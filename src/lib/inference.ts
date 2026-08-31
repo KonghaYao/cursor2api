@@ -875,7 +875,7 @@ function openAiChunkBase(id: string, created: number, model: string) {
 type OpenAiSseStreamState = {
   accumulatedThinking: string;
   accumulatedText: string;
-  toolRows: Map<string, { id: string; name: string; args: string; index: number; emittedName: boolean }>;
+  toolRows: Map<string, { id: string; name: string; args: string; index: number }>;
   usage: unknown;
   extendedUsage: unknown;
   providerMetadata: unknown;
@@ -961,57 +961,13 @@ function sseChunksFromConnectFrame(
         name: "",
         args: "",
         index: Number.isFinite(Number(part.toolIndex)) ? Number(part.toolIndex) : state.toolRows.size,
-        emittedName: false,
       });
     }
     const row = state.toolRows.get(id)!;
     if (part.toolName) row.name = String(part.toolName);
     if (Number.isFinite(Number(part.toolIndex))) row.index = Number(part.toolIndex);
-
-    if (row.name && !row.emittedName) {
-      row.emittedName = true;
-      out.push(
-        encodeSseData({
-          ...base(),
-          choices: [
-            {
-              index: 0,
-              delta: {
-                tool_calls: [
-                  {
-                    index: row.index,
-                    id: row.id,
-                    type: "function",
-                    function: { name: row.name },
-                  },
-                ],
-              },
-              finish_reason: null,
-            },
-          ],
-        }),
-      );
-    }
-
     if (part.args != null && part.args !== "") {
-      const fragment = chunkAsArgsString(part.args);
       row.args = absorbArgsChunk(row.args, part.args, { complete: Boolean(part.isComplete) });
-      if (fragment) {
-        out.push(
-          encodeSseData({
-            ...base(),
-            choices: [
-              {
-                index: 0,
-                delta: {
-                  tool_calls: [{ index: row.index, function: { arguments: fragment } }],
-                },
-                finish_reason: null,
-              },
-            ],
-          }),
-        );
-      }
     }
   }
 
@@ -1062,6 +1018,16 @@ function enqueueOpenAiSseFinish(
     }),
   );
   const errorField = state.error ? { error: state.error } : {};
+  // Cursor Agent expects complete tool_calls in one delta (same as openaiSseBody), not streamed fragments.
+  if (oaiCalls.length) {
+    enqueue(
+      encodeSseData({
+        ...base(),
+        ...errorField,
+        choices: [{ index: 0, delta: { tool_calls: oaiCalls }, finish_reason: null }],
+      }),
+    );
+  }
   enqueue(
     encodeSseData({
       ...base(),
@@ -1133,7 +1099,7 @@ export async function streamOpenAiChatCompletion(opts: {
     res = await fetch(`${CURSOR_BASE}/aiserver.v1.InferenceService/Stream`, {
       method: "POST",
       headers: {
-        ...inferenceHeaders(opts.accessToken, String(opts.body.conversationId || opts.sessionId)),
+        ...inferenceHeaders(opts.accessToken, opts.sessionId),
         "content-type": "application/connect+json",
         "connect-accept-encoding": "gzip",
       },

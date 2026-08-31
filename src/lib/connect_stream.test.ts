@@ -65,6 +65,46 @@ test("OpenAI SSE stream emits error field from Connect error frame", async () =>
   assert.ok(finishLine?.includes('"error":'), finishLine);
 });
 
+test("OpenAI SSE stream emits complete tool_calls delta at end (not incremental fragments)", async () => {
+  const payloads = [
+    encodeConnectFrame({
+      toolCallPart: {
+        toolCallId: "call_abc",
+        toolIndex: 0,
+        toolName: "get_weather",
+        args: '{"city":',
+      },
+    }),
+    encodeConnectFrame({
+      toolCallPart: {
+        toolCallId: "call_abc",
+        toolIndex: 0,
+        args: '"SF"}',
+        isComplete: true,
+      },
+    }),
+  ];
+  const stream = buildOpenAiSseStreamFromFramePayloads({
+    frameChunks: payloads,
+    model: "composer-2.5-fast",
+    conversationId: "sess-tool123",
+    tools: [
+      {
+        name: "get_weather",
+        description: "Get weather",
+        parameters: { type: "object", properties: { city: { type: "string" } } },
+      },
+    ],
+  });
+  const text = await new Response(stream).text();
+  assert.ok(text.includes('"tool_calls"'), text);
+  assert.ok(text.includes('"name":"get_weather"'), text);
+  assert.ok(text.includes('"arguments":"{\\"city\\":\\"SF\\"}"'), text);
+  assert.ok(text.includes('"finish_reason":"tool_calls"'), text);
+  const toolCallChunks = text.split("\n").filter((l) => l.includes('"delta":{"tool_calls"'));
+  assert.equal(toolCallChunks.length, 1, `expected one tool_calls delta chunk, got ${toolCallChunks.length}`);
+});
+
 test("upstreamAbortFromClient aborts when client signal aborts", () => {
   const client = new AbortController();
   const upstream = upstreamAbortFromClient(client.signal);
