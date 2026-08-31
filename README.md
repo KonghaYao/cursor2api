@@ -4,6 +4,24 @@
 
 鉴权只看请求：`Authorization: Bearer <crsr_… 或 JWT>` 或 `x-api-key`。没有服务端 API key，每个人用自己的 Cursor token，互不串会话。换出的 JWT 按 token 指纹缓存在 unstorage 形 KV 里，TTL 跟 JWT `exp` 走，提前 60s 失效。
 
+## 生产环境
+
+已部署：**`https://cursor2api.freetavily.deno.net/v1`**
+
+客户端只需配置 `baseURL` 和你的 Cursor API key（`crsr_…` 或已换好的 JWT），无需自建网关。
+
+```text
+baseURL  → https://cursor2api.freetavily.deno.net/v1
+apiKey   → <你的 Cursor token>
+```
+
+```bash
+curl -s https://cursor2api.freetavily.deno.net/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer crsr_your_key_here' \
+  -d '{"model":"grok-4.6","messages":[{"role":"user","content":"Reply with exactly: PONG"}]}'
+```
+
 共享逻辑在 `src/lib/`：
 
 | 入口 | 启动 |
