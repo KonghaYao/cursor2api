@@ -90,6 +90,7 @@ CURSOR_API_KEY=crsr_xxx node --experimental-strip-types src/lib/cursor_generate_
 
 ```bash
 npm test
+deno task test   # 或 npm run test:deno — handler 集成（mock Cursor，无需 API key）
 ```
 
-模型映射用例见 `src/lib/inference.model.test.ts`。
+模型映射用例见 `src/lib/inference.model.test.ts`；流式 SSE 见 `src/lib/connect_stream.test.ts`。

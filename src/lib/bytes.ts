@@ -37,26 +37,67 @@ export type ConnectFrame = {
   json: Record<string, unknown> | null;
 };
 
-export async function decodeConnectFrames(buffer: Uint8Array): Promise<ConnectFrame[]> {
-  const frames: ConnectFrame[] = [];
-  let offset = 0;
-  while (offset + 5 <= buffer.length) {
-    const flags = buffer[offset];
-    const length = new DataView(buffer.buffer, buffer.byteOffset + offset + 1, 4).getUint32(0);
-    if (offset + 5 + length > buffer.length) break;
-    let payload = buffer.subarray(offset + 5, offset + 5 + length);
-    if (flags & 1) payload = await gunzipBytes(payload);
-    const text = decoder.decode(payload);
-    let json: Record<string, unknown> | null = null;
-    try {
-      json = text ? (JSON.parse(text) as Record<string, unknown>) : null;
-    } catch {
-      json = { _unparsed: text.slice(0, 400) };
-    }
-    frames.push({ flags, end: Boolean(flags & 2), json });
-    offset += 5 + length;
+async function decodeConnectFramePayload(
+  flags: number,
+  payload: Uint8Array,
+): Promise<ConnectFrame> {
+  let body = payload;
+  if (flags & 1) body = await gunzipBytes(payload);
+  const text = decoder.decode(body);
+  let json: Record<string, unknown> | null = null;
+  try {
+    json = text ? (JSON.parse(text) as Record<string, unknown>) : null;
+  } catch {
+    json = { _unparsed: text.slice(0, 400) };
   }
-  return frames;
+  return { flags, end: Boolean(flags & 2), json };
+}
+
+export class ConnectFrameParser {
+  private buffer = new Uint8Array(0);
+
+  push(chunk: Uint8Array): void {
+    if (!chunk.length) return;
+    const merged = new Uint8Array(this.buffer.length + chunk.length);
+    merged.set(this.buffer);
+    merged.set(chunk, this.buffer.length);
+    this.buffer = merged;
+  }
+
+  async drainAvailableFrames(): Promise<ConnectFrame[]> {
+    const frames: ConnectFrame[] = [];
+    while (this.buffer.length >= 5) {
+      const flags = this.buffer[0];
+      const length = new DataView(this.buffer.buffer, this.buffer.byteOffset + 1, 4).getUint32(0);
+      if (this.buffer.length < 5 + length) break;
+      const payload = this.buffer.subarray(5, 5 + length);
+      this.buffer = this.buffer.subarray(5 + length);
+      frames.push(await decodeConnectFramePayload(flags, payload));
+    }
+    return frames;
+  }
+}
+
+export async function decodeConnectFrames(buffer: Uint8Array): Promise<ConnectFrame[]> {
+  const parser = new ConnectFrameParser();
+  parser.push(buffer);
+  return parser.drainAvailableFrames();
+}
+
+export function encodeSseData(obj: unknown): Uint8Array {
+  return encoder.encode(`data: ${JSON.stringify(obj)}\n\n`);
+}
+
+export function sseStreamResponse(stream: ReadableStream<Uint8Array>, sessionId: string): Response {
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      "access-control-allow-origin": "*",
+      "x-session-id": sessionId,
+    },
+  });
 }
 
 export function jwtClaims(token: string): { exp?: number; [key: string]: unknown } | null {

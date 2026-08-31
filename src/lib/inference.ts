@@ -1,5 +1,15 @@
 import { CLIENT_VERSION, CURSOR_BASE, sdkHeaders } from "./auth.ts";
-import { decodeConnectFrames, encodeConnectFrame, bytesBody, randomId, type ConnectFrame } from "./bytes.ts";
+import {
+  ConnectFrameParser,
+  decodeConnectFrames,
+  encodeConnectFrame,
+  encodeSseData,
+  bytesBody,
+  jsonResponse,
+  randomId,
+  sseStreamResponse,
+  type ConnectFrame,
+} from "./bytes.ts";
 
 export function resolveModel(model: unknown): string {
   return String(model ?? "");
@@ -856,6 +866,371 @@ export function openaiSseBody({
   });
   chunks.push({ ...base, choices: [], usage });
   return chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("") + "data: [DONE]\n\n";
+}
+
+function openAiChunkBase(id: string, created: number, model: string) {
+  return { id, object: "chat.completion.chunk" as const, created, model };
+}
+
+type OpenAiSseStreamState = {
+  accumulatedThinking: string;
+  accumulatedText: string;
+  toolRows: Map<string, { id: string; name: string; args: string; index: number; emittedName: boolean }>;
+  usage: unknown;
+  extendedUsage: unknown;
+  providerMetadata: unknown;
+  error: unknown;
+  errorEmitted: boolean;
+};
+
+function newOpenAiSseStreamState(): OpenAiSseStreamState {
+  return {
+    accumulatedThinking: "",
+    accumulatedText: "",
+    toolRows: new Map(),
+    usage: null,
+    extendedUsage: null,
+    providerMetadata: null,
+    error: null,
+    errorEmitted: false,
+  };
+}
+
+function isAbortError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const name = (err as { name?: string }).name;
+  return name === "AbortError";
+}
+
+/** Links client disconnect to upstream fetch; returned controller drives outbound fetch. */
+export function upstreamAbortFromClient(clientSignal?: AbortSignal): AbortController {
+  const upstream = new AbortController();
+  if (!clientSignal) return upstream;
+  if (clientSignal.aborted) {
+    upstream.abort(clientSignal.reason);
+    return upstream;
+  }
+  const onAbort = () => upstream.abort(clientSignal.reason);
+  clientSignal.addEventListener("abort", onAbort, { once: true });
+  return upstream;
+}
+
+function sseChunksFromConnectFrame(
+  frame: ConnectFrame,
+  base: () => ReturnType<typeof openAiChunkBase>,
+  state: OpenAiSseStreamState,
+): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  const j = frame.json;
+  if (!j) return out;
+
+  const thinkingPart = j.thinkingPart as Record<string, unknown> | undefined;
+  if (thinkingPart?.text) {
+    const chunk = String(thinkingPart.text);
+    state.accumulatedThinking += chunk;
+    if (chunk) {
+      out.push(
+        encodeSseData({
+          ...base(),
+          choices: [{ index: 0, delta: { reasoning_content: chunk }, finish_reason: null }],
+        }),
+      );
+    }
+  }
+
+  const textPart = j.textPart as Record<string, unknown> | undefined;
+  if (textPart?.text) {
+    const chunk = String(textPart.text);
+    state.accumulatedText += chunk;
+    if (chunk) {
+      out.push(
+        encodeSseData({
+          ...base(),
+          choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }],
+        }),
+      );
+    }
+  }
+
+  const part = j.toolCallPart as Record<string, unknown> | undefined;
+  if (part?.toolCallId) {
+    const id = sanitizeToolCallId(part.toolCallId);
+    if (!state.toolRows.has(id)) {
+      state.toolRows.set(id, {
+        id,
+        name: "",
+        args: "",
+        index: Number.isFinite(Number(part.toolIndex)) ? Number(part.toolIndex) : state.toolRows.size,
+        emittedName: false,
+      });
+    }
+    const row = state.toolRows.get(id)!;
+    if (part.toolName) row.name = String(part.toolName);
+    if (Number.isFinite(Number(part.toolIndex))) row.index = Number(part.toolIndex);
+
+    if (row.name && !row.emittedName) {
+      row.emittedName = true;
+      out.push(
+        encodeSseData({
+          ...base(),
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: row.index,
+                    id: row.id,
+                    type: "function",
+                    function: { name: row.name },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        }),
+      );
+    }
+
+    if (part.args != null && part.args !== "") {
+      const fragment = chunkAsArgsString(part.args);
+      row.args = absorbArgsChunk(row.args, part.args, { complete: Boolean(part.isComplete) });
+      if (fragment) {
+        out.push(
+          encodeSseData({
+            ...base(),
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [{ index: row.index, function: { arguments: fragment } }],
+                },
+                finish_reason: null,
+              },
+            ],
+          }),
+        );
+      }
+    }
+  }
+
+  if (j.usage) state.usage = j.usage;
+  if (j.extendedUsage) state.extendedUsage = j.extendedUsage;
+  if (j.providerMetadata) state.providerMetadata = j.providerMetadata;
+  if (j.error) {
+    state.error = j.error;
+    if (!state.errorEmitted) {
+      state.errorEmitted = true;
+      out.push(
+        encodeSseData({
+          ...base(),
+          error: j.error,
+          choices: [{ index: 0, delta: {}, finish_reason: null }],
+        }),
+      );
+    }
+  }
+  return out;
+}
+
+function mergedToolCallsFromState(state: OpenAiSseStreamState): MergedToolCall[] {
+  return [...state.toolRows.values()]
+    .map((row) => ({
+      id: row.id,
+      name: row.name,
+      args: repairArgsJson(row.args),
+      complete: true,
+      index: row.index,
+    }))
+    .filter((row) => row.name);
+}
+
+function enqueueOpenAiSseFinish(
+  enqueue: (bytes: Uint8Array) => void,
+  base: () => ReturnType<typeof openAiChunkBase>,
+  state: OpenAiSseStreamState,
+  tools?: CursorTool[],
+): void {
+  const merged = mergedToolCallsFromState(state);
+  const oaiCalls = toolCallsToOpenAI(merged, tools);
+  const usage = toOpenAIUsage(
+    normalizeCursorUsage({
+      usage: state.usage,
+      extendedUsage: state.extendedUsage,
+      providerMetadata: state.providerMetadata,
+    }),
+  );
+  const errorField = state.error ? { error: state.error } : {};
+  enqueue(
+    encodeSseData({
+      ...base(),
+      ...errorField,
+      choices: [{ index: 0, delta: {}, finish_reason: oaiCalls.length ? "tool_calls" : "stop" }],
+      usage,
+    }),
+  );
+  enqueue(encodeSseData({ ...base(), ...errorField, choices: [], usage }));
+}
+
+/** Test helper: feed Connect frame payloads and return an OpenAI SSE ReadableStream. */
+export function buildOpenAiSseStreamFromFramePayloads(opts: {
+  frameChunks: Uint8Array[];
+  model: unknown;
+  conversationId: string;
+  tools?: CursorTool[];
+}): ReadableStream<Uint8Array> {
+  const id = `chatcmpl-${opts.conversationId.slice(0, 8)}`;
+  const created = Math.floor(Date.now() / 1000);
+  const model = resolveModel(opts.model);
+  const base = () => openAiChunkBase(id, created, model);
+  const state = newOpenAiSseStreamState();
+  const parser = new ConnectFrameParser();
+
+  return new ReadableStream({
+    async start(controller) {
+      const enqueue = (bytes: Uint8Array) => controller.enqueue(bytes);
+      enqueue(
+        encodeSseData({
+          ...base(),
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        }),
+      );
+      for (const chunk of opts.frameChunks) {
+        parser.push(chunk);
+        const frames = await parser.drainAvailableFrames();
+        for (const frame of frames) {
+          for (const bytes of sseChunksFromConnectFrame(frame, base, state)) enqueue(bytes);
+        }
+      }
+      enqueueOpenAiSseFinish(enqueue, base, state, opts.tools);
+      enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+}
+
+export async function streamOpenAiChatCompletion(opts: {
+  accessToken: string;
+  body: Record<string, unknown>;
+  sessionId?: string;
+  model: unknown;
+  conversationId: string;
+  tools?: CursorTool[];
+  signal?: AbortSignal;
+}): Promise<Response> {
+  const upstreamAbort = upstreamAbortFromClient(opts.signal);
+  if (upstreamAbort.signal.aborted) {
+    return jsonResponse(
+      499,
+      { error: { message: "client closed request", type: "invalid_request_error" } },
+      opts.sessionId,
+    );
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${CURSOR_BASE}/aiserver.v1.InferenceService/Stream`, {
+      method: "POST",
+      headers: {
+        ...inferenceHeaders(opts.accessToken, String(opts.body.conversationId || opts.sessionId)),
+        "content-type": "application/connect+json",
+        "connect-accept-encoding": "gzip",
+      },
+      body: bytesBody(encodeConnectFrame(opts.body)),
+      signal: upstreamAbort.signal,
+    });
+  } catch (err) {
+    if (isAbortError(err) || upstreamAbort.signal.aborted) {
+      return jsonResponse(
+        499,
+        { error: { message: "client closed request", type: "invalid_request_error" } },
+        opts.sessionId,
+      );
+    }
+    throw err;
+  }
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    return jsonResponse(
+      res.status,
+      {
+        error: {
+          message: detail || res.statusText || "inference stream failed",
+          type: "server_error",
+        },
+      },
+      opts.sessionId,
+    );
+  }
+  if (!res.body) {
+    return jsonResponse(
+      502,
+      { error: { message: "empty inference stream body", type: "server_error" } },
+      opts.sessionId,
+    );
+  }
+
+  const id = `chatcmpl-${opts.conversationId.slice(0, 8)}`;
+  const created = Math.floor(Date.now() / 1000);
+  const model = resolveModel(opts.model);
+  const base = () => openAiChunkBase(id, created, model);
+  const state = newOpenAiSseStreamState();
+  const parser = new ConnectFrameParser();
+  const reader = res.body.getReader();
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const enqueue = (bytes: Uint8Array) => controller.enqueue(bytes);
+      enqueue(
+        encodeSseData({
+          ...base(),
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        }),
+      );
+      try {
+        while (true) {
+          if (upstreamAbort.signal.aborted) break;
+          const { done, value } = await reader.read();
+          if (value?.length) parser.push(value);
+          let frames = await parser.drainAvailableFrames();
+          for (const frame of frames) {
+            for (const bytes of sseChunksFromConnectFrame(frame, base, state)) enqueue(bytes);
+          }
+          if (done) {
+            frames = await parser.drainAvailableFrames();
+            for (const frame of frames) {
+              for (const bytes of sseChunksFromConnectFrame(frame, base, state)) enqueue(bytes);
+            }
+            break;
+          }
+        }
+        if (!upstreamAbort.signal.aborted) {
+          enqueueOpenAiSseFinish(enqueue, base, state, opts.tools);
+          enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+        }
+        controller.close();
+      } catch (err) {
+        if (isAbortError(err) || upstreamAbort.signal.aborted) {
+          try {
+            await reader.cancel();
+          } catch {
+            /* empty */
+          }
+          controller.close();
+          return;
+        }
+        controller.error(err);
+      }
+    },
+    cancel() {
+      upstreamAbort.abort();
+      reader.cancel().catch(() => {});
+    },
+  });
+
+  return sseStreamResponse(stream, opts.sessionId || opts.conversationId);
 }
 
 function inferenceHeaders(accessToken: string, sessionId?: string): Record<string, string> {

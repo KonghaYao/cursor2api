@@ -1,5 +1,5 @@
 import { connectUnary, getAccessToken, modelsFrom, AuthError, type GatewayCtx } from "./auth.ts";
-import { corsResponse, jsonResponse, sseResponse } from "./bytes.ts";
+import { corsResponse, jsonResponse } from "./bytes.ts";
 import {
   anthropicToCursor,
   anthropicToolsToCursor,
@@ -9,8 +9,8 @@ import {
   resolveCursorModelRoute,
   inferenceStream,
   openaiMessagesToCursor,
-  openaiSseBody,
   openaiToolsToCursor,
+  streamOpenAiChatCompletion,
   toAnthropicMessage,
   toOpenAICompletion,
   toolCallsToOpenAI,
@@ -172,6 +172,36 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       console.log(
         `  chat n=${messages.length} tools=${tools.length} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${route.routeId}`,
       );
+      if (body.stream) {
+        const { accessToken, tenant } = await getAccessToken(ctx, request.headers);
+        const { clientId, conversationId, conversationGroupId } = await resolveChatIdentity(
+          ctx,
+          request.headers,
+          body,
+          tenant,
+          (body.messages as unknown[]) || [],
+        );
+        return streamOpenAiChatCompletion({
+          accessToken,
+          body: cursorBody({
+            messages,
+            tools,
+            injectToolsPrompt: body.inject_tools_prompt !== false && body.injectToolsPrompt !== false,
+            model: body.model,
+            conversationId,
+            conversationGroupId,
+            maxTokens: body.max_tokens,
+            temperature: body.temperature,
+            reasoningEffort: extractReasoningEffort(body),
+            fast: extractFastMode(body),
+          }),
+          model: body.model,
+          conversationId: clientId,
+          sessionId: clientId,
+          tools,
+          signal: request.signal,
+        });
+      }
       const { turn, conversationId, sessionId } = await runInference(ctx, request.headers, body, {
         messages,
         tools,
@@ -182,9 +212,6 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
         for (const c of toolCallsToOpenAI(turn.toolCalls, tools)) {
           console.log(`  ${c.function.name} ${c.function.arguments.slice(0, 280)}`);
         }
-      }
-      if (body.stream) {
-        return sseResponse(openaiSseBody({ model: body.model, turn, conversationId, tools }), sessionId);
       }
       return jsonResponse(
         turn.status === 200 ? 200 : turn.status,
