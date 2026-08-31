@@ -5,6 +5,61 @@ export function resolveModel(model: unknown): string {
   return String(model ?? "");
 }
 
+/**
+ * Cursor Composer Fast/Standard are distinct GetUsableModels route ids (e.g. `composer-2.5-fast`).
+ * Grok public ids (`grok-4.6-fast`) map to flat routes (`cursor-grok-4.6-high-fast`); max effort → xhigh(-fast).
+ */
+function parsePublicGrokModel(clientModel: string): { family: "4.6" | "4.5"; fast: boolean } | null {
+  const id = clientModel.toLowerCase().trim();
+  let m = id.match(/^grok-4\.6(?:-fast)?$/);
+  if (m) return { family: "4.6", fast: id.endsWith("-fast") };
+  m = id.match(/^grok-4\.5(?:-fast)?$/);
+  if (m) return { family: "4.5", fast: id.endsWith("-fast") };
+  return null;
+}
+
+function grokCursorFlatRoute(family: "4.6" | "4.5", effort: string, fast: boolean): string {
+  const ver = family;
+  return `cursor-grok-${ver}-${effort}${fast ? "-fast" : ""}`;
+}
+
+export function resolveCursorModelRoute(
+  model: unknown,
+  opts?: { fast?: boolean; reasoningEffort?: unknown },
+): { routeId: string; clientModel: string } {
+  const clientModel = String(model ?? "").trim();
+  let routeId = clientModel;
+
+  if (/^cursor-grok-/i.test(routeId)) {
+    return { routeId, clientModel: clientModel || routeId };
+  }
+
+  const grok = parsePublicGrokModel(routeId);
+  if (grok) {
+    const fast = grok.fast || Boolean(opts?.fast);
+    const familyKey = grok.family === "4.6" ? "grok-4.6" : "grok-4.5";
+    const effort = mapGrokEffort(familyKey, opts?.reasoningEffort) ?? "high";
+    routeId = grokCursorFlatRoute(grok.family, effort, fast);
+    return { routeId, clientModel: clientModel || routeId };
+  }
+
+  const alreadyFast = /-fast$/i.test(routeId);
+  if (!alreadyFast && opts?.fast && /^composer-[\d.]+$/i.test(routeId)) {
+    routeId = `${routeId}-fast`;
+  }
+  return { routeId, clientModel: clientModel || routeId };
+}
+
+export function extractFastMode(body: Record<string, unknown> | null | undefined): boolean {
+  if (!body || typeof body !== "object") return false;
+  if (body.fast === true || body.fast_mode === true || body.fastMode === true) return true;
+  const extra = body.extra_body as Record<string, unknown> | undefined;
+  if (extra?.fast === true || extra?.fast_mode === true || extra?.fastMode === true) return true;
+  const meta = body.metadata as Record<string, unknown> | undefined;
+  if (meta?.fast === true || meta?.fast_mode === true || meta?.fastMode === true) return true;
+  return false;
+}
+
 export const ROLE = {
   user: "INFERENCE_MESSAGE_ROLE_USER",
   assistant: "INFERENCE_MESSAGE_ROLE_ASSISTANT",
@@ -544,11 +599,17 @@ export function cursorBody(opts: {
   maxTokens?: unknown;
   temperature?: unknown;
   reasoningEffort?: unknown;
+  fast?: boolean;
 }): Record<string, unknown> {
-  const modelId = resolveModel(opts.model);
+  const { routeId: modelId } = resolveCursorModelRoute(opts.model, {
+    fast: opts.fast,
+    reasoningEffort: opts.reasoningEffort,
+  });
   const requestedModel: Record<string, unknown> = { modelId, maxMode: false, builtInModel: true };
-  const effort = mapGrokEffort(modelId, opts.reasoningEffort);
-  if (effort) requestedModel.parameters = [{ id: "effort", value: effort }];
+  if (!/^cursor-grok-/i.test(modelId)) {
+    const effort = mapGrokEffort(modelId, opts.reasoningEffort);
+    if (effort) requestedModel.parameters = [{ id: "effort", value: effort }];
+  }
   const injectTools = opts.injectToolsPrompt !== false && Boolean(opts.tools?.length);
   const messages = injectTools ? injectToolsPrompt(opts.messages, opts.tools) : opts.messages;
   const body: Record<string, unknown> = {

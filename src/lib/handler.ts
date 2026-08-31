@@ -4,12 +4,13 @@ import {
   anthropicToCursor,
   anthropicToolsToCursor,
   cursorBody,
+  extractFastMode,
   extractReasoningEffort,
+  resolveCursorModelRoute,
   inferenceStream,
   openaiMessagesToCursor,
   openaiSseBody,
   openaiToolsToCursor,
-  resolveModel,
   toAnthropicMessage,
   toOpenAICompletion,
   toolCallsToOpenAI,
@@ -96,6 +97,7 @@ async function runInference(
       maxTokens: body.max_tokens,
       temperature: body.temperature,
       reasoningEffort: extractReasoningEffort(body),
+      fast: extractFastMode(body),
     }),
     { sessionId },
   );
@@ -138,7 +140,13 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       if ((body.thinking as Record<string, unknown> | undefined)?.type === "enabled" && body.reasoning_effort == null) {
         body.reasoning_effort = "high";
       }
-      console.log(`  messages n=${messages.length} tools=${tools.length} model=${resolveModel(body.model)}`);
+      const route = resolveCursorModelRoute(body.model, {
+        fast: extractFastMode(body),
+        reasoningEffort: extractReasoningEffort(body),
+      });
+      console.log(
+        `  messages n=${messages.length} tools=${tools.length} model=${route.clientModel || route.routeId} cursorRoute=${route.routeId}`,
+      );
       const { turn, conversationId, sessionId } = await runInference(ctx, request.headers, body, {
         messages,
         tools,
@@ -157,8 +165,12 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       const body = await readJson(request);
       const messages = openaiMessagesToCursor((body.messages as unknown[]) || []);
       const tools = openaiToolsToCursor(body.tools);
+      const route = resolveCursorModelRoute(body.model, {
+        fast: extractFastMode(body),
+        reasoningEffort: extractReasoningEffort(body),
+      });
       console.log(
-        `  chat n=${messages.length} tools=${tools.length} stream=${Boolean(body.stream)} model=${resolveModel(body.model)}`,
+        `  chat n=${messages.length} tools=${tools.length} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${route.routeId}`,
       );
       const { turn, conversationId, sessionId } = await runInference(ctx, request.headers, body, {
         messages,

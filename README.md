@@ -54,7 +54,10 @@ deno task start
 | `POST /v1/chat/completions` | OpenAI Chat Completions（含 `stream`） |
 | `POST /v1/messages` | Anthropic Messages |
 
-客户端传什么 `model` 就原样交给 Cursor。Grok 的 `reasoning_effort`：`low` / `medium` / `high` / `xhigh`。Cursor 会丢掉 `role: system`，网关会折进 `<system>…</system>` user 消息；**带 `tools[]` 时**会拆成 `<tools-rules>`（固定 agent 约束，可缓存）与 `<tools-catalog>`（按工具名排序的稳定 schema 列表，随工具集变化），并仍传 `body.tools`；`<tools-rules>` 与 `<system>` 会各打 prompt cache 断点。不需要注入时可设 `inject_tools_prompt: false`。
+客户端 `model` 约定：
+
+- **Composer**：`composer-2.5` / `composer-2.5-fast`（或 `composer-2.5` + `fast: true`）原样或加后缀，对应 Cursor 的 Standard / Fast route。
+- **Grok**：对外用 `grok-4.6` / `grok-4.6-fast`（`grok-4.5` 同理）；网关映射为 `cursor-grok-4.6-{effort}` 或 `cursor-grok-4.6-{effort}-fast`，**不再**对 flat route 发 `parameters.effort`。`reasoning_effort`：`low` / `medium` / `high`；**`max`（或 `xhigh`）→ `xhigh` / `xhigh-fast`**。Cursor 会丢掉 `role: system`，网关会折进 `<system>…</system>` user 消息；**带 `tools[]` 时**会拆成 `<tools-rules>`（固定 agent 约束，可缓存）与 `<tools-catalog>`（按工具名排序的稳定 schema 列表，随工具集变化），并仍传 `body.tools`；`<tools-rules>` 与 `<system>` 会各打 prompt cache 断点。不需要注入时可设 `inject_tools_prompt: false`。
 
 ### 多轮会话（无 client session id）
 
