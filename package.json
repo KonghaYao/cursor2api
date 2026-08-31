@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "OpenAI/Anthropic adapter over Cursor InferenceService/Stream. Client executes tool_calls.",
+  "description": "OpenAI/Anthropic adapter over Cursor InferenceService/Stream. Maps Composer/Grok model aliases to Cursor flat routes; client executes tool_calls.",
   "scripts": {
     "start": "node src/node.ts",
     "start:node": "node src/node.ts",

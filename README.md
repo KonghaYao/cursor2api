@@ -6,9 +6,7 @@
 
 ## 生产环境
 
-已部署：**`https://cursor2api.freetavily.deno.net/v1`**
-
-客户端只需配置 `baseURL` 和你的 Cursor API key（`crsr_…` 或已换好的 JWT），无需自建网关。
+已部署：**`https://cursor2api.freetavily.deno.net/v1`**（推送 `main` 后由 Deno Deploy 自动发布。）
 
 ```text
 baseURL  → https://cursor2api.freetavily.deno.net/v1
@@ -16,10 +14,10 @@ apiKey   → <你的 Cursor token>
 ```
 
 ```bash
-curl -s https://cursor2api.freetavily.deno.net/v1/chat/completions \
+curl -sS https://cursor2api.freetavily.deno.net/v1/chat/completions \
   -H 'content-type: application/json' \
   -H 'authorization: Bearer crsr_your_key_here' \
-  -d '{"model":"grok-4.6","messages":[{"role":"user","content":"Reply with exactly: PONG"}]}'
+  -d '{"model":"composer-2.5-fast","messages":[{"role":"user","content":"Reply with exactly: PONG"}]}'
 ```
 
 共享逻辑在 `src/lib/`：
@@ -50,14 +48,25 @@ deno task start
 | | |
 |---|---|
 | `GET /health` | 存活检查 |
-| `GET /v1/models` | Cursor 可用模型 |
+| `GET /v1/models` | Cursor 可用模型（原生 route id） |
 | `POST /v1/chat/completions` | OpenAI Chat Completions（含 `stream`） |
 | `POST /v1/messages` | Anthropic Messages |
 
-客户端 `model` 约定：
+### 模型 id（简写）
 
-- **Composer**：`composer-2.5` / `composer-2.5-fast`（或 `composer-2.5` + `fast: true`）原样或加后缀，对应 Cursor 的 Standard / Fast route。
-- **Grok**：对外用 `grok-4.6` / `grok-4.6-fast`（`grok-4.5` 同理）；网关映射为 `cursor-grok-4.6-{effort}` 或 `cursor-grok-4.6-{effort}-fast`，**不再**对 flat route 发 `parameters.effort`。`reasoning_effort`：`low` / `medium` / `high`；**`max`（或 `xhigh`）→ `xhigh` / `xhigh-fast`**。Cursor 会丢掉 `role: system`，网关会折进 `<system>…</system>` user 消息；**带 `tools[]` 时**会拆成 `<tools-rules>`（固定 agent 约束，可缓存）与 `<tools-catalog>`（按工具名排序的稳定 schema 列表，随工具集变化），并仍传 `body.tools`；`<tools-rules>` 与 `<system>` 会各打 prompt cache 断点。不需要注入时可设 `inject_tools_prompt: false`。
+客户端可用 **简写 id**，网关映射为 Cursor flat route（详见 **[docs/models.md](docs/models.md)**）：
+
+| 系列 | 简写示例 | 要点 |
+|------|----------|------|
+| **Composer** | `composer-2.5`、`composer-2.5-fast` | Fast 为独立 route；也可用 `composer-2.5` + `fast: true` |
+| **Grok** | `grok-4.6`、`grok-4.6-fast`（`4.5` 同理） | 映射为 `cursor-grok-4.6-{effort}` 或 `…-{effort}-fast` |
+| **Grok effort** | `reasoning_effort` | `low` / `medium` / `high`；**`max` → `xhigh`（Fast 时为 `xhigh-fast`）**；省略时默认 `high` |
+
+响应 JSON 的 `model` 多为客户端传入名；服务端日志中的 **`cursorRoute`** 为实际发给 Cursor 的 id。
+
+### 消息与工具
+
+Cursor 会丢掉 `role: system`，网关会折进 `<system>…</system>` user 消息。**带 `tools[]` 时**会拆成 `<tools-rules>`（固定 agent 约束，可缓存）与 `<tools-catalog>`（按工具名排序的稳定 schema 列表，随工具集变化），并仍传 `body.tools`；`<tools-rules>` 与 `<system>` 会各打 prompt cache 断点。不需要注入时可设 `inject_tools_prompt: false`。
 
 ### 多轮会话（无 client session id）
 
@@ -71,15 +80,16 @@ deno task start
 
 ### 生图（实验）
 
-`src/lib/cursor_generate_image.ts` + `src/lib/cursor_credentials.ts`：优先 `CURSOR_API_KEY`（`crsr_…`），否则读本机 Cursor `state.vscdb` JWT。可稳定请求 `generate_image` tool_call（默认 `grok-4.6`）；像素数据需 IDE Agent 或带 `bcId` 的 Background Composer artifact 下载。
+`src/lib/cursor_generate_image.ts` + `src/lib/cursor_credentials.ts`：优先 `CURSOR_API_KEY`（`crsr_…`），否则读本机 Cursor `state.vscdb` JWT。可稳定请求 `generate_image` tool_call（默认 `grok-4.6`，经网关映射为 `cursor-grok-4.6-high`）；像素数据需 IDE Agent 或带 `bcId` 的 Background Composer artifact 下载。
 
 ```bash
 CURSOR_API_KEY=crsr_xxx node --experimental-strip-types src/lib/cursor_generate_image.ts "a red circle icon"
 ```
 
+## 测试
+
 ```bash
-curl -s http://127.0.0.1:8789/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -H 'authorization: Bearer crsr_your_key_here' \
-  -d '{"model":"grok-4.6","messages":[{"role":"user","content":"Reply with exactly: PONG"}]}'
+npm test
 ```
+
+模型映射用例见 `src/lib/inference.model.test.ts`。
