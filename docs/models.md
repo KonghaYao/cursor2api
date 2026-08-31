@@ -31,8 +31,11 @@ Composer **不使用** `reasoning_effort` 选档。**Max** 通过 `requestedMode
 
 - `grok-4.6` / `grok-4.6-fast`
 - `grok-4.5` / `grok-4.5-fast`
+- 带 effort 的简写：`grok-4.6-high`、`grok-4.6-high-fast`、`grok-4.6-medium-fast` 等（映射到对应 `cursor-grok-*` route）
 
 也可直接传 Cursor id：`cursor-grok-4.6-high-fast`（原样透传）。
+
+**Tool calling：** Cursor 的非 fast Grok route（如 `cursor-grok-4.6-high`）不支持 `tools`。网关在有 `tools[]` 时会自动升级到 `-fast` route（`grok-4.6` + tools → `cursor-grok-4.6-high-fast`）。纯文本对话仍走标准档。
 
 ### `reasoning_effort`
 

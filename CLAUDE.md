@@ -125,6 +125,28 @@ Provider exceeded max output tokens.
 
 ---
 
+## 2026-08-31：`grok-4.6`（无 fast）+ tools → 无返回
+
+### 现象
+
+`model: "grok-4.6"`（映射为 `cursor-grok-4.6-high`）在 **带 tools** 时流式无任何 `content` / `tool_calls`；纯文本对话正常。`grok-4.6-fast` + tools 正常。
+
+### 根因
+
+Cursor Inference 的 **非 fast Grok flat route**（`cursor-grok-4.6-high`、`medium`、`low`、`xhigh`）**不支持 tool calling**，上游返回 `ERROR_PROVIDER_ERROR` / 422。Agent 必带 tools，因此表现为 Grok 标准档「完全无返回」。
+
+### 修复
+
+`cursorBody` 在请求含 `tools` / `providerDefinedTools` 时，对非 fast 的 `cursor-grok-*` route 自动追加 `-fast`（`upgradeGrokRouteForTools`）。无 tools 时仍走标准档 route。
+
+| 请求 | tools | 实际 route |
+|------|-------|------------|
+| `grok-4.6` | 无 | `cursor-grok-4.6-high` |
+| `grok-4.6` | 有 | `cursor-grok-4.6-high-fast` |
+| `grok-4.6-medium` | 有 | `cursor-grok-4.6-medium-fast` |
+
+---
+
 ## 2026-08-31：OpenAI `image_url` 必须映射为 Cursor `InferenceImagePart`
 
 ### 现象

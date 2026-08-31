@@ -54,6 +54,12 @@ function grokCursorFlatRoute(family: "4.6" | "4.5", effort: string, fast: boolea
   return `cursor-grok-${ver}-${effort}${fast ? "-fast" : ""}`;
 }
 
+/** Cursor non-fast Grok flat routes fail tool calls upstream (422); upgrade when tools are present. */
+export function upgradeGrokRouteForTools(modelId: string, hasTools: boolean): string {
+  if (!hasTools || !/^cursor-grok-/i.test(modelId) || /-fast$/i.test(modelId)) return modelId;
+  return `${modelId}-fast`;
+}
+
 export function resolveCursorModelRoute(
   model: unknown,
   opts?: { fast?: boolean; reasoningEffort?: unknown },
@@ -835,10 +841,12 @@ export function cursorBody(opts: {
   automationId?: unknown;
   inferenceReason?: unknown;
 }): Record<string, unknown> {
-  const { routeId: modelId, clientModel } = resolveCursorModelRoute(opts.model, {
+  const { routeId: resolvedRouteId, clientModel } = resolveCursorModelRoute(opts.model, {
     fast: opts.fast,
     reasoningEffort: opts.reasoningEffort,
   });
+  const hasTools = Boolean(opts.tools?.length || opts.providerDefinedTools?.length);
+  const modelId = upgradeGrokRouteForTools(resolvedRouteId, hasTools);
   const requestedModel: Record<string, unknown> = {
     modelId,
     maxMode: Boolean(opts.maxMode),

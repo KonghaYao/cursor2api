@@ -8,6 +8,8 @@ import {
   extractFastMode,
   extractReasoningEffort,
   resolveCursorModelRoute,
+  upgradeGrokRouteForTools,
+  openaiProviderDefinedTools,
   inferenceStream,
   ImageInputError,
   openaiMessagesToCursor,
@@ -178,8 +180,9 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
         reasoningEffort: extractReasoningEffort(body),
       });
       const media = countCursorMediaParts(messages);
+      const cursorRoute = upgradeGrokRouteForTools(route.routeId, tools.length > 0);
       console.log(
-        `  messages n=${messages.length} tools=${tools.length} images=${media.images} files=${media.files} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${route.routeId}`,
+        `  messages n=${messages.length} tools=${tools.length} images=${media.images} files=${media.files} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${cursorRoute}`,
       );
       if (body.stream) {
         const { accessToken, tenant } = await getAccessToken(ctx, request.headers);
@@ -225,8 +228,10 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
         reasoningEffort: extractReasoningEffort(body),
       });
       const media = countCursorMediaParts(messages);
+      const hasTools = tools.length > 0 || openaiProviderDefinedTools(body.tools).length > 0;
+      const cursorRoute = upgradeGrokRouteForTools(route.routeId, hasTools);
       console.log(
-        `  chat n=${messages.length} tools=${tools.length} images=${media.images} files=${media.files} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${route.routeId}`,
+        `  chat n=${messages.length} tools=${tools.length} images=${media.images} files=${media.files} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${cursorRoute}`,
       );
       if (body.stream) {
         const { accessToken, tenant } = await getAccessToken(ctx, request.headers);

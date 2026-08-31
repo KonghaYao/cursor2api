@@ -12,6 +12,7 @@ import {
   parseImageDataUrl,
   ROLE,
   resolveCursorModelRoute,
+  upgradeGrokRouteForTools,
 } from "./inference.ts";
 
 test("resolveCursorModelRoute passes composer-2.5-fast unchanged", () => {
@@ -68,6 +69,31 @@ test("grok-4.6-medium maps to cursor flat route", () => {
 test("grok-4.6-high-fast + reasoning_effort overrides embedded effort", () => {
   const r = resolveCursorModelRoute("grok-4.6-high-fast", { reasoningEffort: "low" });
   assert.equal(r.routeId, "cursor-grok-4.6-low-fast");
+});
+
+test("upgradeGrokRouteForTools appends -fast for tool calls on standard Grok routes", () => {
+  assert.equal(upgradeGrokRouteForTools("cursor-grok-4.6-high", true), "cursor-grok-4.6-high-fast");
+  assert.equal(upgradeGrokRouteForTools("cursor-grok-4.6-high", false), "cursor-grok-4.6-high");
+  assert.equal(upgradeGrokRouteForTools("cursor-grok-4.6-high-fast", true), "cursor-grok-4.6-high-fast");
+});
+
+test("cursorBody upgrades grok-4.6 to fast route when tools are present", () => {
+  const body = cursorBody({
+    messages: [{ role: "INFERENCE_MESSAGE_ROLE_USER", text: "hi" }],
+    conversationId: "c1",
+    model: "grok-4.6",
+    tools: [{ name: "t", description: "d", parameters: { type: "object", properties: {} } }],
+  });
+  assert.equal(body.modelId, "cursor-grok-4.6-high-fast");
+});
+
+test("cursorBody keeps grok-4.6 standard route without tools", () => {
+  const body = cursorBody({
+    messages: [{ role: "INFERENCE_MESSAGE_ROLE_USER", text: "hi" }],
+    conversationId: "c1",
+    model: "grok-4.6",
+  });
+  assert.equal(body.modelId, "cursor-grok-4.6-high");
 });
 
 test("grok-4.6 standard maps to cursor flat route without parameters", () => {
