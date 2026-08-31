@@ -3,11 +3,13 @@ import { corsResponse, jsonResponse } from "./bytes.ts";
 import {
   anthropicToCursor,
   anthropicToolsToCursor,
+  countCursorImageParts,
   cursorBody,
   extractFastMode,
   extractReasoningEffort,
   resolveCursorModelRoute,
   inferenceStream,
+  ImageInputError,
   openaiMessagesToCursor,
   openaiToolsToCursor,
   streamOpenAiChatCompletion,
@@ -163,14 +165,15 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
 
     if (method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
       const body = await readJson(request);
-      const messages = openaiMessagesToCursor((body.messages as unknown[]) || []);
+      const messages = await openaiMessagesToCursor((body.messages as unknown[]) || []);
       const tools = openaiToolsToCursor(body.tools);
       const route = resolveCursorModelRoute(body.model, {
         fast: extractFastMode(body),
         reasoningEffort: extractReasoningEffort(body),
       });
+      const images = countCursorImageParts(messages);
       console.log(
-        `  chat n=${messages.length} tools=${tools.length} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${route.routeId}`,
+        `  chat n=${messages.length} tools=${tools.length} images=${images} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${route.routeId}`,
       );
       if (body.stream) {
         const { accessToken, tenant } = await getAccessToken(ctx, request.headers);
@@ -224,10 +227,13 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
     return jsonResponse(404, { error: { message: `Unknown ${method} ${url.pathname}`, type: "invalid_request_error" } });
   } catch (err) {
     const message = String((err as Error)?.message || err);
-    const status = err instanceof AuthError ? 401 : 500;
+    const status = err instanceof AuthError ? 401 : err instanceof ImageInputError ? 400 : 500;
     console.log(`  -> ${status} ${message}`);
     return jsonResponse(status, {
-      error: { message, type: status === 401 ? "authentication_error" : "server_error" },
+      error: {
+        message,
+        type: status === 401 ? "authentication_error" : status === 400 ? "invalid_request_error" : "server_error",
+      },
     });
   }
 }

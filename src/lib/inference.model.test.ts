@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  countCursorImageParts,
   cursorBody,
   extractFastMode,
   GROK_MIN_MAX_TOKENS,
+  ImageInputError,
   isGrokModel,
   normalizeMaxTokensForModel,
+  openaiMessagesToCursor,
+  parseImageDataUrl,
+  ROLE,
   resolveCursorModelRoute,
 } from "./inference.ts";
 
@@ -94,4 +99,74 @@ test("cursorBody applies Grok max_tokens floor", () => {
   });
   const cfg = body.modelConfig as Record<string, unknown>;
   assert.equal(cfg.maxTokens, GROK_MIN_MAX_TOKENS);
+});
+
+const TINY_PNG_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const TINY_PNG_DATA_URL = `data:image/png;base64,${TINY_PNG_B64}`;
+
+test("parseImageDataUrl extracts mime and raw base64", () => {
+  const parsed = parseImageDataUrl(TINY_PNG_DATA_URL);
+  assert.equal(parsed?.mimeType, "image/png");
+  assert.equal(parsed?.data, TINY_PNG_B64);
+});
+
+test("openaiMessagesToCursor keeps text-only user messages as text", async () => {
+  const msgs = await openaiMessagesToCursor([{ role: "user", content: "hello" }]);
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0]?.role, ROLE.user);
+  assert.equal(msgs[0]?.text, "hello");
+  assert.equal(msgs[0]?.parts, undefined);
+});
+
+test("openaiMessagesToCursor maps image_url data URI to InferenceImagePart", async () => {
+  const msgs = await openaiMessagesToCursor([
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "what is this?" },
+        { type: "image_url", image_url: { url: TINY_PNG_DATA_URL } },
+      ],
+    },
+  ]);
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0]?.text, undefined);
+  const parts = (msgs[0]?.parts as { parts: unknown[] }).parts;
+  assert.equal(parts.length, 2);
+  assert.deepEqual(parts[0], { text: { text: "what is this?" } });
+  assert.deepEqual(parts[1], { image: { data: TINY_PNG_B64, mimeType: "image/png" } });
+  assert.equal(countCursorImageParts(msgs), 1);
+});
+
+test("openaiMessagesToCursor fetches http(s) image_url", async () => {
+  const png = Buffer.from(TINY_PNG_B64, "base64");
+  const fakeFetch: typeof fetch = async (input) => {
+    assert.equal(String(input), "https://example.test/dot.png");
+    return new Response(png, { status: 200, headers: { "content-type": "image/png" } });
+  };
+  const msgs = await openaiMessagesToCursor(
+    [
+      {
+        role: "user",
+        content: [{ type: "image_url", image_url: { url: "https://example.test/dot.png" } }],
+      },
+    ],
+    { fetch: fakeFetch },
+  );
+  const parts = (msgs[0]?.parts as { parts: Array<{ image?: { data: string; mimeType: string } }> }).parts;
+  assert.equal(parts[0]?.image?.mimeType, "image/png");
+  assert.equal(parts[0]?.image?.data, TINY_PNG_B64);
+});
+
+test("openaiMessagesToCursor rejects non-http image URLs", async () => {
+  await assert.rejects(
+    () =>
+      openaiMessagesToCursor([
+        { role: "user", content: [{ type: "image_url", image_url: { url: "file:///tmp/x.png" } }] },
+      ]),
+    (err: unknown) => {
+      assert.ok(err instanceof ImageInputError);
+      return true;
+    },
+  );
 });

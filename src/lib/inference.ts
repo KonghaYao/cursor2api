@@ -168,6 +168,165 @@ export function flattenContent(content: unknown): string {
     .join("\n");
 }
 
+/** Cursor InferenceImagePart.data is a base64 string (not a data URL). */
+export const MAX_CURSOR_IMAGE_BYTES = 10 * 1024 * 1024;
+
+export class ImageInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ImageInputError";
+  }
+}
+
+export type CursorImageBytes = { data: string; mimeType: string };
+
+export type OpenAiMessagesToCursorOpts = {
+  fetch?: typeof fetch;
+};
+
+function bytesToBase64(bytes: Uint8Array): string {
+  if (typeof Buffer !== "undefined") return Buffer.from(bytes).toString("base64");
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function base64DecodedBytes(b64: string): number {
+  const pad = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((b64.length * 3) / 4) - pad);
+}
+
+function assertImageSize(decodedBytes: number): void {
+  if (decodedBytes > MAX_CURSOR_IMAGE_BYTES) {
+    throw new ImageInputError(`Image input is too large (max ${MAX_CURSOR_IMAGE_BYTES} bytes)`);
+  }
+}
+
+/** Parse `data:image/...;base64,...` into Cursor InferenceImagePart fields. */
+export function parseImageDataUrl(url: string): CursorImageBytes | null {
+  const trimmed = url.trim();
+  const m = /^data:([^;,]+)?(;base64)?,([\s\S]*)$/i.exec(trimmed);
+  if (!m) return null;
+  const mimeType = (m[1] || "image/png").trim().toLowerCase() || "image/png";
+  if (!m[2]) return null;
+  const data = (m[3] || "").replace(/\s+/g, "");
+  if (!data) return null;
+  assertImageSize(base64DecodedBytes(data));
+  return { data, mimeType };
+}
+
+function extractOpenAiImageUrl(part: Record<string, unknown>): string | undefined {
+  const type = String(part.type || "").toLowerCase();
+  if (type === "image_url" || type === "input_image") {
+    const iu = part.image_url ?? part.imageUrl ?? part.url;
+    if (typeof iu === "string" && iu) return iu;
+    if (iu && typeof iu === "object") {
+      const url = (iu as Record<string, unknown>).url;
+      if (typeof url === "string" && url) return url;
+    }
+  }
+  if (type === "image") {
+    const source = part.source as Record<string, unknown> | undefined;
+    if (source && typeof source === "object") {
+      const st = String(source.type || "").toLowerCase();
+      if (st === "base64" && typeof source.data === "string" && source.data) {
+        const mime = String(source.media_type || source.mediaType || "image/png");
+        return `data:${mime};base64,${source.data}`;
+      }
+      if ((st === "url" || st === "image_url") && typeof source.url === "string") return source.url;
+    }
+    if (typeof part.image_url === "string" && part.image_url) return String(part.image_url);
+  }
+  return undefined;
+}
+
+export async function resolveCursorImage(
+  url: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<CursorImageBytes> {
+  const fromData = parseImageDataUrl(url);
+  if (fromData) return fromData;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new ImageInputError("Invalid image URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new ImageInputError("Image URL must be a data: URI or http(s) URL");
+  }
+
+  const signal =
+    typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+      ? AbortSignal.timeout(15_000)
+      : undefined;
+  let res: Response;
+  try {
+    res = await fetchImpl(parsed, { redirect: "follow", signal });
+  } catch (err) {
+    throw new ImageInputError(`Failed to fetch image: ${String((err as Error)?.message || err)}`);
+  }
+  if (!res.ok) throw new ImageInputError(`Failed to fetch image (${res.status})`);
+  const mime = (res.headers.get("content-type") || "").split(";")[0]?.trim().toLowerCase() || "image/png";
+  const buf = new Uint8Array(await res.arrayBuffer());
+  assertImageSize(buf.length);
+  if (!buf.length) throw new ImageInputError("Image input is empty");
+  return { data: bytesToBase64(buf), mimeType: mime.startsWith("image/") ? mime : "image/png" };
+}
+
+function isOpenAiImagePart(part: Record<string, unknown>): boolean {
+  const type = String(part.type || "").toLowerCase();
+  return type === "image_url" || type === "input_image" || type === "image";
+}
+
+async function userContentToCursor(
+  content: unknown,
+  opts?: OpenAiMessagesToCursorOpts,
+): Promise<CursorMessage> {
+  if (!Array.isArray(content)) {
+    return { role: ROLE.user, text: flattenContent(content) };
+  }
+  const parts: Array<Record<string, unknown>> = [];
+  let hasImage = false;
+  for (const part of content) {
+    if (typeof part === "string") {
+      if (part) parts.push({ text: { text: part } });
+      continue;
+    }
+    if (!part || typeof part !== "object") continue;
+    const p = part as Record<string, unknown>;
+    if (isOpenAiImagePart(p)) {
+      const url = extractOpenAiImageUrl(p);
+      if (!url) throw new ImageInputError("Image part is missing a url");
+      const img = await resolveCursorImage(url, opts?.fetch ?? fetch);
+      parts.push({ image: { data: img.data, mimeType: img.mimeType } });
+      hasImage = true;
+      continue;
+    }
+    if (p.type === "thinking") continue;
+    const text = p.type === "text" || typeof p.text === "string" ? String(p.text || "") : "";
+    if (text) parts.push({ text: { text } });
+  }
+  if (!hasImage) return { role: ROLE.user, text: flattenContent(content) };
+  return { role: ROLE.user, parts: { parts } };
+}
+
+export function countCursorImageParts(messages: CursorMessage[]): number {
+  let n = 0;
+  for (const m of messages || []) {
+    const parts = (m.parts as { parts?: unknown[] } | undefined)?.parts;
+    if (!Array.isArray(parts)) continue;
+    for (const part of parts) {
+      if (part && typeof part === "object" && (part as Record<string, unknown>).image) n += 1;
+    }
+  }
+  return n;
+}
+
 function tryJsonParse(text: string): { ok: true; value: unknown } | { ok: false } {
   try {
     return { ok: true, value: JSON.parse(text) };
@@ -491,7 +650,10 @@ export function injectToolsPrompt(messages: CursorMessage[], tools: CursorTool[]
   return [...prefix, ...(messages || [])];
 }
 
-export function openaiMessagesToCursor(messages: unknown[]): CursorMessage[] {
+export async function openaiMessagesToCursor(
+  messages: unknown[],
+  opts?: OpenAiMessagesToCursorOpts,
+): Promise<CursorMessage[]> {
   const out: CursorMessage[] = [];
   const systems: string[] = [];
   const flushSystem = () => {
@@ -509,7 +671,7 @@ export function openaiMessagesToCursor(messages: unknown[]): CursorMessage[] {
     }
     flushSystem();
     if (role === "user") {
-      out.push({ role: ROLE.user, text: flattenContent(rec.content) });
+      out.push(await userContentToCursor(rec.content, opts));
       continue;
     }
     if (role === "assistant") {
