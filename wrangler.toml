@@ -1,0 +1,8 @@
+name = "cursor-agent-gateway"
+main = "src/cf.ts"
+compatibility_date = "2026-08-31"
+
+# optional multi-isolate JWT cache:
+# [[kv_namespaces]]
+# binding = "KV"
+# id = "…"

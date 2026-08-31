@@ -1,0 +1,26 @@
+{
+  "name": "cursor2api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI/Anthropic adapter over Cursor InferenceService/Stream. Client executes tool_calls.",
+  "scripts": {
+    "start": "node src/node.ts",
+    "start:node": "node src/node.ts",
+    "start:bun": "bun src/node.ts",
+    "start:deno": "deno run --allow-net --allow-env src/deno.ts",
+    "start:cf": "wrangler dev",
+    "deploy:cf": "wrangler deploy"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "dependencies": {
+    "unstorage": "^1.17.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "wrangler": "^4.0.0"
+  }
+}
