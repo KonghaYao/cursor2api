@@ -88,6 +88,10 @@ export function encodeSseData(obj: unknown): Uint8Array {
   return encoder.encode(`data: ${JSON.stringify(obj)}\n\n`);
 }
 
+export function encodeSseEvent(event: string, obj: unknown): Uint8Array {
+  return encoder.encode(`event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`);
+}
+
 export function sseStreamResponse(stream: ReadableStream<Uint8Array>, sessionId: string): Response {
   return new Response(stream, {
     status: 200,

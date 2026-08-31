@@ -23,7 +23,7 @@
 - `metadata.fast` / `metadata.fast_mode` / `metadata.fastMode`
 - `extra_body.fast`
 
-Composer **不使用** `reasoning_effort` 选档；**Max** 在 Cursor 里是另一条 route（`maxMode` 字段），与 Fast 不同，本网关对 Composer 仍按列表中的 id 原样传递。
+Composer **不使用** `reasoning_effort` 选档。**Max** 通过 `requestedModel.maxMode`（不是 `-fast` 后缀）：请求体 `max` / `max_mode` / `maxMode`（以及 `metadata` / `extra_body` 同名字段）为 true 时打开。模型 id 仍按列表原样传递（`composer-2.5` + Max，而不是 `composer-2.5-max` route）。
 
 ## Grok 4.6 / 4.5
 

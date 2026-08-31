@@ -101,3 +101,116 @@ Provider exceeded max output tokens.
 
 - 推荐对外使用 **`grok-4.6-fast`**；标准 `grok-4.6` 延迟明显更高（十秒级），易被误认为卡住。
 - 若需严格控费，客户端应显式传足够大的 `max_tokens`，而不是依赖极小默认值。
+
+---
+
+## 2026-08-31：Grok `grok-4.6-high-fast` 等别名未映射 → 无返回
+
+### 现象
+
+配置 `model: "grok-4.6-high-fast"`（或 `grok-4.6-medium-fast`、`grok-4.6-xhigh-fast` 等带 effort 的简写）时，流式响应只有 `role` 首包 + `error`，**无任何 `content`**。`grok-4.6-fast` / `cursor-grok-4.6-high-fast` 正常。
+
+### 根因
+
+`parsePublicGrokModel` 只识别 `grok-4.6` / `grok-4.6-fast`，**不识别**文档映射表里的 `grok-4.6-{effort}(-fast)?` 形式。未映射的 id 原样写入 `modelId`，Cursor 返回 `ERROR_BAD_MODEL_NAME`。
+
+### 修复
+
+扩展 `parsePublicGrokModel` 解析 effort + fast 后缀，并映射到 `cursor-grok-4.6-{effort}(-fast)?`；`reasoning_effort` 请求体字段仍可覆盖嵌入 effort。
+
+推荐客户端使用：
+
+- `grok-4.6-fast` / `grok-4.6`（简写）
+- 或 `/v1/models` 返回的 `cursor-grok-*` 原生 id
+
+---
+
+## 2026-08-31：OpenAI `image_url` 必须映射为 Cursor `InferenceImagePart`
+
+### 现象
+
+OpenAI Chat Completions 带图（`content: [{type:text},{type:image_url}]`）时，模型当纯文本处理，完全看不到图片。
+
+### 根因
+
+`openaiMessagesToCursor` 对 user 消息调用 `flattenContent`，只抽取 `text` part。`image_url` 被静默丢弃。
+
+Cursor `InferenceService/Stream` 的 `InferenceCoreMessage` 是 **oneof content**：要么 `text`，要么 `parts`（不能把图塞进 `text` 字符串）。图片字段来自 workbench proto：
+
+```text
+InferenceContentPart  oneof part { text | image | file }
+InferenceImagePart    data: string (裸 base64，非 data URL)
+                      mime_type → JSON camelCase mimeType
+```
+
+Connect JSON 形状（与现有 prompt-cache `parts.parts[].text` 一致）：
+
+```json
+{
+  "role": "INFERENCE_MESSAGE_ROLE_USER",
+  "parts": {
+    "parts": [
+      { "text": { "text": "这张图里有什么？" } },
+      { "image": { "data": "<raw base64>", "mimeType": "image/png" } }
+    ]
+  }
+}
+```
+
+### 修复
+
+提交 `27023de` — *feat: map OpenAI image_url to Cursor InferenceImagePart*
+
+1. 有图时走 `parts`，无图仍用 `text`（避免改变纯文本路径）
+2. `data:image/...;base64,...` 本地拆 mime + payload；`http(s)` 由网关拉取再编码（上限 10MB）
+3. 非法 scheme / 缺 url / 超限 → `ImageInputError` → **400**
+
+相关测试：`src/lib/inference.model.test.ts`；Deno 集成：`tests/deno_gateway.integration.test.ts` — *forwards OpenAI image_url as Cursor image parts*。
+
+### 约束（后续改消息转换时务必遵守）
+
+| 内容 | 策略 |
+|------|------|
+| 纯文本 user | `{ role, text }` |
+| 含 `image_url` / `input_image` / Anthropic `image` | **`parts.parts[]`，`image.data` 为裸 base64** |
+| 文件 `file` / `document` | `parts.parts[].file`（`data` + `mediaType` + `filename`） |
+| tool 结果里的图 | `toolContent.parts[].experimentalContent` |
+| `image.data` | **不要**带 `data:` 前缀；mime 放在 `mimeType` |
+
+不要把多模态 content 重新 flatten 成字符串；Cursor 没有「图 URL 写在 text 里」这条路径。
+
+---
+
+## 2026-08-31：Inference 协议缺口补全
+
+对照 `InferenceStreamRequest` / `InferenceContentPart` 与 OpenAI/Anthropic 表面，一次补上能转的字段；Cursor 没有的能力给明确错误，不要假装成功。
+
+### 已接到 Cursor proto
+
+| 能力 | 实现 |
+|------|------|
+| Anthropic 图片 / document | `anthropicToCursor` → 同 `InferenceImagePart` / `InferenceFilePart` |
+| Anthropic `stream: true` | `streamAnthropicMessage`（`event:` + `data:`）；tool_use **整块**在结束时发出，与 OpenAI 不增量 tool_calls 同一约束 |
+| Composer Max | `requestedModel.maxMode`（`max` / `max_mode` / `metadata.max`） |
+| `tool_choice` / `parallel_tool_calls` | 过滤 tools + `<tool-policy>` 注入（proto 无原生字段） |
+| Tool result 嵌图 | `experimentalContent` |
+| `top_p` / `stop` | `modelConfig.topP` / `stopSequences` |
+| `max_completion_tokens` | `max_tokens` 别名 |
+| `providerDefinedTools` | 非 function 的 OpenAI tools + `provider_defined_tools` |
+| `invocationId` / `automationId` / `inferenceReason` | 请求体透传 |
+| 响应 `image_descriptions` | `collectTurn`；JSON 字段 / SSE 末包 |
+
+### 不能接（Cursor Inference 无此 RPC）
+
+| 路径 | 行为 |
+|------|------|
+| `/v1/embeddings` `/v1/audio/*` `/v1/images/*` `/v1/responses` | **501** |
+| `n > 1` | **400** |
+| `seed` / `logprobs` / penalty | 忽略 |
+| Images 像素 | Inference 只回 `generate_image` tool_call，见实验脚本 |
+
+### 约束
+
+- 流式 **tool 调用**：OpenAI 与 Anthropic 都在结束前一次性给出完整块（Cursor Agent 不接受增量 tool 分片）。
+- `maxMode` 不是 `composer-*-max` route，不要改 `modelId`。
+- `response_format` 只是 prompt 约束，不是服务端 JSON schema 强制。

@@ -50,6 +50,26 @@ test("grok-4.6 + fast flag maps to high-fast", () => {
   assert.equal(r.routeId, "cursor-grok-4.6-high-fast");
 });
 
+test("grok-4.6-high-fast maps to cursor flat route", () => {
+  const r = resolveCursorModelRoute("grok-4.6-high-fast");
+  assert.equal(r.routeId, "cursor-grok-4.6-high-fast");
+});
+
+test("grok-4.6-xhigh-fast maps to cursor flat route", () => {
+  const r = resolveCursorModelRoute("grok-4.6-xhigh-fast");
+  assert.equal(r.routeId, "cursor-grok-4.6-xhigh-fast");
+});
+
+test("grok-4.6-medium maps to cursor flat route", () => {
+  const r = resolveCursorModelRoute("grok-4.6-medium");
+  assert.equal(r.routeId, "cursor-grok-4.6-medium");
+});
+
+test("grok-4.6-high-fast + reasoning_effort overrides embedded effort", () => {
+  const r = resolveCursorModelRoute("grok-4.6-high-fast", { reasoningEffort: "low" });
+  assert.equal(r.routeId, "cursor-grok-4.6-low-fast");
+});
+
 test("grok-4.6 standard maps to cursor flat route without parameters", () => {
   const body = cursorBody({
     messages: [{ role: "INFERENCE_MESSAGE_ROLE_USER", text: "hi" }],
@@ -82,6 +102,7 @@ test("isGrokModel detects public and cursor flat routes", () => {
   assert.equal(isGrokModel("cursor-grok-4.6-high-fast"), true);
   assert.equal(isGrokModel("composer-2.5-fast", "composer-2.5-fast"), false);
   assert.equal(isGrokModel("grok-4.6", "grok-4.6"), true);
+  assert.equal(isGrokModel("grok-4.6-high-fast", "grok-4.6-high-fast"), true);
 });
 
 test("normalizeMaxTokensForModel floors low Grok caps", () => {

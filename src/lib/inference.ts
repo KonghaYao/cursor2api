@@ -4,12 +4,31 @@ import {
   decodeConnectFrames,
   encodeConnectFrame,
   encodeSseData,
+  encodeSseEvent,
   bytesBody,
   jsonResponse,
   randomId,
   sseStreamResponse,
   type ConnectFrame,
 } from "./bytes.ts";
+import {
+  anthropicContentToCursorParts,
+  contentToToolResultPart,
+  openaiContentToCursorParts,
+  userMessageFromParts,
+  type MediaResolveOpts,
+} from "./content_parts.ts";
+
+export {
+  ImageInputError,
+  parseImageDataUrl,
+  resolveCursorImage,
+  countCursorImageParts,
+  countCursorMediaParts,
+  MAX_CURSOR_IMAGE_BYTES,
+} from "./content_parts.ts";
+
+export type OpenAiMessagesToCursorOpts = MediaResolveOpts;
 
 export function resolveModel(model: unknown): string {
   return String(model ?? "");
@@ -19,12 +38,14 @@ export function resolveModel(model: unknown): string {
  * Cursor Composer Fast/Standard are distinct GetUsableModels route ids (e.g. `composer-2.5-fast`).
  * Grok public ids (`grok-4.6-fast`) map to flat routes (`cursor-grok-4.6-high-fast`); max effort → xhigh(-fast).
  */
-function parsePublicGrokModel(clientModel: string): { family: "4.6" | "4.5"; fast: boolean } | null {
+function parsePublicGrokModel(
+  clientModel: string,
+): { family: "4.6" | "4.5"; effort?: string; fast: boolean } | null {
   const id = clientModel.toLowerCase().trim();
-  let m = id.match(/^grok-4\.6(?:-fast)?$/);
-  if (m) return { family: "4.6", fast: id.endsWith("-fast") };
-  m = id.match(/^grok-4\.5(?:-fast)?$/);
-  if (m) return { family: "4.5", fast: id.endsWith("-fast") };
+  let m = id.match(/^grok-4\.6(?:-(low|medium|high|xhigh))?(?:-fast)?$/);
+  if (m) return { family: "4.6", effort: m[1], fast: id.endsWith("-fast") };
+  m = id.match(/^grok-4\.5(?:-(low|medium|high))?(?:-fast)?$/);
+  if (m) return { family: "4.5", effort: m[1], fast: id.endsWith("-fast") };
   return null;
 }
 
@@ -48,7 +69,9 @@ export function resolveCursorModelRoute(
   if (grok) {
     const fast = grok.fast || Boolean(opts?.fast);
     const familyKey = grok.family === "4.6" ? "grok-4.6" : "grok-4.5";
-    const effort = mapGrokEffort(familyKey, opts?.reasoningEffort) ?? "high";
+    const hasBodyEffort = opts?.reasoningEffort != null && String(opts.reasoningEffort).trim() !== "";
+    const effort =
+      (hasBodyEffort ? mapGrokEffort(familyKey, opts?.reasoningEffort) : undefined) ?? grok.effort ?? "high";
     routeId = grokCursorFlatRoute(grok.family, effort, fast);
     return { routeId, clientModel: clientModel || routeId };
   }
@@ -66,7 +89,11 @@ export const GROK_MIN_MAX_TOKENS = 512;
 export function isGrokModel(modelId: string, clientModel?: unknown): boolean {
   const route = String(modelId || "").toLowerCase();
   const client = String(clientModel ?? "").toLowerCase();
-  return /^cursor-grok-/.test(route) || /^grok-4\.[56](?:-fast)?$/.test(client) || /^grok-4\.[56](?:-fast)?$/.test(route);
+  return (
+    /^cursor-grok-/.test(route) ||
+    parsePublicGrokModel(client) != null ||
+    parsePublicGrokModel(route) != null
+  );
 }
 
 export function normalizeMaxTokensForModel(modelId: string, clientModel: unknown, maxTokens: unknown): number | undefined {
@@ -77,13 +104,44 @@ export function normalizeMaxTokensForModel(modelId: string, clientModel: unknown
 }
 
 export function extractFastMode(body: Record<string, unknown> | null | undefined): boolean {
+  return extractBodyFlag(body, ["fast", "fast_mode", "fastMode"]);
+}
+
+export function extractMaxMode(body: Record<string, unknown> | null | undefined): boolean {
+  return extractBodyFlag(body, ["max", "max_mode", "maxMode", "maxModeEnabled"]);
+}
+
+function extractBodyFlag(body: Record<string, unknown> | null | undefined, keys: string[]): boolean {
   if (!body || typeof body !== "object") return false;
-  if (body.fast === true || body.fast_mode === true || body.fastMode === true) return true;
-  const extra = body.extra_body as Record<string, unknown> | undefined;
-  if (extra?.fast === true || extra?.fast_mode === true || extra?.fastMode === true) return true;
-  const meta = body.metadata as Record<string, unknown> | undefined;
-  if (meta?.fast === true || meta?.fast_mode === true || meta?.fastMode === true) return true;
+  const bags: Array<Record<string, unknown> | undefined> = [
+    body,
+    body.extra_body as Record<string, unknown> | undefined,
+    body.metadata as Record<string, unknown> | undefined,
+  ];
+  for (const bag of bags) {
+    if (!bag) continue;
+    for (const key of keys) if (bag[key] === true) return true;
+  }
   return false;
+}
+
+export function extractMaxTokens(body: Record<string, unknown> | null | undefined): unknown {
+  if (!body || typeof body !== "object") return undefined;
+  return body.max_tokens ?? body.maxTokens ?? body.max_completion_tokens ?? body.maxCompletionTokens;
+}
+
+export function extractTopP(body: Record<string, unknown> | null | undefined): unknown {
+  if (!body || typeof body !== "object") return undefined;
+  return body.top_p ?? body.topP;
+}
+
+export function extractStopSequences(body: Record<string, unknown> | null | undefined): string[] | undefined {
+  if (!body || typeof body !== "object") return undefined;
+  const stop = body.stop ?? body.stop_sequences ?? body.stopSequences;
+  if (stop == null) return undefined;
+  if (typeof stop === "string" && stop) return [stop];
+  if (Array.isArray(stop)) return stop.map((s) => String(s)).filter(Boolean);
+  return undefined;
 }
 
 export const ROLE = {
@@ -110,8 +168,15 @@ export type Json = null | boolean | number | string | Json[] | { [key: string]: 
 export type JsonObject = { [key: string]: Json };
 
 export type CursorTool = { name: string; description: string; parameters: JsonObject };
+export type CursorProviderTool = { name: string; id: string; type: string; options?: Json };
 export type CursorMessage = Record<string, unknown>;
 export type MergedToolCall = { id: string; name: string; args: string; complete: boolean; index?: number };
+export type ImageDescription = {
+  messageIndex?: number;
+  partIndex?: number;
+  expContentIndex?: number;
+  description: string;
+};
 
 export type InferenceTurn = {
   status: number;
@@ -124,6 +189,7 @@ export type InferenceTurn = {
   providerMetadata: unknown;
   error: unknown;
   toolCalls: MergedToolCall[];
+  imageDescriptions: ImageDescription[];
 };
 
 function grokEffortFamily(modelId: string): string | null {
@@ -168,121 +234,6 @@ export function flattenContent(content: unknown): string {
     .join("\n");
 }
 
-/** Cursor InferenceImagePart.data is a base64 string (not a data URL). */
-export const MAX_CURSOR_IMAGE_BYTES = 10 * 1024 * 1024;
-
-export class ImageInputError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ImageInputError";
-  }
-}
-
-export type CursorImageBytes = { data: string; mimeType: string };
-
-export type OpenAiMessagesToCursorOpts = {
-  fetch?: typeof fetch;
-};
-
-function bytesToBase64(bytes: Uint8Array): string {
-  if (typeof Buffer !== "undefined") return Buffer.from(bytes).toString("base64");
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
-}
-
-function base64DecodedBytes(b64: string): number {
-  const pad = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
-  return Math.max(0, Math.floor((b64.length * 3) / 4) - pad);
-}
-
-function assertImageSize(decodedBytes: number): void {
-  if (decodedBytes > MAX_CURSOR_IMAGE_BYTES) {
-    throw new ImageInputError(`Image input is too large (max ${MAX_CURSOR_IMAGE_BYTES} bytes)`);
-  }
-}
-
-/** Parse `data:image/...;base64,...` into Cursor InferenceImagePart fields. */
-export function parseImageDataUrl(url: string): CursorImageBytes | null {
-  const trimmed = url.trim();
-  const m = /^data:([^;,]+)?(;base64)?,([\s\S]*)$/i.exec(trimmed);
-  if (!m) return null;
-  const mimeType = (m[1] || "image/png").trim().toLowerCase() || "image/png";
-  if (!m[2]) return null;
-  const data = (m[3] || "").replace(/\s+/g, "");
-  if (!data) return null;
-  assertImageSize(base64DecodedBytes(data));
-  return { data, mimeType };
-}
-
-function extractOpenAiImageUrl(part: Record<string, unknown>): string | undefined {
-  const type = String(part.type || "").toLowerCase();
-  if (type === "image_url" || type === "input_image") {
-    const iu = part.image_url ?? part.imageUrl ?? part.url;
-    if (typeof iu === "string" && iu) return iu;
-    if (iu && typeof iu === "object") {
-      const url = (iu as Record<string, unknown>).url;
-      if (typeof url === "string" && url) return url;
-    }
-  }
-  if (type === "image") {
-    const source = part.source as Record<string, unknown> | undefined;
-    if (source && typeof source === "object") {
-      const st = String(source.type || "").toLowerCase();
-      if (st === "base64" && typeof source.data === "string" && source.data) {
-        const mime = String(source.media_type || source.mediaType || "image/png");
-        return `data:${mime};base64,${source.data}`;
-      }
-      if ((st === "url" || st === "image_url") && typeof source.url === "string") return source.url;
-    }
-    if (typeof part.image_url === "string" && part.image_url) return String(part.image_url);
-  }
-  return undefined;
-}
-
-export async function resolveCursorImage(
-  url: string,
-  fetchImpl: typeof fetch = fetch,
-): Promise<CursorImageBytes> {
-  const fromData = parseImageDataUrl(url);
-  if (fromData) return fromData;
-
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new ImageInputError("Invalid image URL");
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new ImageInputError("Image URL must be a data: URI or http(s) URL");
-  }
-
-  const signal =
-    typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
-      ? AbortSignal.timeout(15_000)
-      : undefined;
-  let res: Response;
-  try {
-    res = await fetchImpl(parsed, { redirect: "follow", signal });
-  } catch (err) {
-    throw new ImageInputError(`Failed to fetch image: ${String((err as Error)?.message || err)}`);
-  }
-  if (!res.ok) throw new ImageInputError(`Failed to fetch image (${res.status})`);
-  const mime = (res.headers.get("content-type") || "").split(";")[0]?.trim().toLowerCase() || "image/png";
-  const buf = new Uint8Array(await res.arrayBuffer());
-  assertImageSize(buf.length);
-  if (!buf.length) throw new ImageInputError("Image input is empty");
-  return { data: bytesToBase64(buf), mimeType: mime.startsWith("image/") ? mime : "image/png" };
-}
-
-function isOpenAiImagePart(part: Record<string, unknown>): boolean {
-  const type = String(part.type || "").toLowerCase();
-  return type === "image_url" || type === "input_image" || type === "image";
-}
-
 async function userContentToCursor(
   content: unknown,
   opts?: OpenAiMessagesToCursorOpts,
@@ -290,41 +241,8 @@ async function userContentToCursor(
   if (!Array.isArray(content)) {
     return { role: ROLE.user, text: flattenContent(content) };
   }
-  const parts: Array<Record<string, unknown>> = [];
-  let hasImage = false;
-  for (const part of content) {
-    if (typeof part === "string") {
-      if (part) parts.push({ text: { text: part } });
-      continue;
-    }
-    if (!part || typeof part !== "object") continue;
-    const p = part as Record<string, unknown>;
-    if (isOpenAiImagePart(p)) {
-      const url = extractOpenAiImageUrl(p);
-      if (!url) throw new ImageInputError("Image part is missing a url");
-      const img = await resolveCursorImage(url, opts?.fetch ?? fetch);
-      parts.push({ image: { data: img.data, mimeType: img.mimeType } });
-      hasImage = true;
-      continue;
-    }
-    if (p.type === "thinking") continue;
-    const text = p.type === "text" || typeof p.text === "string" ? String(p.text || "") : "";
-    if (text) parts.push({ text: { text } });
-  }
-  if (!hasImage) return { role: ROLE.user, text: flattenContent(content) };
-  return { role: ROLE.user, parts: { parts } };
-}
-
-export function countCursorImageParts(messages: CursorMessage[]): number {
-  let n = 0;
-  for (const m of messages || []) {
-    const parts = (m.parts as { parts?: unknown[] } | undefined)?.parts;
-    if (!Array.isArray(parts)) continue;
-    for (const part of parts) {
-      if (part && typeof part === "object" && (part as Record<string, unknown>).image) n += 1;
-    }
-  }
-  return n;
+  const converted = await openaiContentToCursorParts(content, opts);
+  return userMessageFromParts(ROLE.user, converted);
 }
 
 function tryJsonParse(text: string): { ok: true; value: unknown } | { ok: false } {
@@ -558,16 +476,124 @@ export function openaiToolsToCursor(tools: unknown): CursorTool[] {
   if (!Array.isArray(tools)) return [];
   return tools
     .map((t) => {
-      const fn = (t as Record<string, unknown>)?.function || t;
-      const rec = fn as Record<string, unknown>;
-      if (!rec?.name) return null;
+      const rec = t as Record<string, unknown>;
+      const type = String(rec?.type || "function").toLowerCase();
+      if (type && type !== "function") return null;
+      const fn = rec?.function || t;
+      const fnRec = fn as Record<string, unknown>;
+      if (!fnRec?.name) return null;
       return {
-        name: String(rec.name),
-        description: String(rec.description || ""),
-        parameters: (rec.parameters as JsonObject) || { type: "object", properties: {} },
+        name: String(fnRec.name),
+        description: String(fnRec.description || ""),
+        parameters: (fnRec.parameters as JsonObject) || { type: "object", properties: {} },
       };
     })
     .filter((t): t is CursorTool => t != null);
+}
+
+export function openaiProviderDefinedTools(tools: unknown): CursorProviderTool[] {
+  if (!Array.isArray(tools)) return [];
+  const out: CursorProviderTool[] = [];
+  for (const t of tools) {
+    const rec = t as Record<string, unknown>;
+    const type = String(rec?.type || "").toLowerCase();
+    if (!type || type === "function") continue;
+    const name = String(rec.name || rec.id || type);
+    const options: Record<string, unknown> = { ...rec };
+    delete options.type;
+    delete options.name;
+    delete options.id;
+    out.push({ name, id: String(rec.id || name), type, options: options as Json });
+  }
+  return out;
+}
+
+export function mergeProviderDefinedTools(
+  fromTools: CursorProviderTool[],
+  fromBody: unknown,
+): CursorProviderTool[] {
+  const extra: CursorProviderTool[] = [];
+  if (Array.isArray(fromBody)) {
+    for (const t of fromBody) {
+      const rec = t as Record<string, unknown>;
+      if (!rec) continue;
+      const name = String(rec.name || rec.id || rec.type || "");
+      if (!name) continue;
+      extra.push({
+        name,
+        id: String(rec.id || name),
+        type: String(rec.type || name),
+        options: (rec.options ?? rec) as Json,
+      });
+    }
+  }
+  const seen = new Set<string>();
+  const out: CursorProviderTool[] = [];
+  for (const t of [...fromTools, ...extra]) {
+    const key = `${t.type}:${t.name}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(t);
+  }
+  return out;
+}
+
+export function applyToolPolicy(
+  messages: CursorMessage[],
+  tools: CursorTool[],
+  body: Record<string, unknown> | null | undefined,
+): { messages: CursorMessage[]; tools: CursorTool[]; injectToolsPrompt: boolean } {
+  const choice = body?.tool_choice ?? body?.toolChoice;
+  const parallel = body?.parallel_tool_calls ?? body?.parallelToolCalls;
+  const injectFlag = body?.inject_tools_prompt !== false && body?.injectToolsPrompt !== false;
+
+  if (choice === "none" || (choice && typeof choice === "object" && String((choice as Record<string, unknown>).type).toLowerCase() === "none")) {
+    return { messages, tools: [], injectToolsPrompt: false };
+  }
+
+  let selected = tools;
+  const extra: string[] = [];
+  if (choice === "required" || choice === "any") {
+    extra.push("You MUST call at least one tool from the catalog. Do not respond with only text.");
+  }
+  if (choice && typeof choice === "object") {
+    const rec = choice as Record<string, unknown>;
+    const type = String(rec.type || "").toLowerCase();
+    if (type === "any" || type === "required") {
+      extra.push("You MUST call at least one tool from the catalog. Do not respond with only text.");
+    }
+    const fn = rec.function as Record<string, unknown> | undefined;
+    const name = String(fn?.name || (type === "tool" || type === "function" ? rec.name : "") || "");
+    if (name) {
+      selected = tools.filter((t) => t.name === name);
+      extra.push(`You MUST call the tool named ${name}. Do not call any other tool.`);
+    }
+  }
+  if (parallel === false) extra.push("Call at most one tool in this turn.");
+  let next = messages || [];
+  if (extra.length) {
+    next = [{ role: ROLE.user, text: `<tool-policy>\n${[...new Set(extra)].join("\n")}\n</tool-policy>` }, ...next];
+  }
+  return { messages: next, tools: selected, injectToolsPrompt: injectFlag && selected.length > 0 };
+}
+
+export function applyResponseFormat(
+  messages: CursorMessage[],
+  body: Record<string, unknown> | null | undefined,
+): CursorMessage[] {
+  const rf = (body?.response_format ?? body?.responseFormat) as Record<string, unknown> | undefined;
+  if (!rf || typeof rf !== "object") return messages;
+  const type = String(rf.type || "").toLowerCase();
+  let inner = "";
+  if (type === "json_object") {
+    inner = "Respond with a single JSON object only. No markdown fences.";
+  } else if (type === "json_schema") {
+    const schema = (rf.json_schema as Record<string, unknown> | undefined)?.schema ?? rf.schema;
+    inner = `Respond with JSON matching this schema:\n${JSON.stringify(schema ?? {})}`;
+  } else {
+    return messages;
+  }
+  return [{ role: ROLE.user, text: `<output-format>\n${inner}\n</output-format>` }, ...(messages || [])];
 }
 
 export function anthropicToolsToCursor(tools: unknown): CursorTool[] {
@@ -699,18 +725,16 @@ export async function openaiMessagesToCursor(
       continue;
     }
     if (role === "tool") {
+      const part = await contentToToolResultPart(
+        rec.tool_call_id || rec.toolCallId,
+        String(rec.name || ""),
+        rec.content,
+        Boolean(rec.is_error),
+        opts,
+      );
       out.push({
         role: ROLE.tool,
-        toolContent: {
-          parts: [
-            {
-              toolCallId: rec.tool_call_id || rec.toolCallId,
-              toolName: rec.name || "",
-              result: flattenContent(rec.content),
-              isError: Boolean(rec.is_error),
-            },
-          ],
-        },
+        toolContent: { parts: [part] },
       });
     }
   }
@@ -718,7 +742,10 @@ export async function openaiMessagesToCursor(
   return out;
 }
 
-export function anthropicToCursor(body: Record<string, unknown>): CursorMessage[] {
+export async function anthropicToCursor(
+  body: Record<string, unknown>,
+  opts?: OpenAiMessagesToCursorOpts,
+): Promise<CursorMessage[]> {
   const messages: CursorMessage[] = [];
   if (body.system) {
     const folded = systemAsUser([flattenContent(body.system)]);
@@ -759,19 +786,31 @@ export function anthropicToCursor(body: Record<string, unknown>): CursorMessage[
       continue;
     }
     const texts: string[] = [];
+    const mediaParts: Array<Record<string, unknown>> = [];
     const results: unknown[] = [];
     for (const part of content as Array<Record<string, unknown>>) {
       if (part.type === "text") texts.push(String(part.text || ""));
+      if (part.type === "image" || part.type === "document" || part.type === "file") {
+        const converted = await anthropicContentToCursorParts([part], opts);
+        mediaParts.push(...converted.parts);
+      }
       if (part.type === "tool_result") {
-        results.push({
-          toolCallId: part.tool_use_id,
-          toolName: part.name || "",
-          result: flattenContent(part.content) || String(part.content ?? ""),
-          isError: Boolean(part.is_error),
-        });
+        const inner = await contentToToolResultPart(
+          part.tool_use_id,
+          String(part.name || ""),
+          part.content,
+          Boolean(part.is_error),
+          opts,
+        );
+        results.push(inner);
       }
     }
-    if (texts.filter(Boolean).length) messages.push({ role: ROLE.user, text: texts.filter(Boolean).join("\n") });
+    if (mediaParts.length) {
+      const textParts = texts.filter(Boolean).map((text) => ({ text: { text } }));
+      messages.push({ role: ROLE.user, parts: { parts: [...textParts, ...mediaParts] } });
+    } else if (texts.filter(Boolean).length) {
+      messages.push({ role: ROLE.user, text: texts.filter(Boolean).join("\n") });
+    }
     if (results.length) messages.push({ role: ROLE.tool, toolContent: { parts: results } });
   }
   return messages;
@@ -780,20 +819,31 @@ export function anthropicToCursor(body: Record<string, unknown>): CursorMessage[
 export function cursorBody(opts: {
   messages: CursorMessage[];
   tools?: CursorTool[];
+  providerDefinedTools?: CursorProviderTool[];
   injectToolsPrompt?: boolean;
   model?: unknown;
   conversationId: string;
   conversationGroupId?: string;
   maxTokens?: unknown;
   temperature?: unknown;
+  topP?: unknown;
+  stopSequences?: string[];
   reasoningEffort?: unknown;
   fast?: boolean;
+  maxMode?: boolean;
+  invocationId?: unknown;
+  automationId?: unknown;
+  inferenceReason?: unknown;
 }): Record<string, unknown> {
   const { routeId: modelId, clientModel } = resolveCursorModelRoute(opts.model, {
     fast: opts.fast,
     reasoningEffort: opts.reasoningEffort,
   });
-  const requestedModel: Record<string, unknown> = { modelId, maxMode: false, builtInModel: true };
+  const requestedModel: Record<string, unknown> = {
+    modelId,
+    maxMode: Boolean(opts.maxMode),
+    builtInModel: true,
+  };
   if (!/^cursor-grok-/i.test(modelId)) {
     const effort = mapGrokEffort(modelId, opts.reasoningEffort);
     if (effort) requestedModel.parameters = [{ id: "effort", value: effort }];
@@ -808,12 +858,57 @@ export function cursorBody(opts: {
     requestedModel,
   };
   if (opts.tools?.length) body.tools = opts.tools;
+  if (opts.providerDefinedTools?.length) body.providerDefinedTools = opts.providerDefinedTools;
   const config: Record<string, unknown> = {};
   const maxTokens = normalizeMaxTokensForModel(modelId, clientModel, opts.maxTokens);
   if (maxTokens != null) config.maxTokens = maxTokens;
   if (Number.isFinite(Number(opts.temperature))) config.temperature = Number(opts.temperature);
+  if (Number.isFinite(Number(opts.topP))) config.topP = Number(opts.topP);
+  if (opts.stopSequences?.length) config.stopSequences = opts.stopSequences;
   if (Object.keys(config).length) body.modelConfig = config;
+  const invocationId = String(opts.invocationId || "").trim();
+  if (invocationId) body.invocationId = invocationId;
+  const automationId = String(opts.automationId || "").trim();
+  if (automationId) body.automationId = automationId;
+  const inferenceReason = String(opts.inferenceReason || "").trim();
+  if (inferenceReason) body.inferenceReason = inferenceReason;
   return body;
+}
+
+export function cursorBodyFromClient(
+  body: Record<string, unknown>,
+  opts: {
+    messages: CursorMessage[];
+    tools: CursorTool[];
+    conversationId: string;
+    conversationGroupId?: string;
+  },
+): Record<string, unknown> {
+  const policy = applyToolPolicy(opts.messages, opts.tools, body);
+  const messages = applyResponseFormat(policy.messages, body);
+  const providerDefinedTools = mergeProviderDefinedTools(
+    openaiProviderDefinedTools(body.tools),
+    body.provider_defined_tools ?? body.providerDefinedTools,
+  );
+  return cursorBody({
+    messages,
+    tools: policy.tools,
+    providerDefinedTools,
+    injectToolsPrompt: policy.injectToolsPrompt,
+    model: body.model,
+    conversationId: opts.conversationId,
+    conversationGroupId: opts.conversationGroupId,
+    maxTokens: extractMaxTokens(body),
+    temperature: body.temperature,
+    topP: extractTopP(body),
+    stopSequences: extractStopSequences(body),
+    reasoningEffort: extractReasoningEffort(body),
+    fast: extractFastMode(body),
+    maxMode: extractMaxMode(body),
+    invocationId: body.invocation_id ?? body.invocationId,
+    automationId: body.automation_id ?? body.automationId,
+    inferenceReason: body.inference_reason ?? body.inferenceReason,
+  });
 }
 
 function mergeToolCallParts(frames: ConnectFrame[]): MergedToolCall[] {
@@ -842,6 +937,39 @@ function mergeToolCallParts(frames: ConnectFrame[]): MergedToolCall[] {
       return row;
     })
     .filter((row) => row.name || row.complete);
+}
+
+function collectImageDescriptions(frames: ConnectFrame[]): ImageDescription[] {
+  const out: ImageDescription[] = [];
+  for (const frame of frames) {
+    const j = frame.json;
+    if (!j) continue;
+    const bag = (j.imageDescriptions || j.image_descriptions) as Record<string, unknown> | undefined;
+    const list = Array.isArray(bag)
+      ? bag
+      : Array.isArray(bag?.descriptions)
+        ? (bag.descriptions as unknown[])
+        : [];
+    for (const item of list) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      const description = String(rec.description || rec.text || "");
+      if (!description) continue;
+      out.push({
+        messageIndex: Number.isFinite(Number(rec.messageIndex ?? rec.message_index))
+          ? Number(rec.messageIndex ?? rec.message_index)
+          : undefined,
+        partIndex: Number.isFinite(Number(rec.partIndex ?? rec.part_index))
+          ? Number(rec.partIndex ?? rec.part_index)
+          : undefined,
+        expContentIndex: Number.isFinite(Number(rec.expContentIndex ?? rec.exp_content_index))
+          ? Number(rec.expContentIndex ?? rec.exp_content_index)
+          : undefined,
+        description,
+      });
+    }
+  }
+  return out;
 }
 
 export function collectTurn(frames: ConnectFrame[]) {
@@ -874,6 +1002,7 @@ export function collectTurn(frames: ConnectFrame[]) {
     providerMetadata,
     error,
     toolCalls: mergeToolCallParts(frames),
+    imageDescriptions: collectImageDescriptions(frames),
   };
 }
 
@@ -964,6 +1093,7 @@ export function toOpenAICompletion({
     usage: toOpenAIUsage(normalizeCursorUsage(turn)),
     conversation_id: conversationId,
     session_id: conversationId,
+    image_descriptions: turn.imageDescriptions?.length ? turn.imageDescriptions : undefined,
     error: turn.error || undefined,
   };
 }
@@ -1008,6 +1138,7 @@ export function toAnthropicMessage({
     },
     conversation_id: conversationId,
     session_id: conversationId,
+    image_descriptions: turn.imageDescriptions?.length ? turn.imageDescriptions : undefined,
   };
 }
 
@@ -1060,6 +1191,7 @@ type OpenAiSseStreamState = {
   providerMetadata: unknown;
   error: unknown;
   errorEmitted: boolean;
+  imageDescriptions: ImageDescription[];
 };
 
 function newOpenAiSseStreamState(): OpenAiSseStreamState {
@@ -1072,6 +1204,7 @@ function newOpenAiSseStreamState(): OpenAiSseStreamState {
     providerMetadata: null,
     error: null,
     errorEmitted: false,
+    imageDescriptions: [],
   };
 }
 
@@ -1153,6 +1286,8 @@ function sseChunksFromConnectFrame(
   if (j.usage) state.usage = j.usage;
   if (j.extendedUsage) state.extendedUsage = j.extendedUsage;
   if (j.providerMetadata) state.providerMetadata = j.providerMetadata;
+  const desc = collectImageDescriptions([frame]);
+  if (desc.length) state.imageDescriptions.push(...desc);
   if (j.error) {
     state.error = j.error;
     if (!state.errorEmitted) {
@@ -1213,6 +1348,7 @@ function enqueueOpenAiSseFinish(
       ...errorField,
       choices: [{ index: 0, delta: {}, finish_reason: oaiCalls.length ? "tool_calls" : "stop" }],
       usage,
+      image_descriptions: state.imageDescriptions.length ? state.imageDescriptions : undefined,
     }),
   );
   enqueue(encodeSseData({ ...base(), ...errorField, choices: [], usage }));
@@ -1354,6 +1490,344 @@ export async function streamOpenAiChatCompletion(opts: {
         if (!upstreamAbort.signal.aborted) {
           enqueueOpenAiSseFinish(enqueue, base, state, opts.tools);
           enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+        }
+        controller.close();
+      } catch (err) {
+        if (isAbortError(err) || upstreamAbort.signal.aborted) {
+          try {
+            await reader.cancel();
+          } catch {
+            /* empty */
+          }
+          controller.close();
+          return;
+        }
+        controller.error(err);
+      }
+    },
+    cancel() {
+      upstreamAbort.abort();
+      reader.cancel().catch(() => {});
+    },
+  });
+
+  return sseStreamResponse(stream, opts.sessionId || opts.conversationId);
+}
+
+type AnthropicSseState = OpenAiSseStreamState & {
+  thinkingOpen: boolean;
+  textOpen: boolean;
+  nextIndex: number;
+  thinkingIndex: number;
+  textIndex: number;
+};
+
+function newAnthropicSseState(): AnthropicSseState {
+  return {
+    ...newOpenAiSseStreamState(),
+    thinkingOpen: false,
+    textOpen: false,
+    nextIndex: 0,
+    thinkingIndex: 0,
+    textIndex: 0,
+  };
+}
+
+function sseChunksFromConnectFrameAnthropic(
+  frame: ConnectFrame,
+  state: AnthropicSseState,
+): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  const j = frame.json;
+  if (!j) return out;
+
+  const thinkingPart = j.thinkingPart as Record<string, unknown> | undefined;
+  if (thinkingPart?.text) {
+    const chunk = String(thinkingPart.text);
+    state.accumulatedThinking += chunk;
+    if (chunk) {
+      if (!state.thinkingOpen) {
+        state.thinkingIndex = state.nextIndex++;
+        state.thinkingOpen = true;
+        out.push(
+          encodeSseEvent("content_block_start", {
+            type: "content_block_start",
+            index: state.thinkingIndex,
+            content_block: { type: "thinking", thinking: "" },
+          }),
+        );
+      }
+      out.push(
+        encodeSseEvent("content_block_delta", {
+          type: "content_block_delta",
+          index: state.thinkingIndex,
+          delta: { type: "thinking_delta", thinking: chunk },
+        }),
+      );
+    }
+    if (thinkingPart.signature) {
+      if (!state.thinkingOpen) {
+        state.thinkingIndex = state.nextIndex++;
+        state.thinkingOpen = true;
+        out.push(
+          encodeSseEvent("content_block_start", {
+            type: "content_block_start",
+            index: state.thinkingIndex,
+            content_block: { type: "thinking", thinking: "" },
+          }),
+        );
+      }
+      out.push(
+        encodeSseEvent("content_block_delta", {
+          type: "content_block_delta",
+          index: state.thinkingIndex,
+          delta: { type: "signature_delta", signature: String(thinkingPart.signature) },
+        }),
+      );
+    }
+  }
+
+  const textPart = j.textPart as Record<string, unknown> | undefined;
+  if (textPart?.text) {
+    const chunk = String(textPart.text);
+    state.accumulatedText += chunk;
+    if (chunk) {
+      if (!state.textOpen) {
+        state.textIndex = state.nextIndex++;
+        state.textOpen = true;
+        out.push(
+          encodeSseEvent("content_block_start", {
+            type: "content_block_start",
+            index: state.textIndex,
+            content_block: { type: "text", text: "" },
+          }),
+        );
+      }
+      out.push(
+        encodeSseEvent("content_block_delta", {
+          type: "content_block_delta",
+          index: state.textIndex,
+          delta: { type: "text_delta", text: chunk },
+        }),
+      );
+    }
+  }
+
+  const part = j.toolCallPart as Record<string, unknown> | undefined;
+  if (part?.toolCallId) {
+    const id = sanitizeToolCallId(part.toolCallId);
+    if (!state.toolRows.has(id)) {
+      state.toolRows.set(id, {
+        id,
+        name: "",
+        args: "",
+        index: Number.isFinite(Number(part.toolIndex)) ? Number(part.toolIndex) : state.toolRows.size,
+      });
+    }
+    const row = state.toolRows.get(id)!;
+    if (part.toolName) row.name = String(part.toolName);
+    if (Number.isFinite(Number(part.toolIndex))) row.index = Number(part.toolIndex);
+    if (part.args != null && part.args !== "") {
+      row.args = absorbArgsChunk(row.args, part.args, { complete: Boolean(part.isComplete) });
+    }
+  }
+
+  if (j.usage) state.usage = j.usage;
+  if (j.extendedUsage) state.extendedUsage = j.extendedUsage;
+  if (j.providerMetadata) state.providerMetadata = j.providerMetadata;
+  const desc = collectImageDescriptions([frame]);
+  if (desc.length) state.imageDescriptions.push(...desc);
+  if (j.error) state.error = j.error;
+  return out;
+}
+
+function enqueueAnthropicSseFinish(
+  enqueue: (bytes: Uint8Array) => void,
+  state: AnthropicSseState,
+  tools?: CursorTool[],
+): void {
+  if (state.thinkingOpen) {
+    enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index: state.thinkingIndex }));
+  }
+  if (state.textOpen) {
+    enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index: state.textIndex }));
+  }
+  const merged = mergedToolCallsFromState(state);
+  for (const c of merged) {
+    const index = state.nextIndex++;
+    const input = coerceJsonBySchema(parseArgs(c.args), schemaForTool(tools, c.name));
+    enqueue(
+      encodeSseEvent("content_block_start", {
+        type: "content_block_start",
+        index,
+        content_block: { type: "tool_use", id: c.id, name: c.name, input },
+      }),
+    );
+    enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index }));
+  }
+  const u = toOpenAIUsage(
+    normalizeCursorUsage({
+      usage: state.usage,
+      extendedUsage: state.extendedUsage,
+      providerMetadata: state.providerMetadata,
+    }),
+  );
+  const stopReason = merged.length ? "tool_use" : "end_turn";
+  enqueue(
+    encodeSseEvent("message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: u.completion_tokens },
+    }),
+  );
+  enqueue(encodeSseEvent("message_stop", { type: "message_stop" }));
+}
+
+/** Test helper: Connect frames → Anthropic SSE. */
+export function buildAnthropicSseStreamFromFramePayloads(opts: {
+  frameChunks: Uint8Array[];
+  model: unknown;
+  conversationId: string;
+  tools?: CursorTool[];
+}): ReadableStream<Uint8Array> {
+  const id = `msg_${opts.conversationId.slice(0, 8)}`;
+  const model = resolveModel(opts.model);
+  const state = newAnthropicSseState();
+  const parser = new ConnectFrameParser();
+  return new ReadableStream({
+    async start(controller) {
+      const enqueue = (bytes: Uint8Array) => controller.enqueue(bytes);
+      enqueue(
+        encodeSseEvent("message_start", {
+          type: "message_start",
+          message: {
+            id,
+            type: "message",
+            role: "assistant",
+            model,
+            content: [],
+            stop_reason: null,
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        }),
+      );
+      for (const chunk of opts.frameChunks) {
+        parser.push(chunk);
+        const frames = await parser.drainAvailableFrames();
+        for (const frame of frames) {
+          for (const bytes of sseChunksFromConnectFrameAnthropic(frame, state)) enqueue(bytes);
+        }
+      }
+      enqueueAnthropicSseFinish(enqueue, state, opts.tools);
+      controller.close();
+    },
+  });
+}
+
+export async function streamAnthropicMessage(opts: {
+  accessToken: string;
+  body: Record<string, unknown>;
+  sessionId?: string;
+  model: unknown;
+  conversationId: string;
+  tools?: CursorTool[];
+  signal?: AbortSignal;
+}): Promise<Response> {
+  const upstreamAbort = upstreamAbortFromClient(opts.signal);
+  if (upstreamAbort.signal.aborted) {
+    return jsonResponse(
+      499,
+      { error: { message: "client closed request", type: "invalid_request_error" } },
+      opts.sessionId,
+    );
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${CURSOR_BASE}/aiserver.v1.InferenceService/Stream`, {
+      method: "POST",
+      headers: {
+        ...inferenceHeaders(opts.accessToken, opts.sessionId),
+        "content-type": "application/connect+json",
+        "connect-accept-encoding": "gzip",
+      },
+      body: bytesBody(encodeConnectFrame(opts.body)),
+      signal: upstreamAbort.signal,
+    });
+  } catch (err) {
+    if (isAbortError(err) || upstreamAbort.signal.aborted) {
+      return jsonResponse(
+        499,
+        { error: { message: "client closed request", type: "invalid_request_error" } },
+        opts.sessionId,
+      );
+    }
+    throw err;
+  }
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    return jsonResponse(
+      res.status,
+      {
+        error: {
+          message: detail || res.statusText || "inference stream failed",
+          type: "server_error",
+        },
+      },
+      opts.sessionId,
+    );
+  }
+  if (!res.body) {
+    return jsonResponse(
+      502,
+      { error: { message: "empty inference stream body", type: "server_error" } },
+      opts.sessionId,
+    );
+  }
+
+  const id = `msg_${opts.conversationId.slice(0, 8)}`;
+  const model = resolveModel(opts.model);
+  const state = newAnthropicSseState();
+  const parser = new ConnectFrameParser();
+  const reader = res.body.getReader();
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const enqueue = (bytes: Uint8Array) => controller.enqueue(bytes);
+      enqueue(
+        encodeSseEvent("message_start", {
+          type: "message_start",
+          message: {
+            id,
+            type: "message",
+            role: "assistant",
+            model,
+            content: [],
+            stop_reason: null,
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        }),
+      );
+      try {
+        while (true) {
+          if (upstreamAbort.signal.aborted) break;
+          const { done, value } = await reader.read();
+          if (value?.length) parser.push(value);
+          let frames = await parser.drainAvailableFrames();
+          for (const frame of frames) {
+            for (const bytes of sseChunksFromConnectFrameAnthropic(frame, state)) enqueue(bytes);
+          }
+          if (done) {
+            frames = await parser.drainAvailableFrames();
+            for (const frame of frames) {
+              for (const bytes of sseChunksFromConnectFrameAnthropic(frame, state)) enqueue(bytes);
+            }
+            break;
+          }
+        }
+        if (!upstreamAbort.signal.aborted) {
+          enqueueAnthropicSseFinish(enqueue, state, opts.tools);
         }
         controller.close();
       } catch (err) {

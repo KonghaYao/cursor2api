@@ -50,7 +50,7 @@ deno task start
 | `GET /health` | 存活检查 |
 | `GET /v1/models` | Cursor 可用模型（原生 route id） |
 | `POST /v1/chat/completions` | OpenAI Chat Completions（含 `stream`） |
-| `POST /v1/messages` | Anthropic Messages |
+| `POST /v1/messages` | Anthropic Messages（含 `stream`） |
 
 ### 模型 id（简写）
 
@@ -67,6 +67,46 @@ deno task start
 ### 消息与工具
 
 Cursor 会丢掉 `role: system`，网关会折进 `<system>…</system>` user 消息。**带 `tools[]` 时**会拆成 `<tools-rules>`（固定 agent 约束，可缓存）与 `<tools-catalog>`（按工具名排序的稳定 schema 列表，随工具集变化），并仍传 `body.tools`；`<tools-rules>` 与 `<system>` 会各打 prompt cache 断点。不需要注入时可设 `inject_tools_prompt: false`。
+
+`tool_choice`：`none` 不传 tools；`required` / Anthropic `any` 注入必须调工具的约束；`{type:"function",function:{name}}` 只保留该工具。`parallel_tool_calls: false` 约束本轮最多一个 tool_call。非 `function` 的 OpenAI tool（如 `web_search_preview`）以及 `provider_defined_tools` 会写入 Cursor `providerDefinedTools`。
+
+`response_format`：`json_object` / `json_schema` 折进 `<output-format>` user 消息（Cursor 无原生 JSON mode）。`n > 1` 返回 400。`max_completion_tokens` 作为 `max_tokens` 别名。`top_p` / `stop` 写入 `modelConfig`。
+
+### 图片 / 文件输入
+
+`POST /v1/chat/completions` 与 `POST /v1/messages` 都把多模态 content 转成 Cursor `InferenceContentPart`（`parts.parts[]` 的 `text` / `image` / `file`）。**不能**压成纯文本。
+
+| 客户端 | 网关 |
+|--------|------|
+| OpenAI `image_url` / `input_image`（data URI 或 http(s)） | `image.data` 裸 base64 + `mimeType` |
+| Anthropic `{type:"image", source:{type:"base64"}}` | 同上 |
+| OpenAI `file` / Anthropic `document` | `file.data` + `mediaType` + `filename` |
+| `role: tool` / `tool_result` 里的图 | `experimentalContent`（文本仍在 `result`） |
+
+http(s) 由网关拉取（最大 10MB）。非法 URL 返回 **400**。`image_url.detail` 无对应字段，忽略。上游若回 `image_descriptions`，会出现在响应 JSON（流式在最后一包）。
+
+```bash
+curl -sS "$BASE/chat/completions" -H 'content-type: application/json' \
+  -H "authorization: Bearer $KEY" \
+  -d '{
+    "model": "composer-2.5-fast",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "这张图里有什么？"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
+      ]
+    }]
+  }'
+```
+
+### Composer Max
+
+`requestedModel.maxMode`（与 Fast route 独立）。任选：`max` / `max_mode` / `maxMode`、`metadata.max`、`extra_body.max_mode`。
+
+### 未提供的 OpenAI 表面
+
+Cursor Inference **没有** embeddings / TTS / STT / Images API / Responses API。对应路径返回 **501**（生图像素仍需 Agent 执行 `generate_image` tool_call，见下文实验脚本）。`n`、`seed`、`logprobs`、penalty 字段无 proto 对应：`n>1` 拒绝，其余忽略。
 
 ### 多轮会话（无 client session id）
 
@@ -93,4 +133,4 @@ npm test
 deno task test   # 或 npm run test:deno — handler 集成（mock Cursor，无需 API key）
 ```
 
-模型映射用例见 `src/lib/inference.model.test.ts`；流式 SSE 见 `src/lib/connect_stream.test.ts`。
+模型映射、图片/文件与 tool_choice 用例见 `src/lib/inference.model.test.ts`、`src/lib/inference.compat.test.ts`；流式 SSE 见 `src/lib/connect_stream.test.ts`。

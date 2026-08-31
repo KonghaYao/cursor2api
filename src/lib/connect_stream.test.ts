@@ -5,7 +5,7 @@ import {
   encodeConnectFrame,
   encodeSseData,
 } from "./bytes.ts";
-import { buildOpenAiSseStreamFromFramePayloads, upstreamAbortFromClient } from "./inference.ts";
+import { buildOpenAiSseStreamFromFramePayloads, buildAnthropicSseStreamFromFramePayloads, upstreamAbortFromClient } from "./inference.ts";
 
 test("ConnectFrameParser parses two frames split across chunk boundaries", async () => {
   const f1 = encodeConnectFrame({ textPart: { text: "hello" } });
@@ -112,4 +112,31 @@ test("upstreamAbortFromClient aborts when client signal aborts", () => {
   client.abort("bye");
   assert.equal(upstream.signal.aborted, true);
   assert.equal(upstream.signal.reason, "bye");
+});
+
+test("Anthropic SSE stream emits event-named text deltas and complete tool_use at end", async () => {
+  const payloads = [
+    encodeConnectFrame({ thinkingPart: { text: "hmm" } }),
+    encodeConnectFrame({ textPart: { text: "hi" } }),
+    encodeConnectFrame({
+      toolCallPart: { toolCallId: "call_1", toolIndex: 0, toolName: "lookup", args: '{"q":"a"}', isComplete: true },
+    }),
+  ];
+  const stream = buildAnthropicSseStreamFromFramePayloads({
+    frameChunks: payloads,
+    model: "composer-2.5-fast",
+    conversationId: "sess-ant123",
+    tools: [{ name: "lookup", description: "", parameters: { type: "object", properties: { q: { type: "string" } } } }],
+  });
+  const text = await new Response(stream).text();
+  assert.ok(text.includes("event: message_start"), text);
+  assert.ok(text.includes("event: content_block_delta"), text);
+  assert.ok(text.includes('"thinking":"hmm"'), text);
+  assert.ok(text.includes('"text":"hi"'), text);
+  assert.ok(text.includes('"type":"tool_use"'), text);
+  assert.ok(text.includes('"name":"lookup"'), text);
+  assert.ok(text.includes('"stop_reason":"tool_use"'), text);
+  assert.ok(text.includes("event: message_stop"), text);
+  const toolStarts = text.split("event: content_block_start").filter((s) => s.includes("tool_use"));
+  assert.equal(toolStarts.length, 1, "expected one complete tool_use block");
 });

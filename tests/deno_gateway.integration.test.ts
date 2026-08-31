@@ -210,3 +210,175 @@ Deno.test("POST /v1/chat/completions forwards OpenAI image_url as Cursor image p
     globalThis.fetch = original;
   }
 });
+
+Deno.test("POST /v1/messages stream=true returns Anthropic SSE", async () => {
+  const kv = createMemoryKv();
+  const original = installMockFetch({
+    onStream: () => {
+      const frame = encodeConnectFrame({ textPart: { text: "hello" } });
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(frame);
+            controller.close();
+          },
+        }),
+        { status: 200 },
+      );
+    },
+  });
+  try {
+    const res = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${TEST_JWT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "composer-2.5-fast",
+          stream: true,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      }),
+      { kv },
+    );
+    if (res.status !== 200) throw new Error(`expected 200, got ${res.status}: ${await res.text()}`);
+    const text = await res.text();
+    if (!text.includes("event: message_start")) throw new Error(`missing message_start: ${text.slice(0, 400)}`);
+    if (!text.includes('"text":"hello"')) throw new Error(`missing text: ${text.slice(0, 400)}`);
+    if (!text.includes("event: message_stop")) throw new Error("missing message_stop");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+Deno.test("POST /v1/messages forwards Anthropic image blocks", async () => {
+  const kv = createMemoryKv();
+  let upstream: Record<string, unknown> | undefined;
+  const original = installMockFetch({
+    onStream: (init) => {
+      upstream = decodeConnectJson(init?.body ?? null);
+      const frame = encodeConnectFrame({ textPart: { text: "ok" } });
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(frame);
+            controller.close();
+          },
+        }),
+        { status: 200 },
+      );
+    },
+  });
+  try {
+    const res = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${TEST_JWT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "composer-2.5-fast",
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "look" },
+                { type: "image", source: { type: "base64", media_type: "image/png", data: TINY_PNG_B64 } },
+              ],
+            },
+          ],
+        }),
+      }),
+      { kv },
+    );
+    if (res.status !== 200) throw new Error(`expected 200, got ${res.status}: ${await res.text()}`);
+    const blob = JSON.stringify(upstream);
+    if (!blob.includes(TINY_PNG_B64)) throw new Error(`image not forwarded: ${blob.slice(0, 500)}`);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+Deno.test("POST /v1/chat/completions n>1 is 400", async () => {
+  const kv = createMemoryKv();
+  const res = await handleGatewayRequest(
+    new Request("http://127.0.0.1/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TEST_JWT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "composer-2.5-fast",
+        n: 2,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    }),
+    { kv },
+  );
+  if (res.status !== 400) throw new Error(`expected 400, got ${res.status}: ${await res.text()}`);
+});
+
+Deno.test("POST /v1/embeddings is 501", async () => {
+  const kv = createMemoryKv();
+  const res = await handleGatewayRequest(
+    new Request("http://127.0.0.1/v1/embeddings", {
+      method: "POST",
+      headers: { authorization: `Bearer ${TEST_JWT}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "composer-2.5-fast", input: "hi" }),
+    }),
+    { kv },
+  );
+  if (res.status !== 501) throw new Error(`expected 501, got ${res.status}`);
+});
+
+Deno.test("POST /v1/chat/completions forwards maxMode and top_p", async () => {
+  const kv = createMemoryKv();
+  let upstream: Record<string, unknown> | undefined;
+  const original = installMockFetch({
+    onStream: (init) => {
+      upstream = decodeConnectJson(init?.body ?? null);
+      const frame = encodeConnectFrame({ textPart: { text: "x" } });
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(frame);
+            controller.close();
+          },
+        }),
+        { status: 200 },
+      );
+    },
+  });
+  try {
+    const res = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${TEST_JWT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          max_mode: true,
+          top_p: 0.5,
+          stop: ["END"],
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      }),
+      { kv },
+    );
+    if (res.status !== 200) throw new Error(`expected 200, got ${res.status}: ${await res.text()}`);
+    const rm = upstream?.requestedModel as Record<string, unknown>;
+    if (rm?.maxMode !== true) throw new Error(`maxMode not set: ${JSON.stringify(rm)}`);
+    const cfg = upstream?.modelConfig as Record<string, unknown>;
+    if (cfg?.topP !== 0.5) throw new Error(`topP ${cfg?.topP}`);
+    const stops = cfg?.stopSequences as string[];
+    if (!stops?.includes("END")) throw new Error(`stop ${JSON.stringify(cfg)}`);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

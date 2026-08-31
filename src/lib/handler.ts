@@ -3,8 +3,8 @@ import { corsResponse, jsonResponse } from "./bytes.ts";
 import {
   anthropicToCursor,
   anthropicToolsToCursor,
-  countCursorImageParts,
-  cursorBody,
+  countCursorMediaParts,
+  cursorBodyFromClient,
   extractFastMode,
   extractReasoningEffort,
   resolveCursorModelRoute,
@@ -13,6 +13,7 @@ import {
   openaiMessagesToCursor,
   openaiToolsToCursor,
   streamOpenAiChatCompletion,
+  streamAnthropicMessage,
   toAnthropicMessage,
   toOpenAICompletion,
   toolCallsToOpenAI,
@@ -73,6 +74,26 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
   return JSON.parse(text) as Record<string, unknown>;
 }
 
+function rejectUnsupportedChatOptions(body: Record<string, unknown>): Response | null {
+  const n = Number(body.n);
+  if (Number.isFinite(n) && n > 1) {
+    return jsonResponse(400, {
+      error: { message: "n > 1 is not supported; Cursor Inference returns a single completion", type: "invalid_request_error" },
+    });
+  }
+  return null;
+}
+
+function notImplemented(feature: string): Response {
+  return jsonResponse(501, {
+    error: {
+      message: `${feature} is not available on Cursor InferenceService/Stream`,
+      type: "invalid_request_error",
+      code: "not_implemented",
+    },
+  });
+}
+
 async function runInference(
   ctx: GatewayCtx,
   headers: Headers,
@@ -87,22 +108,9 @@ async function runInference(
     tenant,
     rawMessages,
   );
-  const turn = await inferenceStream(
-    accessToken,
-    cursorBody({
-      messages,
-      tools,
-      injectToolsPrompt: body.inject_tools_prompt !== false && body.injectToolsPrompt !== false,
-      model: body.model,
-      conversationId,
-      conversationGroupId,
-      maxTokens: body.max_tokens,
-      temperature: body.temperature,
-      reasoningEffort: extractReasoningEffort(body),
-      fast: extractFastMode(body),
-    }),
-    { sessionId },
-  );
+  const turn = await inferenceStream(accessToken, cursorBodyFromClient(body, { messages, tools, conversationId, conversationGroupId }), {
+    sessionId,
+  });
   return { turn, conversationId: clientId, sessionId: clientId };
 }
 
@@ -135,9 +143,32 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       return jsonResponse(200, { object: "list", data });
     }
 
+    if (method === "POST" && (url.pathname === "/v1/embeddings" || url.pathname === "/embeddings")) {
+      return notImplemented("Embeddings");
+    }
+    if (
+      method === "POST" &&
+      (url.pathname === "/v1/audio/speech" ||
+        url.pathname === "/v1/audio/transcriptions" ||
+        url.pathname === "/v1/audio/translations")
+    ) {
+      return notImplemented("Audio");
+    }
+    if (
+      method === "POST" &&
+      (url.pathname === "/v1/images/generations" || url.pathname === "/v1/images/edits" || url.pathname === "/v1/images/variations")
+    ) {
+      return notImplemented("Images API (use chat tools / generate_image tool_call; Inference does not return pixels)");
+    }
+    if (method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
+      return notImplemented("OpenAI Responses API");
+    }
+
     if (method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages")) {
       const body = await readJson(request);
-      const messages = anthropicToCursor(body);
+      const unsupported = rejectUnsupportedChatOptions(body);
+      if (unsupported) return unsupported;
+      const messages = await anthropicToCursor(body);
       const tools = anthropicToolsToCursor(body.tools);
       if ((body.thinking as Record<string, unknown> | undefined)?.type === "enabled" && body.reasoning_effort == null) {
         body.reasoning_effort = "high";
@@ -146,9 +177,29 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
         fast: extractFastMode(body),
         reasoningEffort: extractReasoningEffort(body),
       });
+      const media = countCursorMediaParts(messages);
       console.log(
-        `  messages n=${messages.length} tools=${tools.length} model=${route.clientModel || route.routeId} cursorRoute=${route.routeId}`,
+        `  messages n=${messages.length} tools=${tools.length} images=${media.images} files=${media.files} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${route.routeId}`,
       );
+      if (body.stream) {
+        const { accessToken, tenant } = await getAccessToken(ctx, request.headers);
+        const { clientId, conversationId, conversationGroupId } = await resolveChatIdentity(
+          ctx,
+          request.headers,
+          body,
+          tenant,
+          (body.messages as unknown[]) || [],
+        );
+        return streamAnthropicMessage({
+          accessToken,
+          body: cursorBodyFromClient(body, { messages, tools, conversationId, conversationGroupId }),
+          model: body.model,
+          conversationId: clientId,
+          sessionId: clientId,
+          tools,
+          signal: request.signal,
+        });
+      }
       const { turn, conversationId, sessionId } = await runInference(ctx, request.headers, body, {
         messages,
         tools,
@@ -165,15 +216,17 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
 
     if (method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
       const body = await readJson(request);
+      const unsupported = rejectUnsupportedChatOptions(body);
+      if (unsupported) return unsupported;
       const messages = await openaiMessagesToCursor((body.messages as unknown[]) || []);
       const tools = openaiToolsToCursor(body.tools);
       const route = resolveCursorModelRoute(body.model, {
         fast: extractFastMode(body),
         reasoningEffort: extractReasoningEffort(body),
       });
-      const images = countCursorImageParts(messages);
+      const media = countCursorMediaParts(messages);
       console.log(
-        `  chat n=${messages.length} tools=${tools.length} images=${images} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${route.routeId}`,
+        `  chat n=${messages.length} tools=${tools.length} images=${media.images} files=${media.files} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${route.routeId}`,
       );
       if (body.stream) {
         const { accessToken, tenant } = await getAccessToken(ctx, request.headers);
@@ -186,18 +239,7 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
         );
         return streamOpenAiChatCompletion({
           accessToken,
-          body: cursorBody({
-            messages,
-            tools,
-            injectToolsPrompt: body.inject_tools_prompt !== false && body.injectToolsPrompt !== false,
-            model: body.model,
-            conversationId,
-            conversationGroupId,
-            maxTokens: body.max_tokens,
-            temperature: body.temperature,
-            reasoningEffort: extractReasoningEffort(body),
-            fast: extractFastMode(body),
-          }),
+          body: cursorBodyFromClient(body, { messages, tools, conversationId, conversationGroupId }),
           model: body.model,
           conversationId: clientId,
           sessionId: clientId,
