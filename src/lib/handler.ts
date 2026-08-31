@@ -1,5 +1,5 @@
 import { connectUnary, getAccessToken, modelsFrom, AuthError, type GatewayCtx } from "./auth.ts";
-import { corsResponse, jsonResponse, randomId, sseResponse } from "./bytes.ts";
+import { corsResponse, jsonResponse, sseResponse } from "./bytes.ts";
 import {
   anthropicToCursor,
   anthropicToolsToCursor,
@@ -16,6 +16,7 @@ import {
   type CursorMessage,
   type CursorTool,
 } from "./inference.ts";
+import { resolveClientSessionId } from "./session.ts";
 
 function headerValue(headers: Headers, name: string): string | undefined {
   const raw = headers.get(name);
@@ -35,16 +36,26 @@ function incomingSessionId(headers: Headers, body: Record<string, unknown>): str
   return id || undefined;
 }
 
-function resolveChatIdentity(headers: Headers, body: Record<string, unknown>, tenant: string) {
+async function resolveChatIdentity(
+  ctx: GatewayCtx,
+  headers: Headers,
+  body: Record<string, unknown>,
+  tenant: string,
+  rawMessages: unknown[],
+) {
   const periSession = incomingSessionId(headers, body);
-  const clientId = String(
+  const meta = body.metadata && typeof body.metadata === "object" ? (body.metadata as Record<string, unknown>) : {};
+  const explicitId = String(
     body.conversation_id ||
       body.conversationId ||
-      (body.metadata as Record<string, unknown> | undefined)?.conversation_id ||
+      meta.conversation_id ||
       periSession ||
-      randomId(),
-  );
+      "",
+  ).trim();
+
+  const { clientId, source } = await resolveClientSessionId(ctx.kv, tenant, rawMessages, explicitId || undefined);
   const cursorId = `${tenant}:${clientId}`;
+  console.log(`  session ${source} id=${clientId.slice(0, 8)}…`);
   return {
     clientId,
     conversationId: cursorId,
@@ -63,10 +74,16 @@ async function runInference(
   ctx: GatewayCtx,
   headers: Headers,
   body: Record<string, unknown>,
-  { messages, tools }: { messages: CursorMessage[]; tools: CursorTool[] },
+  { messages, tools, rawMessages }: { messages: CursorMessage[]; tools: CursorTool[]; rawMessages: unknown[] },
 ) {
   const { accessToken, tenant } = await getAccessToken(ctx, headers);
-  const { clientId, conversationId, conversationGroupId, sessionId } = resolveChatIdentity(headers, body, tenant);
+  const { clientId, conversationId, conversationGroupId, sessionId } = await resolveChatIdentity(
+    ctx,
+    headers,
+    body,
+    tenant,
+    rawMessages,
+  );
   const turn = await inferenceStream(
     accessToken,
     cursorBody({
@@ -122,7 +139,11 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
         body.reasoning_effort = "high";
       }
       console.log(`  messages n=${messages.length} tools=${tools.length} model=${resolveModel(body.model)}`);
-      const { turn, conversationId, sessionId } = await runInference(ctx, request.headers, body, { messages, tools });
+      const { turn, conversationId, sessionId } = await runInference(ctx, request.headers, body, {
+        messages,
+        tools,
+        rawMessages: (body.messages as unknown[]) || [],
+      });
       if (turn.error) console.log(`  infer error ${JSON.stringify(turn.error).slice(0, 200)}`);
       if (turn.toolCalls?.length) {
         for (const c of toolCallsToOpenAI(turn.toolCalls, tools)) {
@@ -139,7 +160,11 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       console.log(
         `  chat n=${messages.length} tools=${tools.length} stream=${Boolean(body.stream)} model=${resolveModel(body.model)}`,
       );
-      const { turn, conversationId, sessionId } = await runInference(ctx, request.headers, body, { messages, tools });
+      const { turn, conversationId, sessionId } = await runInference(ctx, request.headers, body, {
+        messages,
+        tools,
+        rawMessages: (body.messages as unknown[]) || [],
+      });
       if (turn.error) console.log(`  infer error ${JSON.stringify(turn.error).slice(0, 200)}`);
       if (turn.toolCalls?.length) {
         for (const c of toolCallsToOpenAI(turn.toolCalls, tools)) {

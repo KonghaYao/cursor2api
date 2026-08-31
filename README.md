@@ -56,6 +56,24 @@ deno task start
 
 客户端传什么 `model` 就原样交给 Cursor。Grok 的 `reasoning_effort`：`low` / `medium` / `high` / `xhigh`。Cursor 会丢掉 `role: system`，网关会折进 `<system>…</system>` user 消息；**带 `tools[]` 时**会拆成 `<tools-rules>`（固定 agent 约束，可缓存）与 `<tools-catalog>`（按工具名排序的稳定 schema 列表，随工具集变化），并仍传 `body.tools`；`<tools-rules>` 与 `<system>` 会各打 prompt cache 断点。不需要注入时可设 `inject_tools_prompt: false`。
 
+### 多轮会话（无 client session id）
+
+客户端**不传** `x-session-id` / `conversation_id` 且每轮带**全量** `messages` 时，网关按 API key 指纹在 KV 里做**粘性会话**（默认开启）：
+
+- 判定「新会话」：`messages` 里仅有 **1 条 `user`**（忽略 `system` / `developer`）→ 生成新 `conversation_id`
+- 否则复用该 key 下最近一次会话 id（TTL 默认 3600s，环境变量 `SESSION_STICKY_TTL_SECONDS`）
+- 显式传入 `conversation_id` 或 `x-session-id` 时优先使用；`SESSION_STICKY=0` 可关闭（恢复每请求随机 id）
+
+同一 API key 下**并行多条对话**且都不传 id 时会共用一条 Cursor 会话；生产多实例请绑共享 KV（见 Cloudflare `KV`）。响应头 `x-session-id` 与 JSON 里的 `conversation_id` / `session_id` 仍会返回，便于调试。
+
+### 生图（实验）
+
+`src/lib/cursor_generate_image.ts` + `src/lib/cursor_credentials.ts`：优先 `CURSOR_API_KEY`（`crsr_…`），否则读本机 Cursor `state.vscdb` JWT。可稳定请求 `generate_image` tool_call（默认 `grok-4.6`）；像素数据需 IDE Agent 或带 `bcId` 的 Background Composer artifact 下载。
+
+```bash
+CURSOR_API_KEY=crsr_xxx node --experimental-strip-types src/lib/cursor_generate_image.ts "a red circle icon"
+```
+
 ```bash
 curl -s http://127.0.0.1:8789/v1/chat/completions \
   -H 'content-type: application/json' \

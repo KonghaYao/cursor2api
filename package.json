@@ -10,7 +10,8 @@
     "start:bun": "bun src/node.ts",
     "start:deno": "deno run --allow-net --allow-env src/deno.ts",
     "start:cf": "wrangler dev",
-    "deploy:cf": "wrangler deploy"
+    "deploy:cf": "wrangler deploy",
+    "test": "node --experimental-strip-types --test src/lib/session.test.ts"
   },
   "engines": {
     "node": ">=22.18"
