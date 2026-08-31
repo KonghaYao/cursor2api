@@ -3,6 +3,9 @@ import test from "node:test";
 import {
   cursorBody,
   extractFastMode,
+  GROK_MIN_MAX_TOKENS,
+  isGrokModel,
+  normalizeMaxTokensForModel,
   resolveCursorModelRoute,
 } from "./inference.ts";
 
@@ -68,4 +71,27 @@ test("cursorBody composer fast route", () => {
 test("extractFastMode reads metadata.fast", () => {
   assert.equal(extractFastMode({ metadata: { fast: true } }), true);
   assert.equal(extractFastMode({ model: "composer-2.5-fast" }), false);
+});
+
+test("isGrokModel detects public and cursor flat routes", () => {
+  assert.equal(isGrokModel("cursor-grok-4.6-high-fast"), true);
+  assert.equal(isGrokModel("composer-2.5-fast", "composer-2.5-fast"), false);
+  assert.equal(isGrokModel("grok-4.6", "grok-4.6"), true);
+});
+
+test("normalizeMaxTokensForModel floors low Grok caps", () => {
+  assert.equal(normalizeMaxTokensForModel("cursor-grok-4.6-high-fast", "grok-4.6-fast", 64), GROK_MIN_MAX_TOKENS);
+  assert.equal(normalizeMaxTokensForModel("composer-2.5-fast", "composer-2.5-fast", 64), 64);
+  assert.equal(normalizeMaxTokensForModel("cursor-grok-4.6-high", "grok-4.6", 1024), 1024);
+});
+
+test("cursorBody applies Grok max_tokens floor", () => {
+  const body = cursorBody({
+    messages: [{ role: "INFERENCE_MESSAGE_ROLE_USER", text: "hi" }],
+    conversationId: "c1",
+    model: "grok-4.6-fast",
+    maxTokens: 64,
+  });
+  const cfg = body.modelConfig as Record<string, unknown>;
+  assert.equal(cfg.maxTokens, GROK_MIN_MAX_TOKENS);
 });

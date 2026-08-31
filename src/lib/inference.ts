@@ -60,6 +60,22 @@ export function resolveCursorModelRoute(
   return { routeId, clientModel: clientModel || routeId };
 }
 
+/** Grok routes burn max_tokens on internal reasoning before visible text; low caps yield empty streams. */
+export const GROK_MIN_MAX_TOKENS = 512;
+
+export function isGrokModel(modelId: string, clientModel?: unknown): boolean {
+  const route = String(modelId || "").toLowerCase();
+  const client = String(clientModel ?? "").toLowerCase();
+  return /^cursor-grok-/.test(route) || /^grok-4\.[56](?:-fast)?$/.test(client) || /^grok-4\.[56](?:-fast)?$/.test(route);
+}
+
+export function normalizeMaxTokensForModel(modelId: string, clientModel: unknown, maxTokens: unknown): number | undefined {
+  const n = Number(maxTokens);
+  if (!Number.isFinite(n)) return undefined;
+  if (isGrokModel(modelId, clientModel) && n < GROK_MIN_MAX_TOKENS) return GROK_MIN_MAX_TOKENS;
+  return n;
+}
+
 export function extractFastMode(body: Record<string, unknown> | null | undefined): boolean {
   if (!body || typeof body !== "object") return false;
   if (body.fast === true || body.fast_mode === true || body.fastMode === true) return true;
@@ -611,7 +627,7 @@ export function cursorBody(opts: {
   reasoningEffort?: unknown;
   fast?: boolean;
 }): Record<string, unknown> {
-  const { routeId: modelId } = resolveCursorModelRoute(opts.model, {
+  const { routeId: modelId, clientModel } = resolveCursorModelRoute(opts.model, {
     fast: opts.fast,
     reasoningEffort: opts.reasoningEffort,
   });
@@ -631,7 +647,8 @@ export function cursorBody(opts: {
   };
   if (opts.tools?.length) body.tools = opts.tools;
   const config: Record<string, unknown> = {};
-  if (Number.isFinite(Number(opts.maxTokens))) config.maxTokens = Number(opts.maxTokens);
+  const maxTokens = normalizeMaxTokensForModel(modelId, clientModel, opts.maxTokens);
+  if (maxTokens != null) config.maxTokens = maxTokens;
   if (Number.isFinite(Number(opts.temperature))) config.temperature = Number(opts.temperature);
   if (Object.keys(config).length) body.modelConfig = config;
   return body;
