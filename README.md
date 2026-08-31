@@ -54,7 +54,7 @@ deno task start
 | `POST /v1/chat/completions` | OpenAI Chat Completions（含 `stream`） |
 | `POST /v1/messages` | Anthropic Messages |
 
-客户端传什么 `model` 就原样交给 Cursor。Grok 的 `reasoning_effort`：`low` / `medium` / `high` / `xhigh`。Cursor 会丢掉 `role: system`，网关会折进第一条 user。
+客户端传什么 `model` 就原样交给 Cursor。Grok 的 `reasoning_effort`：`low` / `medium` / `high` / `xhigh`。Cursor 会丢掉 `role: system`，网关会折进 `<system>…</system>` user 消息；**带 `tools[]` 时**会拆成 `<tools-rules>`（固定 agent 约束，可缓存）与 `<tools-catalog>`（按工具名排序的稳定 schema 列表，随工具集变化），并仍传 `body.tools`；`<tools-rules>` 与 `<system>` 会各打 prompt cache 断点。不需要注入时可设 `inject_tools_prompt: false`。
 
 ```bash
 curl -s http://127.0.0.1:8789/v1/chat/completions \

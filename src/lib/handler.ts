@@ -72,6 +72,7 @@ async function runInference(
     cursorBody({
       messages,
       tools,
+      injectToolsPrompt: body.inject_tools_prompt !== false && body.injectToolsPrompt !== false,
       model: body.model,
       conversationId,
       conversationGroupId,

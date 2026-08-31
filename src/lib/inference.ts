@@ -297,8 +297,20 @@ function markCacheBreakpoint(message: CursorMessage): CursorMessage {
 
 function applyPromptCache(messages: CursorMessage[]): CursorMessage[] {
   if (!messages?.length) return messages;
-  const out = messages.map((m) => (m.role === ROLE.system ? markCacheBreakpoint(m) : m));
-  if (!out.some((m) => m.role === ROLE.system)) out[0] = markCacheBreakpoint(out[0]);
+  let marked = false;
+  const out = messages.map((m) => {
+    if (m.role === ROLE.system) {
+      marked = true;
+      return markCacheBreakpoint(m);
+    }
+    const text = typeof m.text === "string" ? m.text.trim() : "";
+    if (m.role === ROLE.user && text && (text.startsWith("<tools-rules>") || text.startsWith("<system>"))) {
+      marked = true;
+      return markCacheBreakpoint(m);
+    }
+    return m;
+  });
+  if (!marked && out[0]) out[0] = markCacheBreakpoint(out[0]);
   return out;
 }
 
@@ -337,6 +349,65 @@ function systemAsUser(texts: string[]): CursorMessage | null {
   const text = texts.filter(Boolean).join("\n\n").trim();
   if (!text) return null;
   return { role: ROLE.user, text: `<system>\n${text}\n</system>` };
+}
+
+const AGENT_TOOL_USE_PREAMBLE = `## Tool use (agent)
+
+You may ONLY call tools listed in the <tools-catalog> message. Do NOT invent, rename, or invoke any other tool names (including tools you have seen in other products, docs, or prior conversations). If no listed tool can do the job, say so in text—do not fabricate a tool_call.
+
+When a listed tool applies, you MUST respond with tool_calls using the exact tool name and JSON arguments that match the schema. Do not only describe steps in prose when a tool can do the work. After tool results arrive, continue with more tool_calls or a final answer as appropriate.`;
+
+function stableSortJson(value: unknown): unknown {
+  if (value == null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(stableSortJson);
+  const obj = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(obj).sort()) out[key] = stableSortJson(obj[key]);
+  return out;
+}
+
+function stableStringify(value: unknown): string {
+  return JSON.stringify(stableSortJson(value));
+}
+
+function sortToolsStable(tools: CursorTool[]): CursorTool[] {
+  return [...tools].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function foldUserTag(tag: string, inner: string): CursorMessage {
+  return { role: ROLE.user, text: `<${tag}>\n${inner}\n</${tag}>` };
+}
+
+export function toolsCatalogText(tools: CursorTool[]): string {
+  const sorted = sortToolsStable(tools);
+  if (!sorted.length) return "";
+  const lines = ["### Tools"];
+  for (const t of sorted) {
+    const desc = String(t.description || "").trim() || "(no description)";
+    lines.push(`- ${t.name}: ${desc}`);
+    const schema =
+      t.parameters && Object.keys(t.parameters).length ? stableStringify(t.parameters) : "";
+    if (schema && schema !== "{}") lines.push(`  schema: ${schema}`);
+  }
+  lines.push("", `Allowed tool names (complete list): ${sorted.map((t) => t.name).join(", ")}`);
+  return lines.join("\n");
+}
+
+/** Full tools block (rules + catalog); useful for tests and debugging. */
+export function toolsPromptText(tools: CursorTool[]): string {
+  const catalog = toolsCatalogText(tools);
+  if (!catalog) return "";
+  return `${AGENT_TOOL_USE_PREAMBLE}\n\n${catalog}`;
+}
+
+/** Fold tool rules + catalog into the message stream (Cursor often ignores bare body.tools for agent behavior). */
+export function injectToolsPrompt(messages: CursorMessage[], tools: CursorTool[] | undefined): CursorMessage[] {
+  const sorted = sortToolsStable(tools || []);
+  if (!sorted.length) return messages || [];
+  const catalog = toolsCatalogText(sorted);
+  const prefix: CursorMessage[] = [foldUserTag("tools-rules", AGENT_TOOL_USE_PREAMBLE)];
+  if (catalog) prefix.push(foldUserTag("tools-catalog", catalog));
+  return [...prefix, ...(messages || [])];
 }
 
 export function openaiMessagesToCursor(messages: unknown[]): CursorMessage[] {
@@ -466,6 +537,7 @@ export function anthropicToCursor(body: Record<string, unknown>): CursorMessage[
 export function cursorBody(opts: {
   messages: CursorMessage[];
   tools?: CursorTool[];
+  injectToolsPrompt?: boolean;
   model?: unknown;
   conversationId: string;
   conversationGroupId?: string;
@@ -477,8 +549,10 @@ export function cursorBody(opts: {
   const requestedModel: Record<string, unknown> = { modelId, maxMode: false, builtInModel: true };
   const effort = mapGrokEffort(modelId, opts.reasoningEffort);
   if (effort) requestedModel.parameters = [{ id: "effort", value: effort }];
+  const injectTools = opts.injectToolsPrompt !== false && Boolean(opts.tools?.length);
+  const messages = injectTools ? injectToolsPrompt(opts.messages, opts.tools) : opts.messages;
   const body: Record<string, unknown> = {
-    messages: applyPromptCache(opts.messages),
+    messages: applyPromptCache(messages),
     conversationId: opts.conversationId,
     conversationGroupId: opts.conversationGroupId || opts.conversationId,
     modelId,
