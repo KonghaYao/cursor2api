@@ -10,7 +10,7 @@
 import { createStorage } from "unstorage";
 import cloudflareKVBindingDriver from "unstorage/drivers/cloudflare-kv-binding";
 import { handleGatewayRequest } from "./lib/handler.ts";
-import { createMemoryKv, type Kv } from "./lib/kv.ts";
+import { createMemoryKv, kvEntryTtlSeconds, type Kv } from "./lib/kv.ts";
 
 type KVNamespace = {
   get(key: string): Promise<string | null>;
@@ -28,7 +28,7 @@ function kvFor(env: CfEnv): Kv {
   return {
     getItem: async (key) => (await storage.getItem(key)) as never,
     setItem: async (key, value, opts) => {
-      await storage.setItem(key, value as never, opts);
+      await storage.setItem(key, value as never, { ttl: kvEntryTtlSeconds(opts?.ttl) });
     },
     removeItem: async (key) => {
       await storage.removeItem(key);

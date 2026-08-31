@@ -1,5 +1,5 @@
 import { randomId } from "./bytes.ts";
-import type { Kv } from "./kv.ts";
+import { KV_TTL_SECONDS, type Kv } from "./kv.ts";
 
 export type StickySessionRow = {
   clientSessionId: string;
@@ -27,11 +27,6 @@ export function stickySessionEnabled(): boolean {
   return true;
 }
 
-export function stickySessionTtlSeconds(): number {
-  const n = Number(envGet("SESSION_STICKY_TTL_SECONDS"));
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 3600;
-}
-
 function conversationRole(role: unknown): string {
   return String(role || "").toLowerCase();
 }
@@ -57,7 +52,7 @@ function kvKey(tenant: string): string {
 }
 
 export async function resolveStickyClientId(kv: Kv, tenant: string, messages: unknown[]): Promise<string> {
-  const ttl = stickySessionTtlSeconds();
+  const ttl = KV_TTL_SECONDS;
   const key = kvKey(tenant);
 
   if (isNewConversationMessages(messages)) {

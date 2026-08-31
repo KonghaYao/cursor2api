@@ -5,7 +5,7 @@
  */
 
 import { handleGatewayRequest } from "./lib/handler.ts";
-import { createMemoryKv } from "./lib/kv.ts";
+import { createDenoKv } from "./lib/kv.ts";
 
 declare const Deno: {
   env: { get(key: string): string | undefined };
@@ -20,7 +20,7 @@ declare const Deno: {
 };
 
 const PORT = Number(Deno.env.get("PORT") || 8789);
-const kv = createMemoryKv();
+const kv = await createDenoKv();
 
 Deno.serve(
   {

@@ -11,7 +11,7 @@
     "start:deno": "deno run --allow-net --allow-env src/deno.ts",
     "start:cf": "wrangler dev",
     "deploy:cf": "wrangler deploy",
-    "test": "node --experimental-strip-types --test src/lib/session.test.ts"
+    "test": "node --experimental-strip-types --test src/lib/session.test.ts src/lib/kv.test.ts"
   },
   "engines": {
     "node": ">=22.18"
