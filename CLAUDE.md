@@ -6,14 +6,17 @@
 
 ## 2026-09-01：每轮 `random` conversationId → 多轮 Cache Read 全 0
 
-### 时间点
+### 时间点（两次发版，两段落零）
 
-| 时刻（本地 UTC+8） | 事件 |
-|--------------------|------|
-| 2026-09-01 晚 | `0ccb04b` 上线 **stateless `session_fp`**：去掉 KV canon，但把上游 `conversationId` / `x-session-id` 做成 **每轮 `randomId()`** |
-| 同日 | Agent 长会话（Composer + tools + 全量 history）**每一轮 Cache Read = 0**，整段 prompt 当新会话计费 |
-| 2026-09-01 深夜 | `22376ac`：`conversationId` / `x-session-id` **必须 = `tenant:session_fp`**（fg 即会话 id） |
-| 修复后生产探测 | 同 thread 多轮 `x-session-id` 稳定；OpenAI `usage` 常不带 `cached_tokens`，**以 Cursor Team Usage 的 Cache Read 为准** |
+Team Usage：`team-usage-events-29803137-2026-09-01 (2).csv`（norin439，Composer 长会话）。Deno 跟 `main`，**push ≈ 线上生效 +1min**。
+
+| CST | UTC | commit | 用量 |
+|-----|-----|--------|------|
+| **22:40:05** | 14:40 | `6dc1abc` hash-only KV | **22:41:32–22:45:41** 连续 **15** 次 Cache Read≈0（前 2 枪仍 99%） |
+| **23:10:27** | 15:10 | `0ccb04b` 删 KV canon | **23:11:29–23:23:39** 连续 **50** 次 ≈0（23:11:03/09 仍 99%） |
+| **23:22:42** | 15:22 | `22376ac` fg=conversationId | **23:23:54** Grok-fast 先回 99.5%；23:24 后 Composer 多数 98–99% |
+
+`41e7376`（22:14）已把 `upstreamConversationId = randomId()` 写进 fingerprint；当天两次发版把这条路径推上生产。图：`reports/incident-2026-09-01-windows.html`。
 
 ### 现象
 
