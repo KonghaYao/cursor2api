@@ -27,4 +27,4 @@ SID2=$(grep -i '^x-session-id:' /tmp/c2api-fp-r2.hdr | awk '{print $2}' | tr -d 
 echo "round1 x-session-id: ${SID1:-<none>}"
 echo "round2 x-session-id: ${SID2:-<none>}"
 echo "round2 body (truncated): $(head -c 200 /tmp/c2api-fp-r2.json)"
-echo "OK: fingerprint session script completed (check gateway logs for canon_len merge=hit)"
+echo "OK: fingerprint session script completed (check gateway logs for session_fp)"

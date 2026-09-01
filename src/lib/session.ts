@@ -1,21 +1,12 @@
 import { randomId } from "./bytes.ts";
+import { computeSessionFp } from "./session_fingerprint.ts";
 import {
-  CanonConflictError,
-  computeAnchorFp,
-  computeEnvFp,
-  resolveCanonicalThread,
-  type CanonicalMergeResult,
-} from "./session_fingerprint.ts";
-import {
-  flattenContent,
   runCanonicalMessagePipeline,
   runCanonicalMessagePipelineFromCursor,
   type CursorMessage,
   type CursorTool,
 } from "./inference.ts";
-import type { Kv } from "./kv.ts";
 
-/** `random` skips KV canon (debug only). Default is always `fingerprint`. */
 export type SessionMode = "fingerprint" | "random";
 
 function envGet(name: string): string | undefined {
@@ -33,11 +24,9 @@ function envGet(name: string): string | undefined {
   return undefined;
 }
 
-/** Always fingerprint unless `SESSION_MODE=random`. Legacy `sticky` / `SESSION_STICKY` are ignored. */
 export function resolveSessionMode(): SessionMode {
   const mode = envGet("SESSION_MODE")?.trim().toLowerCase();
   if (mode === "random") return "random";
-  if (mode === "sticky" || mode === "fingerprint") return "fingerprint";
   return "fingerprint";
 }
 
@@ -45,7 +34,6 @@ function conversationRole(role: unknown): string {
   return String(role || "").toLowerCase();
 }
 
-/** True when the payload looks like the first turn (one user turn, no assistant/tool yet). System/developer messages are ignored. */
 export function isNewConversationMessages(messages: unknown[]): boolean {
   const conv = (messages || []).filter((m) => {
     const role = conversationRole((m as Record<string, unknown>).role);
@@ -67,9 +55,7 @@ export type FingerprintSessionResult = {
   tools: CursorTool[];
   upstreamConversationId: string;
   clientId: string;
-  env_fp: string;
-  anchor_fp: string;
-  merge: CanonicalMergeResult;
+  session_fp: string;
   canon_len: number;
 };
 
@@ -81,14 +67,12 @@ export type RandomSessionResult = {
 export type SessionForRequestResult = FingerprintSessionResult | RandomSessionResult;
 
 export async function resolveSessionForRequest(
-  kv: Kv,
   tenant: string,
   rawMessages: unknown[],
   options: {
     body: Record<string, unknown>;
     tools: CursorTool[];
     preconvertedMessages?: CursorMessage[];
-    threadToken?: string;
   },
 ): Promise<SessionForRequestResult> {
   const mode = resolveSessionMode();
@@ -100,37 +84,22 @@ export async function resolveSessionForRequest(
     ? await runCanonicalMessagePipelineFromCursor(options.preconvertedMessages, options.body, options.tools)
     : await runCanonicalMessagePipeline(rawMessages, options.body, options.tools);
 
-  const foldSystem = options.preconvertedMessages
-    ? flattenContent(options.body.system)
-    : undefined;
-  const env_fp = await computeEnvFp(options.body, options.tools, {
+  const session_fp = await computeSessionFp(options.body, pipelined.tools, {
+    pipelined: pipelined.messages,
     rawMessages: options.preconvertedMessages ? undefined : rawMessages,
-    baseMessages: options.preconvertedMessages,
-    foldSystem,
+    foldSystem: options.preconvertedMessages
+      ? [String(options.body.system || ""), ""].filter(Boolean).join("")
+      : undefined,
   });
-  const anchor_fp = await computeAnchorFp(pipelined.messages, pipelined.tools);
-  const { canon, merge } = await resolveCanonicalThread(
-    kv,
-    tenant,
-    env_fp,
-    anchor_fp,
-    pipelined.messages,
-    pipelined.tools,
-    options.threadToken,
-  );
 
   const upstreamConversationId = randomId();
   return {
     mode: "fingerprint",
-    canon,
+    canon: pipelined.messages,
     tools: pipelined.tools,
     upstreamConversationId,
     clientId: upstreamConversationId,
-    env_fp,
-    anchor_fp,
-    merge,
-    canon_len: canon.length,
+    session_fp,
+    canon_len: pipelined.messages.length,
   };
 }
-
-export { CanonConflictError };

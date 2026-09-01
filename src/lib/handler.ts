@@ -22,7 +22,7 @@ import {
   type CursorMessage,
   type CursorTool,
 } from "./inference.ts";
-import { CanonConflictError, resolveSessionForRequest } from "./session.ts";
+import { resolveSessionForRequest } from "./session.ts";
 
 function headerValue(headers: Headers, name: string): string | undefined {
   const raw = headers.get(name);
@@ -71,19 +71,15 @@ async function prepareChatTurn(
   preconvertedMessages?: CursorMessage[],
 ): Promise<PreparedChat> {
   const periSession = incomingSessionId(headers, body);
-  const explicitId = explicitConversationId(headers, body);
-  const threadToken = headerValue(headers, "x-thread-token") || explicitId;
-
-  const session = await resolveSessionForRequest(ctx.kv, tenant, rawMessages, {
+  const session = await resolveSessionForRequest(tenant, rawMessages, {
     body,
     tools,
     preconvertedMessages,
-    threadToken,
   });
 
   if (session.mode === "fingerprint") {
     console.log(
-      `  session_mode=fingerprint env_fp=${session.env_fp.slice(0, 12)}… anchor_fp=${session.anchor_fp.slice(0, 24)}… canon_len=${session.canon_len} merge=${session.merge}`,
+      `  session_mode=fingerprint session_fp=${session.session_fp.slice(0, 16)}… canon_len=${session.canon_len}`,
     );
     const conversationId = session.upstreamConversationId;
     const cursorId = `${tenant}:${conversationId}`;
@@ -336,12 +332,6 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
     return jsonResponse(404, { error: { message: `Unknown ${method} ${url.pathname}`, type: "invalid_request_error" } });
   } catch (err) {
     const message = String((err as Error)?.message || err);
-    if (err instanceof CanonConflictError) {
-      console.log(`  session_mode=fingerprint merge=conflict -> 409 ${message}`);
-      return jsonResponse(409, {
-        error: { message, type: "invalid_request_error", code: "canon_conflict" },
-      });
-    }
     const status = err instanceof AuthError ? 401 : err instanceof ImageInputError ? 400 : 500;
     console.log(`  -> ${status} ${message}`);
     return jsonResponse(status, {

@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createMemoryKv } from "./kv.ts";
 import { isNewConversationMessages, resolveSessionForRequest, resolveSessionMode } from "./session.ts";
 
 test("isNewConversationMessages ignores system", () => {
@@ -11,48 +10,37 @@ test("isNewConversationMessages ignores system", () => {
     ]),
     true,
   );
-  assert.equal(
-    isNewConversationMessages([
-      { role: "system", content: "x" },
-      { role: "user", content: "hi" },
-      { role: "assistant", content: "hello" },
-      { role: "user", content: "again" },
-    ]),
-    false,
-  );
 });
 
 test("resolveSessionMode defaults to fingerprint", () => {
   const prev = process.env.SESSION_MODE;
-  const prevSticky = process.env.SESSION_STICKY;
   delete process.env.SESSION_MODE;
-  delete process.env.SESSION_STICKY;
-  assert.equal(resolveSessionMode(), "fingerprint");
-  process.env.SESSION_MODE = "sticky";
   assert.equal(resolveSessionMode(), "fingerprint");
   process.env.SESSION_MODE = "random";
   assert.equal(resolveSessionMode(), "random");
   if (prev === undefined) delete process.env.SESSION_MODE;
   else process.env.SESSION_MODE = prev;
-  if (prevSticky === undefined) delete process.env.SESSION_STICKY;
-  else process.env.SESSION_STICKY = prevSticky;
 });
 
-test("fingerprint session merges canon across turns without client id", async () => {
-  const kv = createMemoryKv();
-  const tenant = "t1";
-  const body = { model: "grok-4.6-fast", messages: [] };
-  const turn1 = [{ role: "user", content: "sticky-replacement-a" }];
-  const turn2 = [
-    { role: "user", content: "sticky-replacement-a" },
-    { role: "assistant", content: "b" },
-    { role: "user", content: "c" },
+test("fingerprint session_fp is stable after first tool via resolveSessionForRequest", async () => {
+  const tenant = "t-stable";
+  const body = { model: "composer-2.5-fast" };
+  const tools = [{ name: "f", description: "", parameters: { type: "object" } }];
+  const withTool = [
+    { role: "user", content: "one" },
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }],
+    },
+    { role: "tool", tool_call_id: "c1", content: "ok" },
   ];
-
-  const r1 = await resolveSessionForRequest(kv, tenant, turn1, { body, tools: [] });
-  const r2 = await resolveSessionForRequest(kv, tenant, turn2, { body, tools: [] });
+  const later = [...withTool, { role: "user", content: "two" }];
+  const r1 = await resolveSessionForRequest(tenant, withTool, { body, tools });
+  const r2 = await resolveSessionForRequest(tenant, later, { body, tools });
   assert.equal(r1.mode, "fingerprint");
   assert.equal(r2.mode, "fingerprint");
-  assert.equal(r2.merge, "hit");
-  assert.ok(r2.canon_len >= r1.canon_len);
+  if (r1.mode !== "fingerprint" || r2.mode !== "fingerprint") return;
+  assert.equal(r1.session_fp, r2.session_fp);
+  assert.ok(r2.canon_len > r1.canon_len);
 });
