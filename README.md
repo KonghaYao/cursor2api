@@ -110,13 +110,15 @@ Cursor Inference **没有** embeddings / TTS / STT / Images API / Responses API�
 
 ### 多轮会话（内容指纹，默认无 KV）
 
-客户端每轮带**全量** `messages`；网关 pipeline 后发往上游，**`conversationId` / `x-session-id` = `tenant:session_fp`**（**fg 变 = 新 thread**）。公式见 **[docs/canonical-session-fingerprint.md](docs/canonical-session-fingerprint.md)**。
+客户端每轮带**全量** `messages`；网关 pipeline 后发往上游。**`session_fp` 就是 Cursor conversation id**：`conversationId` / `x-session-id` = `tenant:session_fp`（**fg 变 = 新 thread**）。公式见 **[docs/canonical-session-fingerprint.md](docs/canonical-session-fingerprint.md)**。
+
+**2026-09-01 大 bug**：`0ccb04b` 曾把上游 id 做成每轮 `randomId()`，Agent 多轮 **Cache Read 全 0**。`22376ac` 起必须用 `session_fp`，禁止 fingerprint 路径随机 id。详见 `CLAUDE.md`。
 
 | `SESSION_MODE` | 行为 |
 |----------------|------|
 | （未设置） | **fingerprint**（默认） |
 | `fingerprint` / `sticky`（遗留名） | 同上 |
-| `random` | 调试：不算 fg，不 `messagesPipelined` |
+| `random` | 调试：随机 id，**预期无 prompt cache** |
 
 集成验证：`bash scripts/verify-fingerprint-session.sh`
 

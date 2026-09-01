@@ -4,6 +4,54 @@
 
 ---
 
+## 2026-09-01：每轮 `random` conversationId → 多轮 Cache Read 全 0
+
+### 时间点
+
+| 时刻（本地 UTC+8） | 事件 |
+|--------------------|------|
+| 2026-09-01 晚 | `0ccb04b` 上线 **stateless `session_fp`**：去掉 KV canon，但把上游 `conversationId` / `x-session-id` 做成 **每轮 `randomId()`** |
+| 同日 | Agent 长会话（Composer + tools + 全量 history）**每一轮 Cache Read = 0**，整段 prompt 当新会话计费 |
+| 2026-09-01 深夜 | `22376ac`：`conversationId` / `x-session-id` **必须 = `tenant:session_fp`**（fg 即会话 id） |
+| 修复后生产探测 | 同 thread 多轮 `x-session-id` 稳定；OpenAI `usage` 常不带 `cached_tokens`，**以 Cursor Team Usage 的 Cache Read 为准** |
+
+### 现象
+
+同一 Agent 对话多轮：`Input (w/o Cache Write)` 接近整段 history，**Cache Read 恒为 0**。网关 200、正文正常，只是前缀缓存全灭。
+
+### 引入提交
+
+`0ccb04b` — *feat: stateless session_fp (no KV canon)*
+
+正确方向是：**fingerprint 不算 KV、不 409**。错误是把「无状态」理解成「每轮新 conversation id」。
+
+### 根因（大 bug）
+
+**Cursor Inference 的 prompt cache 绑在稳定的 `conversationId` / `x-session-id` 上，不是只看 messages 字节。**
+
+`session_fp` 本应就是 conversation id（同 thread 多轮不变；换 model / effort / tools / system / 第一条 tool 前的内容 → 新 id）。写成 `randomId()` 后，Cursor 每轮当新会话，**即使 history 单调 append 也 0 缓存**。
+
+### 修复
+
+`22376ac` — *fix: use session_fp as Cursor conversationId for prompt cache*
+
+- fingerprint：`conversationId` = `sessionId` = `conversationGroupId` = `tenant:session_fp`
+- **禁止** fingerprint 路径每轮 `randomId()`
+- `SESSION_MODE=random` 才用随机 id（调试，预期无 cache）
+
+### 约束（后续改 session 时务必遵守）
+
+| 内容 | 策略 |
+|------|------|
+| `session_fp` | SHA256(modelId ⟂ effort ⟂ flags ⟂ tools ⟂ system ⟂ pipeline[0..第一条 tool]) |
+| 上游会话 id | **`tenant:session_fp`**，与 `x-session-id` 一致 |
+| KV | **不存** canon / 不靠 KV 续会话 |
+| 换轨 | fg 变 = 新 thread = 新 conversationId（cache 从 0 再积） |
+
+不要再假设「Cursor 只按 messages 前缀 cache、id 可以乱跳」。
+
+---
+
 ## 2026-08-31：`stream: true` 下 Composer 工具调用崩溃
 
 ### 现象
