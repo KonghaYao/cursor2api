@@ -3,7 +3,7 @@
 **状态**：Normative  
 **版本**：3.0
 
-每请求：pipeline 客户端 `messages` → 算 **一条** `session_fp` → 日志；上游 messages = pipeline 结果。`conversationId` 每轮随机。**`session_fp` 变 = 新 thread。**
+每请求：pipeline 客户端 `messages` → 算 **一条** `session_fp` → 上游 **`conversationId` / `x-session-id` = `tenant:session_fp`**（Cursor prompt cache 绑这个 id）。messages = pipeline 结果。**`session_fp` 变 = 新 thread / 新 conversationId。**
 
 ---
 

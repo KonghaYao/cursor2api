@@ -42,5 +42,7 @@ test("fingerprint session_fp is stable after first tool via resolveSessionForReq
   assert.equal(r2.mode, "fingerprint");
   if (r1.mode !== "fingerprint" || r2.mode !== "fingerprint") return;
   assert.equal(r1.session_fp, r2.session_fp);
+  assert.equal(r1.upstreamConversationId, r1.session_fp);
+  assert.equal(r2.upstreamConversationId, r1.session_fp);
   assert.ok(r2.canon_len > r1.canon_len);
 });

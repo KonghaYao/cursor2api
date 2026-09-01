@@ -92,13 +92,12 @@ export async function resolveSessionForRequest(
       : undefined,
   });
 
-  const upstreamConversationId = randomId();
   return {
     mode: "fingerprint",
     canon: pipelined.messages,
     tools: pipelined.tools,
-    upstreamConversationId,
-    clientId: upstreamConversationId,
+    upstreamConversationId: session_fp,
+    clientId: session_fp,
     session_fp,
     canon_len: pipelined.messages.length,
   };

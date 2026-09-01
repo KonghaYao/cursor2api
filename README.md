@@ -110,7 +110,7 @@ Cursor Inference **没有** embeddings / TTS / STT / Images API / Responses API�
 
 ### 多轮会话（内容指纹，默认无 KV）
 
-客户端每轮带**全量** `messages`；网关 pipeline 后发往上游，并每请求计算 **`env_fp` + `anchor_fp`**（日志/指标；**fg 变 = 新 thread**）。上游 `conversationId` **每轮随机**。公式见 **[docs/canonical-session-fingerprint.md](docs/canonical-session-fingerprint.md)**。
+客户端每轮带**全量** `messages`；网关 pipeline 后发往上游，**`conversationId` / `x-session-id` = `tenant:session_fp`**（**fg 变 = 新 thread**）。公式见 **[docs/canonical-session-fingerprint.md](docs/canonical-session-fingerprint.md)**。
 
 | `SESSION_MODE` | 行为 |
 |----------------|------|

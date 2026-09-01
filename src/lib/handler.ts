@@ -81,15 +81,14 @@ async function prepareChatTurn(
     console.log(
       `  session_mode=fingerprint session_fp=${session.session_fp.slice(0, 16)}… canon_len=${session.canon_len}`,
     );
-    const conversationId = session.upstreamConversationId;
-    const cursorId = `${tenant}:${conversationId}`;
+    const cursorId = `${tenant}:${session.session_fp}`;
     return {
       messages: session.canon,
       tools: session.tools,
       conversationId: cursorId,
-      conversationGroupId: periSession ? `${tenant}:${periSession}` : cursorId,
+      conversationGroupId: cursorId,
       sessionId: cursorId,
-      clientId: session.clientId,
+      clientId: session.session_fp,
       messagesPipelined: true,
     };
   }
