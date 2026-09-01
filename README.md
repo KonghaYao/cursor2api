@@ -2,7 +2,7 @@
 
 把 Cursor `InferenceService/Stream` 转成 OpenAI / Anthropic 形接口。网关**不执行工具**：客户端带 `tools[]`，模型回 `tool_calls`。
 
-鉴权只看请求：`Authorization: Bearer <crsr_… 或 JWT>` 或 `x-api-key`。没有服务端 API key，每个人用自己的 Cursor token，互不串会话。换出的 JWT 按 token 指纹缓存在 KV 里，**KV 条目 TTL 最长 5 分钟**（含 JWT 缓存与粘性会话，到期后重新换票或续绑会话）。
+鉴权只看请求：`Authorization: Bearer <crsr_… 或 JWT>` 或 `x-api-key`。没有服务端 API key，每个人用自己的 Cursor token，互不串会话。换出的 JWT 按 token 指纹缓存在 KV 里，**KV 条目 TTL 最长 5 分钟**（含 JWT 缓存与 canon 会话，到期后重新换票或续绑）。
 
 ## 生产环境
 
@@ -41,7 +41,7 @@ deno task start
 
 默认 `http://127.0.0.1:8789`。OpenAI SDK：`baseURL` = `http://127.0.0.1:8789/v1`，`apiKey` 填 Cursor Dashboard 的 `crsr_…`（或已换好的 JWT）。Node 绑 `127.0.0.1` 和 `::1`；Deno 绑 `127.0.0.1`。
 
-可选 `PORT`。Cloudflare 可绑 `KV` 做跨 isolate 的 JWT / 粘性会话；不绑则用内存。Deno 入口使用 **`Deno.openKv()`** 本地持久化（`deno task start` 需 `--allow-read --allow-write`）。
+可选 `PORT`。Cloudflare 可绑 `KV` 做跨 isolate 的 JWT / canon；不绑则用内存。Deno 入口使用 **`Deno.openKv()`** 本地持久化（`deno task start` 需 `--allow-read --allow-write`）。
 
 ## 接口
 
@@ -108,15 +108,17 @@ curl -sS "$BASE/chat/completions" -H 'content-type: application/json' \
 
 Cursor Inference **没有** embeddings / TTS / STT / Images API / Responses API。对应路径返回 **501**（生图像素仍需 Agent 执行 `generate_image` tool_call，见下文实验脚本）。`n`、`seed`、`logprobs`、penalty 字段无 proto 对应：`n>1` 拒绝，其余忽略。
 
-### 多轮会话（无 client session id）
+### 多轮会话（Canonical 内容指纹，默认）
 
-客户端**不传** `x-session-id` / `conversation_id` 且每轮带**全量** `messages` 时，网关按 API key 指纹在 KV 里做**粘性会话**（默认开启）：
+客户端每轮带**全量** `messages` 时，网关**始终**用 `env_fp` + `anchor_fp` 在 KV 维护 **canon**；上游 `conversationId` **每轮随机**。详见 **[docs/canonical-session-fingerprint.md](docs/canonical-session-fingerprint.md)**。
 
-- 判定「新会话」：`messages` 里仅有 **1 条 `user`**（忽略 `system` / `developer`）→ 生成新 `conversation_id`
-- 否则复用该 key 下最近一次会话 id（**TTL 5 分钟**，与全局 KV 上限一致）
-- 显式传入 `conversation_id` 或 `x-session-id` 时优先使用；`SESSION_STICKY=0` 可关闭（恢复每请求随机 id）
+| `SESSION_MODE` | 行为 |
+|----------------|------|
+| （未设置） | **fingerprint**（默认） |
+| `fingerprint` / `sticky`（遗留） | 内容锚点 + KV canon |
+| `random` | 调试：无 canon |
 
-同一 API key 下**并行多条对话**且都不传 id 时会共用一条 Cursor 会话；生产多实例请绑共享 KV（见 Cloudflare `KV`）。响应头 `x-session-id` 与 JSON 里的 `conversation_id` / `session_id` 仍会返回，便于调试。
+集成验证：`bash scripts/verify-fingerprint-session.sh`
 
 ### 生图（实验）
 

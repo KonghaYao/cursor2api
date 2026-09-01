@@ -1,10 +1,22 @@
 import { randomId } from "./bytes.ts";
-import { KV_TTL_SECONDS, type Kv } from "./kv.ts";
+import {
+  CanonConflictError,
+  computeAnchorFp,
+  computeEnvFp,
+  resolveCanonicalThread,
+  type CanonicalMergeResult,
+} from "./session_fingerprint.ts";
+import {
+  flattenContent,
+  runCanonicalMessagePipeline,
+  runCanonicalMessagePipelineFromCursor,
+  type CursorMessage,
+  type CursorTool,
+} from "./inference.ts";
+import type { Kv } from "./kv.ts";
 
-export type StickySessionRow = {
-  clientSessionId: string;
-  updatedAt: number;
-};
+/** `random` skips KV canon (debug only). Default is always `fingerprint`. */
+export type SessionMode = "fingerprint" | "random";
 
 function envGet(name: string): string | undefined {
   try {
@@ -21,10 +33,12 @@ function envGet(name: string): string | undefined {
   return undefined;
 }
 
-export function stickySessionEnabled(): boolean {
-  const v = envGet("SESSION_STICKY")?.trim().toLowerCase();
-  if (v === "0" || v === "false" || v === "off") return false;
-  return true;
+/** Always fingerprint unless `SESSION_MODE=random`. Legacy `sticky` / `SESSION_STICKY` are ignored. */
+export function resolveSessionMode(): SessionMode {
+  const mode = envGet("SESSION_MODE")?.trim().toLowerCase();
+  if (mode === "random") return "random";
+  if (mode === "sticky" || mode === "fingerprint") return "fingerprint";
+  return "fingerprint";
 }
 
 function conversationRole(role: unknown): string {
@@ -47,57 +61,76 @@ export function isNewConversationMessages(messages: unknown[]): boolean {
   return users === 1 && replies === 0;
 }
 
-function kvKey(tenant: string): string {
-  return `active-session:${tenant}`;
-}
+export type FingerprintSessionResult = {
+  mode: "fingerprint";
+  canon: CursorMessage[];
+  tools: CursorTool[];
+  upstreamConversationId: string;
+  clientId: string;
+  env_fp: string;
+  anchor_fp: string;
+  merge: CanonicalMergeResult;
+  canon_len: number;
+};
 
-export async function resolveStickyClientId(kv: Kv, tenant: string, messages: unknown[]): Promise<string> {
-  const ttl = KV_TTL_SECONDS;
-  const key = kvKey(tenant);
+export type RandomSessionResult = {
+  mode: "random";
+  clientId: string;
+};
 
-  if (isNewConversationMessages(messages)) {
-    const clientSessionId = randomId();
-    await kv.setItem(key, { clientSessionId, updatedAt: Date.now() } satisfies StickySessionRow, { ttl });
-    return clientSessionId;
-  }
+export type SessionForRequestResult = FingerprintSessionResult | RandomSessionResult;
 
-  const row = await kv.getItem<StickySessionRow>(key);
-  if (row?.clientSessionId) {
-    await kv.setItem(key, { clientSessionId: row.clientSessionId, updatedAt: Date.now() } satisfies StickySessionRow, {
-      ttl,
-    });
-    return row.clientSessionId;
-  }
-
-  const clientSessionId = randomId();
-  await kv.setItem(key, { clientSessionId, updatedAt: Date.now() } satisfies StickySessionRow, { ttl });
-  return clientSessionId;
-}
-
-export type SessionResolveSource = "explicit" | "sticky_new" | "sticky_continue" | "sticky_miss" | "random";
-
-export async function resolveClientSessionId(
+export async function resolveSessionForRequest(
   kv: Kv,
   tenant: string,
-  messages: unknown[],
-  explicitId: string | undefined,
-): Promise<{ clientId: string; source: SessionResolveSource }> {
-  if (explicitId) {
-    return { clientId: explicitId, source: "explicit" };
+  rawMessages: unknown[],
+  options: {
+    body: Record<string, unknown>;
+    tools: CursorTool[];
+    preconvertedMessages?: CursorMessage[];
+    threadToken?: string;
+  },
+): Promise<SessionForRequestResult> {
+  const mode = resolveSessionMode();
+  if (mode === "random") {
+    return { mode: "random", clientId: randomId() };
   }
-  if (!stickySessionEnabled()) {
-    return { clientId: randomId(), source: "random" };
-  }
-  const key = kvKey(tenant);
-  const isNew = isNewConversationMessages(messages);
-  if (isNew) {
-    const clientId = await resolveStickyClientId(kv, tenant, messages);
-    return { clientId, source: "sticky_new" };
-  }
-  const before = await kv.getItem<StickySessionRow>(key);
-  const clientId = await resolveStickyClientId(kv, tenant, messages);
-  if (before?.clientSessionId && before.clientSessionId === clientId) {
-    return { clientId, source: "sticky_continue" };
-  }
-  return { clientId, source: "sticky_miss" };
+
+  const pipelined = options.preconvertedMessages
+    ? await runCanonicalMessagePipelineFromCursor(options.preconvertedMessages, options.body, options.tools)
+    : await runCanonicalMessagePipeline(rawMessages, options.body, options.tools);
+
+  const foldSystem = options.preconvertedMessages
+    ? flattenContent(options.body.system)
+    : undefined;
+  const env_fp = await computeEnvFp(options.body, options.tools, {
+    rawMessages: options.preconvertedMessages ? undefined : rawMessages,
+    baseMessages: options.preconvertedMessages,
+    foldSystem,
+  });
+  const anchor_fp = await computeAnchorFp(pipelined.messages, pipelined.tools);
+  const { canon, merge } = await resolveCanonicalThread(
+    kv,
+    tenant,
+    env_fp,
+    anchor_fp,
+    pipelined.messages,
+    pipelined.tools,
+    options.threadToken,
+  );
+
+  const upstreamConversationId = randomId();
+  return {
+    mode: "fingerprint",
+    canon,
+    tools: pipelined.tools,
+    upstreamConversationId,
+    clientId: upstreamConversationId,
+    env_fp,
+    anchor_fp,
+    merge,
+    canon_len: canon.length,
+  };
 }
+
+export { CanonConflictError };

@@ -22,7 +22,7 @@ import {
   type CursorMessage,
   type CursorTool,
 } from "./inference.ts";
-import { resolveClientSessionId } from "./session.ts";
+import { CanonConflictError, resolveSessionForRequest } from "./session.ts";
 
 function headerValue(headers: Headers, name: string): string | undefined {
   const raw = headers.get(name);
@@ -42,31 +42,73 @@ function incomingSessionId(headers: Headers, body: Record<string, unknown>): str
   return id || undefined;
 }
 
-async function resolveChatIdentity(
+function explicitConversationId(headers: Headers, body: Record<string, unknown>): string | undefined {
+  const periSession = incomingSessionId(headers, body);
+  const meta = body.metadata && typeof body.metadata === "object" ? (body.metadata as Record<string, unknown>) : {};
+  const id = String(
+    body.conversation_id || body.conversationId || meta.conversation_id || periSession || "",
+  ).trim();
+  return id || undefined;
+}
+
+type PreparedChat = {
+  messages: CursorMessage[];
+  tools: CursorTool[];
+  conversationId: string;
+  conversationGroupId: string;
+  sessionId: string;
+  clientId: string;
+  messagesPipelined: boolean;
+};
+
+async function prepareChatTurn(
   ctx: GatewayCtx,
   headers: Headers,
   body: Record<string, unknown>,
   tenant: string,
   rawMessages: unknown[],
-) {
+  tools: CursorTool[],
+  preconvertedMessages?: CursorMessage[],
+): Promise<PreparedChat> {
   const periSession = incomingSessionId(headers, body);
-  const meta = body.metadata && typeof body.metadata === "object" ? (body.metadata as Record<string, unknown>) : {};
-  const explicitId = String(
-    body.conversation_id ||
-      body.conversationId ||
-      meta.conversation_id ||
-      periSession ||
-      "",
-  ).trim();
+  const explicitId = explicitConversationId(headers, body);
+  const threadToken = headerValue(headers, "x-thread-token") || explicitId;
 
-  const { clientId, source } = await resolveClientSessionId(ctx.kv, tenant, rawMessages, explicitId || undefined);
-  const cursorId = `${tenant}:${clientId}`;
-  console.log(`  session ${source} id=${clientId.slice(0, 8)}…`);
+  const session = await resolveSessionForRequest(ctx.kv, tenant, rawMessages, {
+    body,
+    tools,
+    preconvertedMessages,
+    threadToken,
+  });
+
+  if (session.mode === "fingerprint") {
+    console.log(
+      `  session_mode=fingerprint env_fp=${session.env_fp.slice(0, 12)}… anchor_fp=${session.anchor_fp.slice(0, 24)}… canon_len=${session.canon_len} merge=${session.merge}`,
+    );
+    const conversationId = session.upstreamConversationId;
+    const cursorId = `${tenant}:${conversationId}`;
+    return {
+      messages: session.canon,
+      tools: session.tools,
+      conversationId: cursorId,
+      conversationGroupId: periSession ? `${tenant}:${periSession}` : cursorId,
+      sessionId: cursorId,
+      clientId: session.clientId,
+      messagesPipelined: true,
+    };
+  }
+
+  const messages = preconvertedMessages ?? (await openaiMessagesToCursor(rawMessages));
+  console.log(`  session_mode=random id=${session.clientId.slice(0, 8)}…`);
+  const cursorId = `${tenant}:${session.clientId}`;
   return {
-    clientId,
+    messages,
+    tools,
     conversationId: cursorId,
     conversationGroupId: periSession ? `${tenant}:${periSession}` : cursorId,
     sessionId: cursorId,
+    clientId: session.clientId,
+    messagesPipelined: false,
   };
 }
 
@@ -100,20 +142,26 @@ async function runInference(
   ctx: GatewayCtx,
   headers: Headers,
   body: Record<string, unknown>,
-  { messages, tools, rawMessages }: { messages: CursorMessage[]; tools: CursorTool[]; rawMessages: unknown[] },
+  {
+    tools,
+    rawMessages,
+    preconvertedMessages,
+  }: { tools: CursorTool[]; rawMessages: unknown[]; preconvertedMessages?: CursorMessage[] },
 ) {
   const { accessToken, tenant } = await getAccessToken(ctx, headers);
-  const { clientId, conversationId, conversationGroupId, sessionId } = await resolveChatIdentity(
-    ctx,
-    headers,
-    body,
-    tenant,
-    rawMessages,
+  const prepared = await prepareChatTurn(ctx, headers, body, tenant, rawMessages, tools, preconvertedMessages);
+  const turn = await inferenceStream(
+    accessToken,
+    cursorBodyFromClient(body, {
+      messages: prepared.messages,
+      tools: prepared.tools,
+      conversationId: prepared.conversationId,
+      conversationGroupId: prepared.conversationGroupId,
+      messagesPipelined: prepared.messagesPipelined,
+    }),
+    { sessionId: prepared.sessionId },
   );
-  const turn = await inferenceStream(accessToken, cursorBodyFromClient(body, { messages, tools, conversationId, conversationGroupId }), {
-    sessionId,
-  });
-  return { turn, conversationId: clientId, sessionId: clientId };
+  return { turn, conversationId: prepared.clientId, sessionId: prepared.clientId };
 }
 
 export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): Promise<Response> {
@@ -186,27 +234,35 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       );
       if (body.stream) {
         const { accessToken, tenant } = await getAccessToken(ctx, request.headers);
-        const { clientId, conversationId, conversationGroupId } = await resolveChatIdentity(
+        const prepared = await prepareChatTurn(
           ctx,
           request.headers,
           body,
           tenant,
           (body.messages as unknown[]) || [],
+          tools,
+          messages,
         );
         return streamAnthropicMessage({
           accessToken,
-          body: cursorBodyFromClient(body, { messages, tools, conversationId, conversationGroupId }),
+          body: cursorBodyFromClient(body, {
+            messages: prepared.messages,
+            tools: prepared.tools,
+            conversationId: prepared.conversationId,
+            conversationGroupId: prepared.conversationGroupId,
+            messagesPipelined: prepared.messagesPipelined,
+          }),
           model: body.model,
-          conversationId: clientId,
-          sessionId: clientId,
-          tools,
+          conversationId: prepared.clientId,
+          sessionId: prepared.clientId,
+          tools: prepared.tools,
           signal: request.signal,
         });
       }
       const { turn, conversationId, sessionId } = await runInference(ctx, request.headers, body, {
-        messages,
         tools,
         rawMessages: (body.messages as unknown[]) || [],
+        preconvertedMessages: messages,
       });
       if (turn.error) console.log(`  infer error ${JSON.stringify(turn.error).slice(0, 200)}`);
       if (turn.toolCalls?.length) {
@@ -235,25 +291,31 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       );
       if (body.stream) {
         const { accessToken, tenant } = await getAccessToken(ctx, request.headers);
-        const { clientId, conversationId, conversationGroupId } = await resolveChatIdentity(
+        const prepared = await prepareChatTurn(
           ctx,
           request.headers,
           body,
           tenant,
           (body.messages as unknown[]) || [],
+          tools,
         );
         return streamOpenAiChatCompletion({
           accessToken,
-          body: cursorBodyFromClient(body, { messages, tools, conversationId, conversationGroupId }),
+          body: cursorBodyFromClient(body, {
+            messages: prepared.messages,
+            tools: prepared.tools,
+            conversationId: prepared.conversationId,
+            conversationGroupId: prepared.conversationGroupId,
+            messagesPipelined: prepared.messagesPipelined,
+          }),
           model: body.model,
-          conversationId: clientId,
-          sessionId: clientId,
-          tools,
+          conversationId: prepared.clientId,
+          sessionId: prepared.clientId,
+          tools: prepared.tools,
           signal: request.signal,
         });
       }
       const { turn, conversationId, sessionId } = await runInference(ctx, request.headers, body, {
-        messages,
         tools,
         rawMessages: (body.messages as unknown[]) || [],
       });
@@ -274,6 +336,12 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
     return jsonResponse(404, { error: { message: `Unknown ${method} ${url.pathname}`, type: "invalid_request_error" } });
   } catch (err) {
     const message = String((err as Error)?.message || err);
+    if (err instanceof CanonConflictError) {
+      console.log(`  session_mode=fingerprint merge=conflict -> 409 ${message}`);
+      return jsonResponse(409, {
+        error: { message, type: "invalid_request_error", code: "canon_conflict" },
+      });
+    }
     const status = err instanceof AuthError ? 401 : err instanceof ImageInputError ? 400 : 500;
     console.log(`  -> ${status} ${message}`);
     return jsonResponse(status, {

@@ -638,8 +638,12 @@ function stableSortJson(value: unknown): unknown {
   return out;
 }
 
-function stableStringify(value: unknown): string {
+export function stableStringify(value: unknown): string {
   return JSON.stringify(stableSortJson(value));
+}
+
+export function canonicalSerialize(messages: CursorMessage[]): string {
+  return stableStringify(messages);
 }
 
 function sortToolsStable(tools: CursorTool[]): CursorTool[] {
@@ -827,6 +831,8 @@ export function cursorBody(opts: {
   tools?: CursorTool[];
   providerDefinedTools?: CursorProviderTool[];
   injectToolsPrompt?: boolean;
+  /** When true, messages already went through injectToolsPrompt + applyPromptCache. */
+  pipelined?: boolean;
   model?: unknown;
   conversationId: string;
   conversationGroupId?: string;
@@ -856,10 +862,12 @@ export function cursorBody(opts: {
     const effort = mapGrokEffort(modelId, opts.reasoningEffort);
     if (effort) requestedModel.parameters = [{ id: "effort", value: effort }];
   }
-  const injectTools = opts.injectToolsPrompt !== false && Boolean(opts.tools?.length);
-  const messages = injectTools ? injectToolsPrompt(opts.messages, opts.tools) : opts.messages;
+  const pipelined = Boolean(opts.pipelined);
+  const injectTools = !pipelined && opts.injectToolsPrompt !== false && Boolean(opts.tools?.length);
+  const withTools = injectTools ? injectToolsPrompt(opts.messages, opts.tools) : opts.messages;
+  const messages = pipelined ? withTools : applyPromptCache(withTools);
   const body: Record<string, unknown> = {
-    messages: applyPromptCache(messages),
+    messages,
     conversationId: opts.conversationId,
     conversationGroupId: opts.conversationGroupId || opts.conversationId,
     modelId,
@@ -883,6 +891,28 @@ export function cursorBody(opts: {
   return body;
 }
 
+export async function runCanonicalMessagePipelineFromCursor(
+  messages: CursorMessage[],
+  body: Record<string, unknown>,
+  tools: CursorTool[],
+): Promise<{ messages: CursorMessage[]; tools: CursorTool[]; injectToolsPrompt: boolean }> {
+  const policy = applyToolPolicy(messages, tools, body);
+  let next = applyResponseFormat(policy.messages, body);
+  const inject = policy.injectToolsPrompt && policy.tools.length > 0;
+  if (inject) next = injectToolsPrompt(next, policy.tools);
+  next = applyPromptCache(next);
+  return { messages: next, tools: policy.tools, injectToolsPrompt: policy.injectToolsPrompt };
+}
+
+export async function runCanonicalMessagePipeline(
+  rawMessages: unknown[],
+  body: Record<string, unknown>,
+  tools: CursorTool[],
+): Promise<{ messages: CursorMessage[]; tools: CursorTool[]; injectToolsPrompt: boolean }> {
+  const base = await openaiMessagesToCursor(rawMessages);
+  return runCanonicalMessagePipelineFromCursor(base, body, tools);
+}
+
 export function cursorBodyFromClient(
   body: Record<string, unknown>,
   opts: {
@@ -890,14 +920,38 @@ export function cursorBodyFromClient(
     tools: CursorTool[];
     conversationId: string;
     conversationGroupId?: string;
+    /** Skip tool policy / format / inject / cache when messages came from runCanonicalMessagePipeline*. */
+    messagesPipelined?: boolean;
   },
 ): Record<string, unknown> {
-  const policy = applyToolPolicy(opts.messages, opts.tools, body);
-  const messages = applyResponseFormat(policy.messages, body);
   const providerDefinedTools = mergeProviderDefinedTools(
     openaiProviderDefinedTools(body.tools),
     body.provider_defined_tools ?? body.providerDefinedTools,
   );
+  if (opts.messagesPipelined) {
+    return cursorBody({
+      messages: opts.messages,
+      tools: opts.tools,
+      providerDefinedTools,
+      injectToolsPrompt: false,
+      pipelined: true,
+      model: body.model,
+      conversationId: opts.conversationId,
+      conversationGroupId: opts.conversationGroupId,
+      maxTokens: extractMaxTokens(body),
+      temperature: body.temperature,
+      topP: extractTopP(body),
+      stopSequences: extractStopSequences(body),
+      reasoningEffort: extractReasoningEffort(body),
+      fast: extractFastMode(body),
+      maxMode: extractMaxMode(body),
+      invocationId: body.invocation_id ?? body.invocationId,
+      automationId: body.automation_id ?? body.automationId,
+      inferenceReason: body.inference_reason ?? body.inferenceReason,
+    });
+  }
+  const policy = applyToolPolicy(opts.messages, opts.tools, body);
+  const messages = applyResponseFormat(policy.messages, body);
   return cursorBody({
     messages,
     tools: policy.tools,
