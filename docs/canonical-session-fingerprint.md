@@ -32,7 +32,7 @@
 | **env_fp** | 推理环境稳定哈希：模型 route、tools catalog、system、影响序列化的 body 标志 |
 | **anchor_fp** | 对话锚点哈希：首个 **完整 tool 回合** 结束后的 Cursor 对话消息前缀（见 §4） |
 | **thread_key** | KV 主键：`{tenant}:{env_fp}:{anchor_fp}`；锚点未闭合前用 `pending` 状态（§6） |
-| **canon** | 服务端存储的 `CursorMessage[]`，为发往上游的唯一真相源 |
+| **canon** | 发往上游的 `CursorMessage[]`（客户端每轮带全量 history，经管道后与 KV 中 `canon_hash` 校验） |
 | **conversationId** | 每请求可 `randomUUID()`；**不参与** KV 查找 |
 
 ---
@@ -141,7 +141,7 @@ thread_key = `${tenant}:${env_fp}:${anchor_fp}`
 
 | Key | Value |
 |-----|--------|
-| `canon:${tenant}:${env_fp}:${anchor_fp}` | `{ canon: CursorMessage[], updatedAt, turnCount }` |
+| `canon:${tenant}:${env_fp}:${anchor_fp}` | `{ canon_len, canon_hash (SHA-256 hex), updatedAt, turnCount }` — **不存消息正文**；上游 `messages` 来自客户端当轮 pipeline 全量 |
 | `thread_token:${tenant}:${randomId}` | `{ env_fp, anchor_fp }`（可选：首轮闭合后下发给客户端，减轻重算） |
 
 TTL：与现有 `KV_TTL_SECONDS`（5 分钟）一致，滑动续期。
@@ -166,7 +166,7 @@ TTL：与现有 `KV_TTL_SECONDS`（5 分钟）一致，滑动续期。
 ### 6.3 appendOnly 规则
 
 - 仅允许在 canon 末尾追加新 message（或追加 tool 结果）。
-- 长度校验：`canon.length <= cursorMessages.length` 且 `canon` 与 `cursorMessages[0..canon.length-1]` 逐条 `canonicalSerialize` 相等。
+- 长度校验：`canon_len <= cursorMessages.length` 且 `SHA256(canonicalSerialize(cursorMessages[0..canon_len-1])) === canon_hash`。
 
 ---
 

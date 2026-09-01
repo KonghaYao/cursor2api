@@ -29,8 +29,10 @@ export class CanonConflictError extends Error {
   }
 }
 
+/** KV stores only fingerprint metadata — never full CursorMessage[] (Deno KV 64KB limit). */
 export type CanonRow = {
-  canon: CursorMessage[];
+  canon_len: number;
+  canon_hash: string;
   updatedAt: number;
   turnCount: number;
 };
@@ -237,6 +239,25 @@ export async function computeAnchorFp(
   return sha256Hex(serialized);
 }
 
+export async function computeCanonHash(messages: CursorMessage[], tools: CursorTool[]): Promise<string> {
+  return sha256Hex(canonicalSerializeForFingerprint(messages, tools));
+}
+
+/** Verify client full history extends stored canon; returns incoming as upstream canon. */
+export async function verifyAppendOnly(
+  storedLen: number,
+  storedHash: string,
+  incoming: CursorMessage[],
+  tools: CursorTool[],
+): Promise<CursorMessage[]> {
+  if (storedLen > incoming.length) throw new CanonConflictError("incoming shorter than canon");
+  if (storedLen === 0) return incoming;
+  const prefixHash = await computeCanonHash(incoming.slice(0, storedLen), tools);
+  if (prefixHash !== storedHash) throw new CanonConflictError("canon prefix mismatch");
+  return incoming;
+}
+
+/** @deprecated Tests only — production uses verifyAppendOnly + hash in KV. */
 export function appendOnlyMerge(stored: CursorMessage[], incoming: CursorMessage[], tools: CursorTool[]): CursorMessage[] {
   if (stored.length > incoming.length) throw new CanonConflictError("incoming shorter than canon");
   for (let i = 0; i < stored.length; i++) {
@@ -245,6 +266,56 @@ export function appendOnlyMerge(stored: CursorMessage[], incoming: CursorMessage
     if (a !== b) throw new CanonConflictError("canon prefix mismatch");
   }
   return incoming;
+}
+
+type CanonRowLegacy = CanonRow & { canon?: CursorMessage[] };
+
+async function canonMetaFromRow(
+  row: CanonRowLegacy | null | undefined,
+  tools: CursorTool[],
+): Promise<{ canon_len: number; canon_hash: string } | null> {
+  if (!row) return null;
+  if (row.canon_len > 0 && row.canon_hash) {
+    return { canon_len: row.canon_len, canon_hash: row.canon_hash };
+  }
+  const legacy = row.canon;
+  if (legacy?.length) {
+    return {
+      canon_len: legacy.length,
+      canon_hash: await computeCanonHash(legacy, tools),
+    };
+  }
+  return null;
+}
+
+async function writeCanonRow(
+  kv: Kv,
+  key: string,
+  messages: CursorMessage[],
+  tools: CursorTool[],
+  turnCount: number,
+  ttl: number,
+  extra?: Partial<ActivePendingRow>,
+): Promise<void> {
+  const { canon_len, canon_hash } = await canonMetaFromMessages(messages, tools);
+  await kv.setItem(
+    key,
+    {
+      canon_len,
+      canon_hash,
+      updatedAt: Date.now(),
+      turnCount,
+      ...extra,
+    } satisfies CanonRow | ActivePendingRow,
+    { ttl },
+  );
+}
+
+async function canonMetaFromMessages(
+  messages: CursorMessage[],
+  tools: CursorTool[],
+): Promise<{ canon_len: number; canon_hash: string }> {
+  return { canon_len: messages.length, canon_hash: await computeCanonHash(messages, tools) };
 }
 
 export async function resolveCanonicalThread(
@@ -272,45 +343,41 @@ export async function resolveCanonicalThread(
 
   if (anchor.startsWith("pending:")) {
     const slot = await kv.getItem<ActivePendingRow>(pendingSlot);
-    if (!slot?.canon?.length) {
+    const meta = await canonMetaFromRow(slot, tools);
+    if (!meta) {
       const canon = cursorMessages;
-      await kv.setItem(
-        pendingSlot,
-        { anchor_fp: anchor, canon, updatedAt: Date.now(), turnCount: 1 } satisfies ActivePendingRow,
-        { ttl },
-      );
+      await writeCanonRow(kv, pendingSlot, canon, tools, 1, ttl, { anchor_fp: anchor });
       return { canon, merge: "miss", turnCount: 1 };
     }
     try {
-      const canon = appendOnlyMerge(slot.canon, cursorMessages, tools);
-      const turnCount = (slot.turnCount || 0) + 1;
-      await kv.setItem(
-        pendingSlot,
-        { anchor_fp: anchor, canon, updatedAt: Date.now(), turnCount } satisfies ActivePendingRow,
-        { ttl },
-      );
+      const canon = await verifyAppendOnly(meta.canon_len, meta.canon_hash, cursorMessages, tools);
+      const turnCount = (slot?.turnCount || 0) + 1;
+      await writeCanonRow(kv, pendingSlot, canon, tools, turnCount, ttl, { anchor_fp: anchor });
       return { canon, merge: "hit", turnCount };
     } catch (e) {
       if (!(e instanceof CanonConflictError)) throw e;
-      if (slot.turnCount > 1) throw e;
+      if ((slot?.turnCount || 0) > 1) throw e;
       const canon = cursorMessages;
-      await kv.setItem(
-        pendingSlot,
-        { anchor_fp: anchor, canon, updatedAt: Date.now(), turnCount: 1 } satisfies ActivePendingRow,
-        { ttl },
-      );
+      await writeCanonRow(kv, pendingSlot, canon, tools, 1, ttl, { anchor_fp: anchor });
       return { canon, merge: "miss", turnCount: 1 };
     }
   }
 
   let row = await kv.getItem<CanonRow>(key);
-  if (!row?.canon?.length) {
+  let rowMeta = await canonMetaFromRow(row, tools);
+  if (!rowMeta) {
     const pendingRow = await kv.getItem<ActivePendingRow>(pendingSlot);
-    if (pendingRow?.canon?.length) {
+    const pendingMeta = await canonMetaFromRow(pendingRow, tools);
+    if (pendingMeta) {
       try {
-        const canon = appendOnlyMerge(pendingRow.canon, cursorMessages, tools);
-        const turnCount = (pendingRow.turnCount || 0) + 1;
-        await kv.setItem(key, { canon, updatedAt: Date.now(), turnCount } satisfies CanonRow, { ttl });
+        const canon = await verifyAppendOnly(
+          pendingMeta.canon_len,
+          pendingMeta.canon_hash,
+          cursorMessages,
+          tools,
+        );
+        const turnCount = (pendingRow?.turnCount || 0) + 1;
+        await writeCanonRow(kv, key, canon, tools, turnCount, ttl);
         await kv.removeItem(pendingSlot);
         return { canon, merge: "hit", turnCount };
       } catch (e) {
@@ -320,17 +387,17 @@ export async function resolveCanonicalThread(
     }
   }
 
-  if (!row?.canon?.length) {
+  if (!rowMeta) {
     const canon = cursorMessages;
     const turnCount = 1;
-    await kv.setItem(key, { canon, updatedAt: Date.now(), turnCount } satisfies CanonRow, { ttl });
+    await writeCanonRow(kv, key, canon, tools, turnCount, ttl);
     return { canon, merge: "miss", turnCount };
   }
 
   try {
-    const canon = appendOnlyMerge(row.canon, cursorMessages, tools);
-    const turnCount = (row.turnCount || 0) + 1;
-    await kv.setItem(key, { canon, updatedAt: Date.now(), turnCount } satisfies CanonRow, { ttl });
+    const canon = await verifyAppendOnly(rowMeta.canon_len, rowMeta.canon_hash, cursorMessages, tools);
+    const turnCount = (row?.turnCount || 0) + 1;
+    await writeCanonRow(kv, key, canon, tools, turnCount, ttl);
     return { canon, merge: "hit", turnCount };
   } catch (e) {
     if (e instanceof CanonConflictError) throw e;

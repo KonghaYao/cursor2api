@@ -7,9 +7,11 @@ import {
   CanonConflictError,
   canonicalSerializeForFingerprint,
   computeAnchorFp,
+  computeCanonHash,
   computeEnvFp,
   extractFCTR,
   resolveCanonicalThread,
+  verifyAppendOnly,
 } from "./session_fingerprint.ts";
 
 const toolsA = [
@@ -79,6 +81,41 @@ test("appendOnlyMerge accepts tail append and rejects prefix tamper", () => {
   assert.deepEqual(appendOnlyMerge(stored, extended, []), extended);
   const bad = [{ role: ROLE.user, text: "tampered" }, a];
   assert.throws(() => appendOnlyMerge(stored, bad, []), CanonConflictError);
+});
+
+test("verifyAppendOnly matches appendOnlyMerge semantics", async () => {
+  const u: CursorMessage = { role: ROLE.user, text: "a" };
+  const a: CursorMessage = { role: ROLE.assistant, text: "b" };
+  const stored = [u];
+  const extended = [u, a];
+  const hash = await computeCanonHash(stored, []);
+  const verified = await verifyAppendOnly(1, hash, extended, []);
+  assert.deepEqual(verified, extended);
+  const bad = [{ role: ROLE.user, text: "tampered" }, a];
+  await assert.rejects(() => verifyAppendOnly(1, hash, bad, []), CanonConflictError);
+});
+
+test("KV row is hash-only (small payload)", async () => {
+  const kv = createMemoryKv();
+  const tenant = "t-small";
+  const body = { model: "composer-2.5-fast" };
+  const msgs = Array.from({ length: 50 }, (_, i) => ({
+    role: "user" as const,
+    content: `msg-${i}-${"x".repeat(200)}`,
+  }));
+  const pipelined = await runCanonicalMessagePipeline(msgs, body, []);
+  const env = await computeEnvFp(body, [], { rawMessages: msgs });
+  const anchor = await computeAnchorFp(pipelined.messages, []);
+  await resolveCanonicalThread(kv, tenant, env, anchor, pipelined.messages, []);
+  const slotKey = anchor.startsWith("pending:")
+    ? `canon:${tenant}:${env}:active_pending`
+    : `canon:${tenant}:${env}:${anchor}`;
+  const raw = await kv.getItem<Record<string, unknown>>(slotKey);
+  assert.ok(raw?.canon_hash && typeof raw.canon_hash === "string");
+  assert.equal((raw.canon_hash as string).length, 64);
+  assert.ok(!(raw as { canon?: unknown }).canon);
+  const serialized = JSON.stringify(raw);
+  assert.ok(serialized.length < 500, `KV row should be tiny, got ${serialized.length}`);
 });
 
 test("canonicalSerialize is stable under key reordering", () => {
