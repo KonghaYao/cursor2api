@@ -68,4 +68,4 @@ Cursor `requestedModel` 含 **route（modelId）** 与 **parameters（fast / max
 session_mode=fingerprint session_fp=… canon_len=N
 ```
 
-JWT KV 与 session 无关。`SESSION_MODE=random` 不算 fp。
+`crsr_…` 换票可走进程 L1 + KV L2；**客户端 JWT 不存储**。`SESSION_MODE=random` 不算 fp。

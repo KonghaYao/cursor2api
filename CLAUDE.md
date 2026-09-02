@@ -4,6 +4,72 @@
 
 ---
 
+## Team Usage CSV：缓存与成本分析方法
+
+从 Cursor Team 导出的 `team-usage-events-*.csv` 判断 **prompt cache 是否正常**、**成本花在哪**、**有没有事故级回归**。可复现脚本：`scripts/analyze_team_usage.py` → HTML 报告 `reports/usage-<date>-cache-cost.html`。
+
+```bash
+python3 scripts/analyze_team_usage.py team-usage-events-29803137-2026-09-02.csv
+open reports/usage-2026-09-02-cache-cost.html
+```
+
+### 列语义（不要误读）
+
+| 列 | 含义 |
+|----|------|
+| `Input (w/o Cache Write)` | 本轮**未命中**缓存的 input tokens（新 user/tool 内容，或整段 history 重送） |
+| `Cache Read` | 命中缓存的前缀 tokens |
+| `Input (w/ Cache Write)` | 本导出常为 0；**不能**当「写了多少 cache」 |
+| `Cost` | Team Usage **内部估算**（`Included` 仍显示相对金额），用于对比趋势 |
+
+**单次命中率**（脚本默认）：
+
+```text
+hit = Cache Read / (Cache Read + Input (w/o Cache Write))
+```
+
+**冷启动**：`Cache Read ≤ 1`（与 Cursor 导出里「几乎没读到缓存」一致）。
+
+**全局命中率**（按 token 加权）：
+
+```text
+global_hit = Σ Cache Read / (Σ Cache Read + Σ Input (w/o Cache Write))
+```
+
+### 与 9/1 事故对照（是否「网关把 conversationId 打随机」）
+
+| 信号 | 事故日（random id） | 健康日 |
+|------|---------------------|--------|
+| 同一逻辑会话连续多枪 `Cache Read ≈ 0` | **15～50+** | 通常 **≤7**；且 `in_wo` 常各不相同（多 thread 交错） |
+| 滚动 20 请求全局命中 | 长期 **&lt;20%** | 中位 **~98%** |
+| 换轨后 | 每轮都冷 | **偶发冷枪**后回到高 `Cache Read` 轨道 |
+
+**整前缀重送**（换 `session_fp` / 新 thread，不是每轮随机）：
+
+- 相邻两枪（时间正序）：上一枪 `Cache Read = R` 且命中高；下一枪 `Cache Read ≤ 1` 且 `Input (w/o Cache Write) ≈ R`（相对误差 &lt;8%）。
+- 脚本统计为 `reships` 次数。
+
+### 自动异常检测（HTML 竖线 / 标签）
+
+1. **Token 一致性**：`Total` 是否等于 `in_wo + Cache Read + Output`（允许 ±2 舍入）。
+2. **冷启动 streak**：连续 ≥5 次 `CR≤1`（按时间排序）；事故日会出现很长一段，健康日多为并行新 thread。
+3. **冷启动 burst**：60 秒滑动窗内 ≥4 次冷启动 → 标为「异常簇」（如 CST 11:08、14:20 批量 subagent）。
+4. **计费离群**：Composer 上 `cost / (in_wo+CR)` 在**热路径**（hit≥90%）应稳定；**冷枪**单价约为热路径 **4～6 倍**属定价结构，不是 warm 乱扣。
+5. **多 thread 假突变**：30 秒内 `Cache Read` 从 ~120k 跳到 ~24k 且**两边都 &gt;10k、仍高命中** → 多为**并行会话交错**，不是单会话 cache 丢失。
+
+### 成本归因（简表）
+
+- **冷启动 + 超长 in_wo**（10万+）：单枪 $0.05–0.07，换轨一次付清。
+- **热路径长上下文**（CR 15万+、in_wo 小）：单枪 ~$0.04，正常。
+- **Grok**：注意 `Cache Read=0` 冷枪与 **大 output**（如 out&gt;6k → $0.14），与 Composer 缓存逻辑分开看。
+
+### 报告产物
+
+- `reports/usage-<date>-cache-cost.html`：汇总卡片、按小时成本/命中、命中率分布、滚动命中、**时间轴散点 + burst 竖线**、冷启动 streak 表。
+- 与事故对比图：`reports/incident-2026-09-01-windows.html`（若存在）。
+
+---
+
 ## 2026-09-01：每轮 `random` conversationId → 多轮 Cache Read 全 0
 
 ### 时间点（两次发版，两段落零）

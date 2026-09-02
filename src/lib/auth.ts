@@ -1,4 +1,5 @@
 import { jwtClaims, randomId, sha256Hex } from "./bytes.ts";
+import { jwtL1Get, jwtL1Set } from "./jwt_l1_cache.ts";
 import { kvGetJwt, kvSetJwt, type Kv } from "./kv.ts";
 
 export const CURSOR_BASE = "https://api2.cursor.sh";
@@ -89,25 +90,37 @@ function resolveCredential(headers: Headers): string {
   return incoming;
 }
 
+/**
+ * Resolve upstream Bearer for Inference/Agent RPC.
+ *
+ * Production: client sends `crsr_…` on every request → L1 → KV → exchange (once per TTL).
+ * Optional: client sends JWT → use as-is, no cache (not the hosted client contract).
+ */
 export async function getAccessToken(ctx: GatewayCtx, headers: Headers): Promise<{ accessToken: string; tenant: string }> {
   const credential = resolveCredential(headers);
   const tenant = await credentialFingerprint(credential);
-  const cacheKey = `jwt:${tenant}`;
-  const cached = await kvGetJwt(ctx.kv, cacheKey);
-  if (cached) return { accessToken: cached.accessToken, tenant };
 
-  let accessToken: string;
-  let exp: number;
-  const now = Date.now() / 1000;
   if (isJwt(credential)) {
-    accessToken = credential;
-    exp = Number(jwtClaims(credential)?.exp) || now + 3600;
-  } else {
-    const exchanged = await exchangeApiKey(credential);
-    accessToken = exchanged.accessToken;
-    exp = Number(jwtClaims(accessToken)?.exp) || now + 3600;
+    return { accessToken: credential, tenant };
   }
-  await kvSetJwt(ctx.kv, cacheKey, { accessToken, exp });
+
+  const cacheKey = `jwt:${tenant}`;
+  const l1 = jwtL1Get(cacheKey);
+  if (l1) return { accessToken: l1.accessToken, tenant };
+
+  const cached = await kvGetJwt(ctx.kv, cacheKey);
+  if (cached) {
+    jwtL1Set(cacheKey, cached);
+    return { accessToken: cached.accessToken, tenant };
+  }
+
+  const exchanged = await exchangeApiKey(credential);
+  const accessToken = exchanged.accessToken;
+  const now = Date.now() / 1000;
+  const exp = Number(jwtClaims(accessToken)?.exp) || now + 3600;
+  const row = { accessToken, exp };
+  await kvSetJwt(ctx.kv, cacheKey, row);
+  jwtL1Set(cacheKey, row);
   return { accessToken, tenant };
 }
 

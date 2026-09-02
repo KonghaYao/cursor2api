@@ -2,7 +2,7 @@
 
 把 Cursor `InferenceService/Stream` 转成 OpenAI / Anthropic 形接口。网关**不执行工具**：客户端带 `tools[]`，模型回 `tool_calls`。
 
-鉴权只看请求：`Authorization: Bearer <crsr_… 或 JWT>` 或 `x-api-key`。没有服务端 API key，每个人用自己的 Cursor token，互不串会话。换出的 JWT 按 token 指纹缓存在 KV 里，**KV 条目 TTL 最长 5 分钟**（仅 JWT 换票缓存）。
+鉴权只看请求：`Authorization: Bearer <crsr_…>` 或 `x-api-key`（**生产约定：客户端只传 Cursor Dashboard 的 API key**，不传已换好的 JWT）。没有服务端共享 API key，每人一把，互不串会话。网关对 `crsr_…` 调 `exchange_user_api_key` 换 JWT：**进程内 L1** → **KV L2**（跨 isolate，TTL ≤5min），同 key 在 TTL 内不重复换票。若有人直接传 `eyJ…` JWT（自测/脚本），网关**不读写 KV**，原样作 Bearer。会话 **fingerprint 不算 KV**。
 
 ## 生产环境
 
@@ -41,7 +41,7 @@ deno task start
 
 默认 `http://127.0.0.1:8789`。OpenAI SDK：`baseURL` = `http://127.0.0.1:8789/v1`，`apiKey` 填 Cursor Dashboard 的 `crsr_…`（或已换好的 JWT）。Node 绑 `127.0.0.1` 和 `::1`；Deno 绑 `127.0.0.1`。
 
-可选 `PORT`。Cloudflare 可绑 `KV` 做跨 isolate 的 JWT 缓存；不绑则用内存。Deno 入口使用 **`Deno.openKv()`** 仅用于 JWT（`deno task start` 需 `--allow-read --allow-write`）。会话 **fingerprint 不算 KV**。
+可选 `PORT`。Cloudflare 可绑 `KV` 做 **crsr_ 换票** 的 L2（不绑则仅 isolate 内 L1 + 内存 KV）。Deno 入口 `Deno.openKv()` 作 L2（`deno task start` 需 `--allow-read --allow-write`）。
 
 ## 接口
 
