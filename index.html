@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>cursor2api</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #f6f8fc;
+      --ink: #0a0e1a;
+      --muted: rgba(10, 14, 26, 0.45);
+      --line: rgba(10, 14, 26, 0.1);
+      --glass: rgba(255, 255, 255, 0.55);
+      --accent: #3d5afe;
+      --glow: rgba(61, 90, 254, 0.4);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      background: var(--bg);
+      color: var(--ink);
+    }
+    #cosmos { position: fixed; inset: 0; z-index: 0; }
+    .aurora {
+      position: fixed; inset: -50%; z-index: 0; pointer-events: none;
+      background:
+        radial-gradient(ellipse 55% 45% at 15% 25%, rgba(124, 77, 255, 0.18), transparent 50%),
+        radial-gradient(ellipse 50% 40% at 85% 15%, rgba(61, 90, 254, 0.2), transparent 48%),
+        radial-gradient(ellipse 70% 55% at 50% 100%, rgba(0, 188, 212, 0.1), transparent 55%);
+      animation: drift 32s ease-in-out infinite alternate;
+      filter: blur(48px);
+    }
+    @keyframes drift { to { transform: translate(-4%, 3%) rotate(3deg) scale(1.08); } }
+    .grid-floor {
+      position: fixed; left: 50%; bottom: -25vh; width: 220vmax; height: 90vh;
+      transform: translateX(-50%) perspective(500px) rotateX(74deg);
+      background-image:
+        linear-gradient(var(--line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line) 1px, transparent 1px);
+      background-size: 56px 56px;
+      mask-image: linear-gradient(to top, black, transparent 88%);
+      opacity: 0.65; z-index: 0;
+    }
+    .scanline {
+      position: fixed; inset: 0; z-index: 1; pointer-events: none;
+      background: repeating-linear-gradient(0deg, transparent, transparent 3px, rgba(10,14,26,0.012) 3px, rgba(10,14,26,0.012) 4px);
+    }
+    .ring-deco {
+      position: fixed; left: 50%; top: 42%;
+      width: min(92vmin, 720px); height: min(92vmin, 720px);
+      transform: translate(-50%, -50%);
+      border: 1px solid rgba(61, 90, 254, 0.12); border-radius: 50%;
+      z-index: 1; pointer-events: none;
+      animation: spin 120s linear infinite;
+    }
+    .ring-deco::before {
+      content: ""; position: absolute; inset: 12%;
+      border: 1px dashed rgba(124, 77, 255, 0.15); border-radius: 50%;
+    }
+    @keyframes spin { to { transform: translate(-50%, -50%) rotate(360deg); } }
+
+    main {
+      position: relative; z-index: 2; height: 100%;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: 2rem; gap: clamp(1.75rem, 4vh, 2.75rem);
+    }
+    h1 {
+      font-family: Syne, sans-serif; font-weight: 800;
+      font-size: clamp(2.8rem, 10vw, 5rem); letter-spacing: -0.04em;
+      background: linear-gradient(160deg, var(--ink) 20%, var(--accent) 100%);
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+      user-select: none;
+    }
+
+    .card {
+      width: min(100%, 540px);
+      background: var(--glass);
+      backdrop-filter: blur(24px) saturate(1.5);
+      border: 1px solid rgba(255,255,255,0.9);
+      border-radius: 20px;
+      padding: 1.5rem 1.5rem 1.25rem;
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.5) inset, 0 32px 64px -28px var(--glow);
+    }
+    .compat {
+      font-size: 0.72rem; letter-spacing: 0.12em; text-transform: uppercase;
+      color: var(--muted); margin-bottom: 1.25rem;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 5.5rem 1fr auto;
+      align-items: center;
+      gap: 0.65rem;
+      padding: 0.65rem 0;
+      border-top: 1px solid var(--line);
+    }
+    .row:first-of-type { border-top: none; padding-top: 0; }
+    .row label {
+      font-size: 0.62rem; letter-spacing: 0.18em; color: var(--muted); text-transform: uppercase;
+    }
+    .row input {
+      font: inherit; font-size: 0.78rem; border: none; background: transparent;
+      color: var(--ink); outline: none; min-width: 0;
+    }
+    .row input::placeholder { color: var(--muted); }
+    .hint {
+      grid-column: 2 / -1;
+      font-size: 0.72rem; line-height: 1.55; color: var(--muted);
+      padding-bottom: 0.35rem;
+    }
+    .hint a { color: var(--accent); text-decoration: none; border-bottom: 1px solid rgba(61,90,254,0.35); }
+    .hint a:hover { border-bottom-color: var(--accent); }
+    button.copy {
+      font: inherit; font-size: 0.65rem; letter-spacing: 0.06em;
+      padding: 0.45rem 0.75rem; border-radius: 8px;
+      border: 1px solid var(--line); background: var(--ink); color: #fff;
+      cursor: pointer; transition: transform 0.12s, box-shadow 0.12s;
+    }
+    button.copy:hover { transform: scale(1.04); box-shadow: 0 8px 20px -6px var(--glow); }
+
+    .card-foot {
+      display: flex; align-items: center; justify-content: flex-end;
+      margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--line);
+    }
+    .gh {
+      display: inline-flex; align-items: center; gap: 0.5rem;
+      font-size: 0.72rem; color: var(--muted); text-decoration: none;
+      transition: color 0.15s;
+    }
+    .gh:hover { color: var(--ink); }
+    .gh svg { width: 22px; height: 22px; fill: currentColor; }
+  </style>
+</head>
+<body>
+  <canvas id="cosmos"></canvas>
+  <div class="aurora" aria-hidden="true"></div>
+  <div class="grid-floor" aria-hidden="true"></div>
+  <div class="scanline" aria-hidden="true"></div>
+  <div class="ring-deco" aria-hidden="true"></div>
+
+  <main>
+    <h1>cursor2api</h1>
+    <section class="card">
+      <p class="compat">OpenAI-compatible · Chat Completions &amp; Models</p>
+
+      <div class="row">
+        <label for="base-url">Base URL</label>
+        <input id="base-url" readonly value="https://cursor2api.freetavily.deno.net/v1" />
+        <button type="button" class="copy" data-target="base-url">COPY</button>
+      </div>
+
+      <div class="row" style="grid-template-rows: auto auto; align-items: start;">
+        <label for="api-key" style="padding-top: 0.15rem;">API Key</label>
+        <div>
+          <p class="hint" style="padding-bottom: 0.65rem;">
+            Get your key from the
+            <a href="https://cursor.com/dashboard/api" target="_blank" rel="noopener noreferrer">Cursor API dashboard</a>
+          </p>
+          <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="crsr_…" />
+        </div>
+        <button type="button" class="copy" data-target="api-key" style="align-self: end;">COPY</button>
+      </div>
+
+      <div class="card-foot">
+        <a class="gh" href="https://github.com/KonghaYao/cursor2api" target="_blank" rel="noopener noreferrer">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+          KonghaYao/cursor2api
+        </a>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+  <script>
+    (function () {
+      const canvas = document.getElementById("cosmos");
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setClearColor(0xf6f8fc, 1);
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(50, 1, 1, 2500);
+      camera.position.z = 480;
+      const n = 18000;
+      const pos = new Float32Array(n * 3);
+      const col = new Float32Array(n * 3);
+      const pal = [0x3d5afe, 0x7c4dff, 0x00bcd4, 0x1a237e].map((h) => new THREE.Color(h));
+      for (let i = 0; i < n; i++) {
+        const r = 200 + Math.random() * 600;
+        const t = Math.random() * Math.PI * 2;
+        const p = Math.acos(2 * Math.random() - 1);
+        pos[i * 3] = r * Math.sin(p) * Math.cos(t);
+        pos[i * 3 + 1] = (r * Math.sin(p) * Math.sin(t)) * 0.4;
+        pos[i * 3 + 2] = r * Math.cos(p);
+        const c = pal[(Math.random() * pal.length) | 0];
+        col[i * 3] = c.r; col[i * 3 + 1] = c.g; col[i * 3 + 2] = c.b;
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
+      scene.add(new THREE.Points(geo, new THREE.PointsMaterial({
+        size: 2, vertexColors: true, transparent: true, opacity: 0.8,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      })));
+      let mx = 0, my = 0;
+      addEventListener("pointermove", (e) => {
+        mx = (e.clientX / innerWidth - 0.5) * 2;
+        my = (e.clientY / innerHeight - 0.5) * 2;
+      });
+      function resize() {
+        renderer.setSize(innerWidth, innerHeight, false);
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+      }
+      resize();
+      addEventListener("resize", resize);
+      const clock = new THREE.Clock();
+      const pts = scene.children[0];
+      (function tick() {
+        const t = clock.getElapsedTime();
+        pts.rotation.y = t * 0.035 + mx * 0.2;
+        pts.rotation.x = my * 0.1;
+        camera.position.x = mx * 40;
+        camera.position.y = -my * 28;
+        camera.lookAt(0, 0, 0);
+        renderer.render(scene, camera);
+        requestAnimationFrame(tick);
+      })();
+    })();
+    document.querySelectorAll(".copy").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const el = document.getElementById(btn.getAttribute("data-target"));
+        const text = el?.value || "";
+        if (!text) return;
+        navigator.clipboard.writeText(text).then(() => {
+          const p = btn.textContent;
+          btn.textContent = "OK";
+          setTimeout(() => { btn.textContent = p; }, 1200);
+        });
+      });
+    });
+  </script>
+</body>
+</html>
