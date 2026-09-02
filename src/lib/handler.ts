@@ -249,7 +249,7 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
           }),
           model: body.model,
           conversationId: prepared.clientId,
-          sessionId: prepared.clientId,
+          sessionId: prepared.sessionId,
           tools: prepared.tools,
           signal: request.signal,
         });
@@ -305,7 +305,7 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
           }),
           model: body.model,
           conversationId: prepared.clientId,
-          sessionId: prepared.clientId,
+          sessionId: prepared.sessionId,
           tools: prepared.tools,
           signal: request.signal,
         });

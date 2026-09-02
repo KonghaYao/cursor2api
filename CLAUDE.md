@@ -197,7 +197,7 @@ Agent execution failed: LLM error: model protocol error: provider failure
 
 1. `sseChunksFromConnectFrame`：只缓冲 `toolCallPart`，**流式过程中不向客户端发 tool delta**
 2. `enqueueOpenAiSseFinish`：在 `finish_reason` 之前，仿 `openaiSseBody` **一次性 emit 完整 `tool_calls`**
-3. 顺带修正 `streamOpenAiChatCompletion` 的 `x-session-id`：误用 `tenant:clientId`，改回与非流式一致的 `clientId`
+3. 流式 `streamOpenAiChatCompletion` / `streamAnthropicMessage` 的 `x-session-id` 须与非流式一致：`prepared.sessionId`（`tenant:session_fp`），与 Connect body 的 `conversationId` 相同；勿用裸 `prepared.clientId`
 
 相关测试：`src/lib/connect_stream.test.ts` — *OpenAI SSE stream emits complete tool_calls delta at end*。
 
