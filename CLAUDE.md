@@ -70,6 +70,42 @@ global_hit = Σ Cache Read / (Σ Cache Read + Σ Input (w/o Cache Write))
 
 ---
 
+## 2026-09-02：`crsr_` 换票 L1；JWT 直连不存 KV
+
+### 背景
+
+生产客户端**只传** Cursor Dashboard 的 `crsr_…` API key（每次请求 Bearer），不传已换好的 JWT。会话仍 **无状态**（`session_fp` → `conversationId`，不写 KV）。  
+此前：每个请求至少 **1 次 KV read** 查换票缓存；`eyJ…` JWT 也会读写 KV（无实际收益）。
+
+### 改动（`b5de214`）
+
+| 凭证 | 行为 |
+|------|------|
+| `crsr_…` | **L1**（进程/isolate 内 Map）→ **KV L2** → `exchange_user_api_key`；L1 命中则 **0 KV read、0 exchange** |
+| `eyJ…` JWT | 直接作上游 Bearer，**不读不写 KV**（自测/脚本；非生产约定） |
+
+L1 TTL 与 KV 一致：条目最长 **5 分钟**，且 JWT `exp` 前 **60s** 失效。
+
+### 生产严肃性（发版评估）
+
+| 维度 | 结论 |
+|------|------|
+| `session_fp` / prompt cache / Inference 协议 | **无改动** |
+| 鉴权结果 | 与改前等价（仍是换票后的 JWT 打上游） |
+| 风险等级 | **低～中**（性能/成本优化，非会话事故类） |
+| 回滚 | revert 单 commit |
+| 多 isolate | 冷 L1 仍走 KV L2，与改前一致；热路径更省 KV |
+
+**不要与 9/1 conversationId 事故混淆**：本项只动 `getAccessToken`，不动 `conversationId`。
+
+### 约束（后续改鉴权时）
+
+- **不要**把 `session_fp`、canon、messages 写回 KV（已删除的 canon 路径勿复活）。
+- **不要**在 `crsr_` 路径去掉 L1 又对每次请求强制 exchange（会打满 Cursor 换票与付费 KV）。
+- Cloudflare：KV 仅作 **L2**；不绑 KV 时仍有 L1 + 内存 `createMemoryKv()`。
+
+---
+
 ## 2026-09-01：每轮 `random` conversationId → 多轮 Cache Read 全 0
 
 ### 时间点（两次发版，两段落零）

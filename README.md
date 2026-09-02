@@ -20,6 +20,28 @@ curl -sS https://cursor2api.freetavily.deno.net/v1/chat/completions \
   -d '{"model":"composer-2.5-fast","messages":[{"role":"user","content":"Reply with exactly: PONG"}]}'
 ```
 
+## 技术迭代与事故时间线
+
+按 `git log` 归纳（详因与约束见 **[CLAUDE.md](CLAUDE.md)**）。
+
+| 日期 | 主题 | 代表 commit | 摘要 |
+|------|------|-------------|------|
+| **2026-08-31** | 网关雏形 | `4475a90` | OpenAI/Anthropic → `InferenceService/Stream`；客户端执行 `tool_calls` |
+| | 多轮与工具 | `3b08cb2` → `95e2841` | 租户粘性会话；`<tools-rules>` / `<tools-catalog>` 与 cache 断点 |
+| | 运行时 | `461d776` | Deno `openKv`；JWT 换票 KV **TTL ≤5min**（仅鉴权，非会话） |
+| | 模型 | `0a8fc5c` | Composer/Grok 简写 → Cursor flat route |
+| | 流式 | `d85819d` → `42f8e85` | 真 SSE；**`stream:true` 时 tool_calls 须在流末一次性下发**（Agent 协议） |
+| | Grok / 多模态 | `5ad529b` → `df8c1ce` | Grok `max_tokens` 下限；带 tools 时非 fast route 升 `-fast` |
+| | 协议补全 | `27023de` → `997a0ec` | `image_url` → `InferenceImagePart`；OpenAI/Anthropic 字段映射 |
+| **2026-09-01** | 会话指纹 | `41e7376` → `6dc1abc` | 默认 `session_fp`；KV 只存 canon 哈希（仍易与无状态目标冲突） |
+| | **事故** | `0ccb04b` | 去 KV canon 时误用 **每轮 random `conversationId`** → Team Usage **连续 15～50 枪 Cache Read≈0** |
+| | **修复** | `22376ac` | `conversationId` / `x-session-id` = **`tenant:session_fp`**，恢复 prompt cache |
+| | 文档 | `b8ddef5` / `8523c65` | 事故与两次发版窗口记入 CLAUDE |
+| **2026-09-02** | 鉴权成本 | `b5de214` | `crsr_`：**L1 → KV → exchange**；生产不传 JWT；**不动会话/cache** |
+| | 可观测 | `scripts/analyze_team_usage.py` | Team Usage CSV → 命中率/冷启动/异常簇 HTML（方法见 CLAUDE） |
+
+**事故一句话**：9/1 晚把「无状态」理解成「每轮新 conversation id」，Cursor 侧 prompt cache 绑稳定 id，导致长会话几乎 **0% Cache Read**；`22376ac` 后用 fingerprint 当 id，9/2 用量全局命中约 **94%**（见 Team Usage 分析）。
+
 共享逻辑在 `src/lib/`：
 
 | 入口 | 启动 |
