@@ -39,7 +39,7 @@ curl -sS https://cursor2api.freetavily.deno.net/v1/chat/completions \
 | | 文档 | `b8ddef5` / `8523c65` | 事故与两次发版窗口记入 CLAUDE |
 | **2026-09-02** | 鉴权成本 | `b5de214` | `crsr_`：**L1 → KV → exchange**；生产不传 JWT；**不动会话/cache** |
 | | 可观测 | `scripts/analyze_team_usage.py` | Team Usage CSV → 命中率/冷启动/异常簇 HTML（方法见 CLAUDE） |
-| **2026-09-03** | Thinking | — | OpenAI 只转发明文 `reasoning_content`；Grok signature 密文不下发。`grok-4.6` 无 tools 走标准档，**仅有 tools 时**升 `-fast` |
+| **2026-09-03** | Thinking / Fast | `a81208c` | 明文 `reasoning_content`；Grok 密文不下发。`grok-4.6` 无 tools 走标准档；**有 tools 必须 Fast（2 倍价），`fast:false` 盖不住** |
 
 **事故一句话**：9/1 晚把「无状态」理解成「每轮新 conversation id」，Cursor 侧 prompt cache 绑稳定 id，导致长会话几乎 **0% Cache Read**；`22376ac` 后用 fingerprint 当 id，9/2 用量全局命中约 **94%**（见 Team Usage 分析）。
 
@@ -95,7 +95,24 @@ deno task start
 | `grok-4.6-fast` 或 `fast: true` | `cursor-grok-4.6-high-fast` |
 | `grok-4.6` **且带 `tools[]`** | `cursor-grok-4.6-high-fast`（自动升级） |
 
-Cursor 的非 fast Grok route **不支持 tool calling**（上游 422）。Agent 几乎必带 tools，所以线上常看到「写了 `grok-4.6` 实际是 fast」——这是有意的，不是把标准档误映射成 fast。不要去掉 `upgradeGrokRouteForTools`，否则 Grok + tools 会无返回。
+Cursor 的非 fast Grok route **不支持 tool calling**（上游 `ERROR_PROVIDER_ERROR` / 422）。Agent 几乎必带 tools，所以线上常看到「写了 `grok-4.6` 实际是 fast」——这是有意的，不是把标准档误映射成 fast。不要去掉 `upgradeGrokRouteForTools`，否则 Grok + tools 会无返回。
+
+**`fast: false` 盖不住自动升级，也不能半价用工具。** 网关只认 `fast: true` / `grok-4.6-fast`；`fast: false` 不会关掉 `upgradeGrokRouteForTools`。硬打 `cursor-grok-4.6-high` + `tools[]` 实测无正文、无 `tool_calls`。官方 IDE 关 Fast 仍能用工具，走的是 Agent harness，不是本网关转发的 `InferenceService` + `tools[]`。
+
+工具调用必须留着时，Grok **只能走 Fast**（2 倍价）。要省钱：纯聊天不带 `tools`，或换 Composer。
+
+Cursor 官方标价（每百万 tokens，[Grok 4.6](https://cursor.com/docs/models/grok-4-6) / [定价表](https://cursor.com/docs/models-and-pricing)）：
+
+| | Input | Cache Read | Output |
+|---|---|---|---|
+| **Grok 4.6** | $2 | $0.50 | $6 |
+| **Grok 4.6 Fast** | $4 | $1 | $12 |
+| **Grok 4.5** | $2 | $0.50 | $6 |
+| **Grok 4.5 Fast** | $4 | $1 | $18 |
+| **Composer 2.5** | $0.50 | $0.20 | $2.50 |
+| **Composer 2.5 Fast** | $3 | $0.50 | $15 |
+
+Grok 4.6 Fast = 全项 2 倍；4.5 Fast 的 output 是 3 倍。都进 **Cursor Models** 池。Pro 及以上 Fast 是默认 speed；产品名仍是「Grok 4.6」，Fast 是开关不是另一个对外 id。
 
 ### Thinking / `reasoning_content`
 
