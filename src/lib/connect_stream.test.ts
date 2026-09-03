@@ -140,3 +140,48 @@ test("Anthropic SSE stream emits event-named text deltas and complete tool_use a
   const toolStarts = text.split("event: content_block_start").filter((s) => s.includes("tool_use"));
   assert.equal(toolStarts.length, 1, "expected one complete tool_use block");
 });
+
+test("OpenAI SSE stream emits reasoning_content only for plaintext thinking", async () => {
+  const stream = buildOpenAiSseStreamFromFramePayloads({
+    frameChunks: [
+      encodeConnectFrame({ thinkingPart: { text: "hmm" } }),
+      encodeConnectFrame({ textPart: { text: "ok" } }),
+    ],
+    model: "composer-2.5-fast",
+    conversationId: "sess-think-plain",
+  });
+  const text = await new Response(stream).text();
+  assert.ok(text.includes('"reasoning_content":"hmm"'), text);
+  assert.ok(text.includes('"content":"ok"'), text);
+});
+
+test("OpenAI SSE stream omits ciphertext thinking signature", async () => {
+  const stream = buildOpenAiSseStreamFromFramePayloads({
+    frameChunks: [
+      encodeConnectFrame({ thinkingPart: { text: "", signature: "enc-blob-do-not-emit" } }),
+      encodeConnectFrame({ textPart: { text: "323" } }),
+    ],
+    model: "grok-4.6",
+    conversationId: "sess-think-cipher",
+  });
+  const text = await new Response(stream).text();
+  assert.equal(text.includes("reasoning_content"), false, text);
+  assert.equal(text.includes("enc-blob-do-not-emit"), false, text);
+  assert.ok(text.includes('"content":"323"'), text);
+});
+
+test("Anthropic SSE stream omits ciphertext thinking signature", async () => {
+  const stream = buildAnthropicSseStreamFromFramePayloads({
+    frameChunks: [
+      encodeConnectFrame({ thinkingPart: { signature: "enc-blob-do-not-emit" } }),
+      encodeConnectFrame({ textPart: { text: "323" } }),
+    ],
+    model: "grok-4.6",
+    conversationId: "sess-ant-cipher",
+  });
+  const text = await new Response(stream).text();
+  assert.equal(text.includes("thinking_delta"), false, text);
+  assert.equal(text.includes("signature_delta"), false, text);
+  assert.equal(text.includes("enc-blob-do-not-emit"), false, text);
+  assert.ok(text.includes('"text":"323"'), text);
+});

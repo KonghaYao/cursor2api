@@ -190,6 +190,7 @@ export type InferenceTurn = {
   text: string;
   thinking: string;
   thinkingSignature?: string;
+  thinkingRedacted?: boolean;
   usage: unknown;
   extendedUsage: unknown;
   providerMetadata: unknown;
@@ -197,6 +198,69 @@ export type InferenceTurn = {
   toolCalls: MergedToolCall[];
   imageDescriptions: ImageDescription[];
 };
+
+function thinkingPartText(part: Record<string, unknown> | undefined): string {
+  if (!part) return "";
+  return part.text != null && String(part.text) !== "" ? String(part.text) : "";
+}
+
+function thinkingPartSignature(part: Record<string, unknown> | undefined): string | undefined {
+  if (!part) return undefined;
+  const signature = part.signature != null && String(part.signature) !== "" ? String(part.signature) : "";
+  return signature || undefined;
+}
+
+function isRedactedThinking(part: Record<string, unknown> | undefined): boolean {
+  if (!part) return false;
+  if (part.isRedacted === true || part.is_redacted === true) return true;
+  const text = thinkingPartText(part);
+  const signature = thinkingPartSignature(part);
+  const redactedData = part.redactedData ?? part.redacted_data;
+  return !text && Boolean(signature || redactedData);
+}
+
+/** Cursor/Grok often emit encrypted thinking as signature-only; never treat ciphertext as reasoning_content. */
+export function absorbThinkingPart(
+  current: { thinking: string; thinkingSignature?: string; thinkingRedacted?: boolean },
+  part: Record<string, unknown> | undefined,
+): { thinking: string; thinkingSignature?: string; thinkingRedacted?: boolean } {
+  if (!part) return current;
+  const text = thinkingPartText(part);
+  const signature = thinkingPartSignature(part);
+  return {
+    thinking: text ? current.thinking + text : current.thinking,
+    thinkingSignature: signature ?? current.thinkingSignature,
+    thinkingRedacted: Boolean(current.thinkingRedacted || isRedactedThinking(part)),
+  };
+}
+
+function reasoningPartsFromResponseInfo(j: Record<string, unknown> | null | undefined): Array<Record<string, unknown>> {
+  const ri = j?.responseInfo as Record<string, unknown> | undefined;
+  const msgs = (ri?.messages as Array<Record<string, unknown>> | undefined) || [];
+  const out: Array<Record<string, unknown>> = [];
+  for (const m of msgs) {
+    const parts = m.reasoningParts as Array<Record<string, unknown>> | undefined;
+    if (Array.isArray(parts)) out.push(...parts);
+  }
+  return out;
+}
+
+function absorbThinkingFromFrame(
+  current: { thinking: string; thinkingSignature?: string; thinkingRedacted?: boolean },
+  j: Record<string, unknown> | null | undefined,
+): { thinking: string; thinkingSignature?: string; thinkingRedacted?: boolean } {
+  if (!j) return current;
+  let next = absorbThinkingPart(current, j.thinkingPart as Record<string, unknown> | undefined);
+  for (const part of reasoningPartsFromResponseInfo(j)) {
+    next = absorbThinkingPart(next, part);
+  }
+  return next;
+}
+
+/** OpenAI surface: only plaintext thinking. Ciphertext/signature stays off reasoning_content. */
+export function openAiReasoningFields(turn: { thinking?: string }): { reasoning_content?: string } {
+  return turn.thinking ? { reasoning_content: turn.thinking } : {};
+}
 
 function grokEffortFamily(modelId: string): string | null {
   const id = String(modelId || "").toLowerCase();
@@ -1036,8 +1100,7 @@ function collectImageDescriptions(frames: ConnectFrame[]): ImageDescription[] {
 
 export function collectTurn(frames: ConnectFrame[]) {
   let text = "";
-  let thinking = "";
-  let thinkingSignature: string | undefined;
+  let absorbed = { thinking: "", thinkingSignature: undefined as string | undefined, thinkingRedacted: false };
   let usage: unknown = null;
   let extendedUsage: unknown = null;
   let providerMetadata: unknown = null;
@@ -1046,10 +1109,8 @@ export function collectTurn(frames: ConnectFrame[]) {
     const j = frame.json;
     if (!j) continue;
     const textPart = j.textPart as Record<string, unknown> | undefined;
-    const thinkingPart = j.thinkingPart as Record<string, unknown> | undefined;
     if (textPart?.text) text += String(textPart.text);
-    if (thinkingPart?.text) thinking += String(thinkingPart.text);
-    if (thinkingPart?.signature) thinkingSignature = String(thinkingPart.signature);
+    absorbed = absorbThinkingFromFrame(absorbed, j);
     if (j.usage) usage = j.usage;
     if (j.extendedUsage) extendedUsage = j.extendedUsage;
     if (j.providerMetadata) providerMetadata = j.providerMetadata;
@@ -1057,8 +1118,9 @@ export function collectTurn(frames: ConnectFrame[]) {
   }
   return {
     text,
-    thinking,
-    thinkingSignature,
+    thinking: absorbed.thinking,
+    thinkingSignature: absorbed.thinkingSignature,
+    thinkingRedacted: absorbed.thinkingRedacted,
     usage,
     extendedUsage,
     providerMetadata,
@@ -1144,8 +1206,7 @@ export function toOpenAICompletion({
     content: turn.text || (toolCalls.length ? null : ""),
   };
   if (toolCalls.length) message.tool_calls = toolCalls;
-  if (turn.thinking) message.reasoning = turn.thinking;
-  if (turn.thinkingSignature) message.reasoning_signature = turn.thinkingSignature;
+  Object.assign(message, openAiReasoningFields(turn));
   return {
     id: `chatcmpl-${conversationId.slice(0, 8)}`,
     object: "chat.completion",
@@ -1298,18 +1359,17 @@ function sseChunksFromConnectFrame(
   const j = frame.json;
   if (!j) return out;
 
-  const thinkingPart = j.thinkingPart as Record<string, unknown> | undefined;
-  if (thinkingPart?.text) {
-    const chunk = String(thinkingPart.text);
-    state.accumulatedThinking += chunk;
-    if (chunk) {
-      out.push(
-        encodeSseData({
-          ...base(),
-          choices: [{ index: 0, delta: { reasoning_content: chunk }, finish_reason: null }],
-        }),
-      );
-    }
+  const beforeThinking = state.accumulatedThinking;
+  const absorbed = absorbThinkingFromFrame({ thinking: state.accumulatedThinking }, j);
+  state.accumulatedThinking = absorbed.thinking;
+  const thinkingChunk = absorbed.thinking.slice(beforeThinking.length);
+  if (thinkingChunk) {
+    out.push(
+      encodeSseData({
+        ...base(),
+        choices: [{ index: 0, delta: { reasoning_content: thinkingChunk }, finish_reason: null }],
+      }),
+    );
   }
 
   const textPart = j.textPart as Record<string, unknown> | undefined;
@@ -1603,50 +1663,29 @@ function sseChunksFromConnectFrameAnthropic(
   const j = frame.json;
   if (!j) return out;
 
-  const thinkingPart = j.thinkingPart as Record<string, unknown> | undefined;
-  if (thinkingPart?.text) {
-    const chunk = String(thinkingPart.text);
-    state.accumulatedThinking += chunk;
-    if (chunk) {
-      if (!state.thinkingOpen) {
-        state.thinkingIndex = state.nextIndex++;
-        state.thinkingOpen = true;
-        out.push(
-          encodeSseEvent("content_block_start", {
-            type: "content_block_start",
-            index: state.thinkingIndex,
-            content_block: { type: "thinking", thinking: "" },
-          }),
-        );
-      }
+  const beforeThinking = state.accumulatedThinking;
+  const absorbed = absorbThinkingFromFrame({ thinking: state.accumulatedThinking }, j);
+  state.accumulatedThinking = absorbed.thinking;
+  const thinkingChunk = absorbed.thinking.slice(beforeThinking.length);
+  if (thinkingChunk) {
+    if (!state.thinkingOpen) {
+      state.thinkingIndex = state.nextIndex++;
+      state.thinkingOpen = true;
       out.push(
-        encodeSseEvent("content_block_delta", {
-          type: "content_block_delta",
+        encodeSseEvent("content_block_start", {
+          type: "content_block_start",
           index: state.thinkingIndex,
-          delta: { type: "thinking_delta", thinking: chunk },
+          content_block: { type: "thinking", thinking: "" },
         }),
       );
     }
-    if (thinkingPart.signature) {
-      if (!state.thinkingOpen) {
-        state.thinkingIndex = state.nextIndex++;
-        state.thinkingOpen = true;
-        out.push(
-          encodeSseEvent("content_block_start", {
-            type: "content_block_start",
-            index: state.thinkingIndex,
-            content_block: { type: "thinking", thinking: "" },
-          }),
-        );
-      }
-      out.push(
-        encodeSseEvent("content_block_delta", {
-          type: "content_block_delta",
-          index: state.thinkingIndex,
-          delta: { type: "signature_delta", signature: String(thinkingPart.signature) },
-        }),
-      );
-    }
+    out.push(
+      encodeSseEvent("content_block_delta", {
+        type: "content_block_delta",
+        index: state.thinkingIndex,
+        delta: { type: "thinking_delta", thinking: thinkingChunk },
+      }),
+    );
   }
 
   const textPart = j.textPart as Record<string, unknown> | undefined;

@@ -39,6 +39,7 @@ curl -sS https://cursor2api.freetavily.deno.net/v1/chat/completions \
 | | 文档 | `b8ddef5` / `8523c65` | 事故与两次发版窗口记入 CLAUDE |
 | **2026-09-02** | 鉴权成本 | `b5de214` | `crsr_`：**L1 → KV → exchange**；生产不传 JWT；**不动会话/cache** |
 | | 可观测 | `scripts/analyze_team_usage.py` | Team Usage CSV → 命中率/冷启动/异常簇 HTML（方法见 CLAUDE） |
+| **2026-09-03** | Thinking | — | OpenAI 只转发明文 `reasoning_content`；Grok signature 密文不下发。`grok-4.6` 无 tools 走标准档，**仅有 tools 时**升 `-fast` |
 
 **事故一句话**：9/1 晚把「无状态」理解成「每轮新 conversation id」，Cursor 侧 prompt cache 绑稳定 id，导致长会话几乎 **0% Cache Read**；`22376ac` 后用 fingerprint 当 id，9/2 用量全局命中约 **94%**（见 Team Usage 分析）。
 
@@ -81,10 +82,30 @@ deno task start
 | 系列 | 简写示例 | 要点 |
 |------|----------|------|
 | **Composer** | `composer-2.5`、`composer-2.5-fast` | Fast 为独立 route；也可用 `composer-2.5` + `fast: true` |
-| **Grok** | `grok-4.6`、`grok-4.6-fast`（`4.5` 同理） | 映射为 `cursor-grok-4.6-{effort}` 或 `…-{effort}-fast` |
+| **Grok** | `grok-4.6`、`grok-4.6-fast`（`4.5` 同理） | 映射为 `cursor-grok-4.6-{effort}` 或 `…-{effort}-fast`；**无 tools 时 `grok-4.6` 不是 fast** |
 | **Grok effort** | `reasoning_effort` | `low` / `medium` / `high`；**`max` → `xhigh`（Fast 时为 `xhigh-fast`）**；省略时默认 `high` |
 
 响应 JSON 的 `model` 多为客户端传入名；服务端日志中的 **`cursorRoute`** 为实际发给 Cursor 的 id。
+
+**`grok-4.6` 不会默认走 fast。** 只有下面几种情况才会变成 `-fast` route：
+
+| 请求 | 实际上游 route |
+|------|----------------|
+| `grok-4.6`（无 `tools`） | `cursor-grok-4.6-high` |
+| `grok-4.6-fast` 或 `fast: true` | `cursor-grok-4.6-high-fast` |
+| `grok-4.6` **且带 `tools[]`** | `cursor-grok-4.6-high-fast`（自动升级） |
+
+Cursor 的非 fast Grok route **不支持 tool calling**（上游 422）。Agent 几乎必带 tools，所以线上常看到「写了 `grok-4.6` 实际是 fast」——这是有意的，不是把标准档误映射成 fast。不要去掉 `upgradeGrokRouteForTools`，否则 Grok + tools 会无返回。
+
+### Thinking / `reasoning_content`
+
+OpenAI 表面只出**明文** thinking：
+
+- 流式：`choices[0].delta.reasoning_content`
+- 非流式：`choices[0].message.reasoning_content`
+- 历史回传：`reasoning` / `reasoning_content` → Cursor `reasoningParts`（仅明文）
+
+Composer 的 `thinkingPart.text` 是明文，会原样转出。Grok（`grok-4.6` / `grok-4.6-fast`）上游只给空 `text` + 加密 `signature`（`InferenceReasoningPart` 红acted 形态）。**密文 / signature 不写入 `reasoning_content`**，也不映射成 `reasoning` / `reasoning_signature`。客户端因此看不到 Grok thinking，直到 Cursor 开始下发明文。网关解不了这段密文。
 
 ### 消息与工具
 

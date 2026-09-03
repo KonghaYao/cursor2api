@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  absorbThinkingPart,
   anthropicToCursor,
   applyToolPolicy,
+  collectTurn,
   cursorBody,
   cursorBodyFromClient,
   extractMaxMode,
@@ -12,7 +14,9 @@ import {
   openaiMessagesToCursor,
   openaiProviderDefinedTools,
   openaiToolsToCursor,
+  openAiReasoningFields,
   ROLE,
+  toOpenAICompletion,
 } from "./inference.ts";
 
 const TINY_PNG_B64 =
@@ -140,4 +144,78 @@ test("anthropicToCursor maps image and document blocks", async () => {
   const parts = (msgs[0]?.parts as { parts: Array<Record<string, unknown>> }).parts;
   assert.deepEqual(parts[0], { text: { text: "look" } });
   assert.deepEqual(parts[1], { image: { data: TINY_PNG_B64, mimeType: "image/png" } });
+});
+
+test("openaiMessagesToCursor maps plaintext reasoning_content to reasoningParts", async () => {
+  const msgs = await openaiMessagesToCursor([
+    { role: "assistant", content: "323", reasoning_content: "17*19=323" },
+  ]);
+  assert.deepEqual(msgs[0]?.reasoningParts, [
+    { isRedacted: false, text: "17*19=323", signature: undefined },
+  ]);
+});
+
+test("collectTurn keeps plaintext thinking and drops signature-only ciphertext", () => {
+  const plain = collectTurn([
+    { flags: 0, end: false, json: { thinkingPart: { text: "step 1" } } },
+    { flags: 0, end: false, json: { thinkingPart: { text: " step 2" } } },
+    { flags: 0, end: true, json: { textPart: { text: "323" } } },
+  ]);
+  assert.equal(plain.thinking, "step 1 step 2");
+  assert.equal(plain.thinkingRedacted, false);
+  assert.deepEqual(openAiReasoningFields(plain), { reasoning_content: "step 1 step 2" });
+
+  const cipher = collectTurn([
+    { flags: 0, end: false, json: { thinkingPart: { text: "", signature: "enc-blob" } } },
+    { flags: 0, end: true, json: { textPart: { text: "323" } } },
+  ]);
+  assert.equal(cipher.thinking, "");
+  assert.equal(cipher.thinkingSignature, "enc-blob");
+  assert.equal(cipher.thinkingRedacted, true);
+  assert.deepEqual(openAiReasoningFields(cipher), {});
+
+  const fromInfo = collectTurn([
+    {
+      flags: 0,
+      end: true,
+      json: {
+        responseInfo: {
+          messages: [{ reasoningParts: [{ text: "from info", isRedacted: false }] }],
+        },
+      },
+    },
+  ]);
+  assert.equal(fromInfo.thinking, "from info");
+});
+
+test("toOpenAICompletion exposes reasoning_content not reasoning or signature", () => {
+  const completion = toOpenAICompletion({
+    model: "grok-4.6",
+    conversationId: "sess-think1",
+    turn: {
+      status: 200,
+      frames: [],
+      text: "323",
+      thinking: "17*19",
+      thinkingSignature: "enc-blob",
+      thinkingRedacted: false,
+      usage: null,
+      extendedUsage: null,
+      providerMetadata: null,
+      error: null,
+      toolCalls: [],
+      imageDescriptions: [],
+    },
+  });
+  const message = completion.choices[0]?.message as Record<string, unknown>;
+  assert.equal(message.reasoning_content, "17*19");
+  assert.equal(message.reasoning, undefined);
+  assert.equal(message.reasoning_signature, undefined);
+});
+
+test("absorbThinkingPart never promotes signature to thinking text", () => {
+  const out = absorbThinkingPart({ thinking: "" }, { signature: "cipher", text: "" });
+  assert.equal(out.thinking, "");
+  assert.equal(out.thinkingSignature, "cipher");
+  assert.equal(out.thinkingRedacted, true);
 });
