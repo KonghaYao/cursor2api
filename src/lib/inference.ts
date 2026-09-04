@@ -1306,11 +1306,15 @@ export function toAnthropicError(
 
 function anthropicUsage(turn: { usage?: unknown; extendedUsage?: unknown; providerMetadata?: unknown }) {
   const normalized = normalizeCursorUsage(turn);
+  const cacheCreationInputTokens = normalized.cacheWriteTokens ?? 0;
+  const cacheReadInputTokens = normalized.cacheReadTokens ?? 0;
   return {
-    input_tokens: normalized.promptTokens,
+    // Cursor/OpenAI promptTokens is the total prompt count. Anthropic reports
+    // mutually exclusive uncached, cache-creation, and cache-read input buckets.
+    input_tokens: Math.max(0, normalized.promptTokens - cacheCreationInputTokens - cacheReadInputTokens),
     output_tokens: normalized.completionTokens,
-    cache_creation_input_tokens: normalized.cacheWriteTokens ?? 0,
-    cache_read_input_tokens: normalized.cacheReadTokens ?? 0,
+    cache_creation_input_tokens: cacheCreationInputTokens,
+    cache_read_input_tokens: cacheReadInputTokens,
   };
 }
 

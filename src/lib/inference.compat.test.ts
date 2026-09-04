@@ -268,7 +268,7 @@ test("toAnthropicMessage exposes cache usage and maps errors", () => {
     maxTokens: 3,
   });
   assert.deepEqual(message.usage, {
-    input_tokens: 20,
+    input_tokens: 3,
     output_tokens: 3,
     cache_creation_input_tokens: 5,
     cache_read_input_tokens: 12,
@@ -281,6 +281,31 @@ test("toAnthropicMessage exposes cache usage and maps errors", () => {
   assert.deepEqual(toAnthropicError({ code: "RESOURCE_EXHAUSTED", message: "rate limited" }), {
     type: "error",
     error: { type: "rate_limit_error", message: "rate limited" },
+  });
+});
+
+test("toAnthropicMessage clamps uncached input when Cursor cache buckets exceed prompt total", () => {
+  const message = toAnthropicMessage({
+    model: "composer-2.5-fast",
+    conversationId: "internal-session",
+    turn: {
+      status: 200,
+      frames: [],
+      text: "ok",
+      thinking: "",
+      usage: { promptTokens: 10, completionTokens: 1 },
+      extendedUsage: { cacheReadTokens: 8, cacheWriteTokens: 5 },
+      providerMetadata: null,
+      error: null,
+      toolCalls: [],
+      imageDescriptions: [],
+    },
+  });
+  assert.deepEqual(message.usage, {
+    input_tokens: 0,
+    output_tokens: 1,
+    cache_creation_input_tokens: 5,
+    cache_read_input_tokens: 8,
   });
 });
 

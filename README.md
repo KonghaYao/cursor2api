@@ -88,13 +88,15 @@ deno task start
 | 工具响应 | `message.tool_calls` / `delta.tool_calls` | `tool_use` content block，`stop_reason: "tool_use"` |
 | Structured output | `response_format` | `output_config.format`；两者都通过 `<output-format>` 提示约束，非服务端强制 JSON schema |
 | Thinking | `reasoning_content` | 仅在 Cursor 同时提供明文 thinking 与可回传 signature 时输出 `thinking` / `thinking_delta` / `signature_delta`；无签名或仅密文时省略 |
-| Cache usage | `prompt_tokens_details.cached_tokens`、`cache_write_tokens` | 非流式及最终 `message_delta.usage` 都含 `input_tokens`、`output_tokens` 和 cache read/write |
+| Cache usage | `prompt_tokens` 是总输入，`prompt_tokens_details.cached_tokens` 是其中缓存子集 | Anthropic 三个输入桶互斥：`input_tokens`（未缓存）+ `cache_creation_input_tokens` + `cache_read_input_tokens` = Cursor 总 prompt tokens；非流式及最终 `message_delta.usage` 口径一致 |
 | 非流式错误 | HTTP 状态 + `{error:{…}}` | HTTP 状态 + `{type:"error",error:{…},request_id}`，响应头含 `request-id` |
 | 流式错误 | 带 `error` 的 SSE data | `event: error`；错误后不伪造成功的 `message_stop` |
 
 此前 Anthropic 端点存在几处不对等问题：Connect 错误会被包装成 HTTP 200 空消息、流式错误没有 `error` event、server tools 被误当 custom tools、`output_config.format` / `disable_parallel_tool_use` 未生效，以及同一 user message 内 `text → tool_result → text` 会被重排。现已统一修复，并由 Node 单测和 Deno handler 集成测试覆盖。
 
 Anthropic `/v1/messages` 会在访问 Cursor 前验证 `model`、`max_tokens`、`messages`、角色/content block、采样范围与 tools。Malformed JSON、未知 content block 和 Cursor 无法表达的 `top_k`、`container`、`context_management`、`service_tier`、server tools 均明确返回 `400 invalid_request_error`，不再静默忽略。`max_tokens: 0` 的 cache prewarming 语义也不支持并返回 400。`thinking.budget_tokens` 会近似映射为 Cursor `low` / `medium` / `high` / `xhigh` effort，并非 Anthropic token budget 的精确执行。
+
+**Cache usage 口径**：Cursor/OpenAI 的 `promptTokens` / `prompt_tokens` 是总 prompt tokens，cache read/write 是其子集；Anthropic 协议则把输入拆成互斥桶。因此网关按 `input_tokens = max(0, promptTokens - cacheReadTokens - cacheWriteTokens)` 返回未缓存输入，避免 cache token 在 `input_tokens` 和 cache 字段中重复计数。客户端计算命中率时，分母应使用 `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`。
 
 **Cache control 由网关管理**：API 输入里的顶层或 content block `cache_control` 不决定 Cursor cache breakpoint，也不会原样透传。网关继续只按稳定的 system/tools/首消息规则设置断点，避免客户端输入破坏 `session_fp` 与 prompt cache 轨道。
 

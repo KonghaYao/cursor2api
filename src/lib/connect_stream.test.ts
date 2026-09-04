@@ -158,7 +158,7 @@ test("Anthropic SSE stream emits full usage and max_tokens stop reason", async (
   });
   const text = await new Response(stream).text();
   assert.ok(text.includes('"stop_reason":"max_tokens"'), text);
-  assert.ok(text.includes('"input_tokens":20'), text);
+  assert.ok(text.includes('"input_tokens":3'), text);
   assert.ok(text.includes('"output_tokens":3'), text);
   assert.ok(text.includes('"cache_creation_input_tokens":5'), text);
   assert.ok(text.includes('"cache_read_input_tokens":12'), text);
