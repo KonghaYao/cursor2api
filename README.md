@@ -13,7 +13,7 @@ Cursor `InferenceService/Stream` 的 OpenAI Chat Completions 与 Anthropic Messa
 ```text
 baseURL = https://cursor2api.freetavily.deno.net/v1
 apiKey  = <Cursor crsr_… API key>
-model   = composer-2.5-fast
+model   = composer-2.5
 ```
 
 - Chat Completions：`POST /v1/chat/completions`
@@ -26,7 +26,7 @@ model   = composer-2.5-fast
 ```text
 baseURL = https://cursor2api.freetavily.deno.net
 apiKey  = <Cursor crsr_… API key>
-model   = composer-2.5-fast
+model   = composer-2.5
 ```
 
 - Messages：`POST /v1/messages`，别名为 `POST /messages`
@@ -41,7 +41,7 @@ Anthropic SDK 通常会自动追加 `/v1/messages`，因此其 `baseURL` 使用�
 
 ## 模型
 
-推荐默认使用 `composer-2.5-fast`。
+推荐默认使用 `composer-2.5`，成本低于 Fast route；只有明确需要更低延迟时再使用 `composer-2.5-fast`。
 
 - `composer-2.5`：Composer 标准 route
 - `composer-2.5-fast`：Composer Fast route
