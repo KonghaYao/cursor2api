@@ -75,6 +75,27 @@ deno task start
 | `POST /v1/chat/completions` | OpenAI Chat Completions（含 `stream`） |
 | `POST /v1/messages` | Anthropic Messages（含 `stream`） |
 
+### OpenAI / Anthropic 端点兼容性
+
+两个端点共用同一套 Cursor Inference pipeline、稳定 `session_fp`、模型路由、tools、图片/文件、thinking、usage 和上游错误处理。Cursor 能表达的能力保持对等，但响应格式遵循各自协议，不应混用客户端解析器。
+
+| 能力 | OpenAI `/v1/chat/completions` | Anthropic `/v1/messages` |
+|------|--------------------------------|--------------------------|
+| 鉴权 | `Authorization: Bearer …`（也接受 `x-api-key`） | `x-api-key` 或 `Authorization: Bearer …`；接受 `anthropic-version` |
+| 文本流 | `data:` chunk，结束为 `[DONE]` | `message_start` → `content_block_*` → `message_delta` → `message_stop` |
+| 工具定义 | `tools[].function`；非 function tool 转 `providerDefinedTools` | custom tool 的 `name` / `input_schema`；`web_search_*` 等 server tool 转 `providerDefinedTools` |
+| 工具结果 | `role: "tool"` + `tool_call_id` | user content 中的 `tool_result` + `tool_use_id` |
+| 工具响应 | `message.tool_calls` / `delta.tool_calls` | `tool_use` content block，`stop_reason: "tool_use"` |
+| Structured output | `response_format` | `output_config.format`；两者都通过 `<output-format>` 提示约束，非服务端强制 JSON schema |
+| Thinking | `reasoning_content` | `thinking` content block；密文 signature 不对外泄露 |
+| Cache usage | `prompt_tokens_details.cached_tokens`、`cache_write_tokens` | `cache_read_input_tokens`、`cache_creation_input_tokens` |
+| 非流式错误 | HTTP 状态 + `{error:{…}}` | HTTP 状态 + `{type:"error",error:{…}}` |
+| 流式错误 | 带 `error` 的 SSE data | `event: error`；错误后不伪造成功的 `message_stop` |
+
+此前 Anthropic 端点存在几处不对等问题：Connect 错误会被包装成 HTTP 200 空消息、流式错误没有 `error` event、server tools 被误当 custom tools、`output_config.format` / `disable_parallel_tool_use` 未生效，以及同一 user message 内 `text → tool_result → text` 会被重排。现已统一修复，并由 Node 单测和 Deno handler 集成测试覆盖。
+
+**协议边界**：Cursor Agent 不接受增量 tool 参数分片，所以两个端点都先缓冲上游 `toolCallPart`，在流结束前一次性发出完整工具调用。OpenAI 是一条完整 `delta.tool_calls`；Anthropic 是完整 `tool_use` block，而不是逐段 `input_json_delta`。文本和明文 thinking 仍实时增量下发。
+
 ### 模型 id（简写）
 
 客户端可用 **简写 id**，网关映射为 Cursor flat route（详见 **[docs/models.md](docs/models.md)**）：
@@ -128,9 +149,9 @@ Composer 的 `thinkingPart.text` 是明文，会原样转出。Grok（`grok-4.6`
 
 Cursor 会丢掉 `role: system`，网关会折进 `<system>…</system>` user 消息。**带 `tools[]` 时**会拆成 `<tools-rules>`（固定 agent 约束，可缓存）与 `<tools-catalog>`（按工具名排序的稳定 schema 列表，随工具集变化），并仍传 `body.tools`；`<tools-rules>` 与 `<system>` 会各打 prompt cache 断点。不需要注入时可设 `inject_tools_prompt: false`。
 
-`tool_choice`：`none` 不传 tools；`required` / Anthropic `any` 注入必须调工具的约束；`{type:"function",function:{name}}` 只保留该工具。`parallel_tool_calls: false` 约束本轮最多一个 tool_call。非 `function` 的 OpenAI tool（如 `web_search_preview`）以及 `provider_defined_tools` 会写入 Cursor `providerDefinedTools`。
+`tool_choice`：`none` 不传 tools；`required` / Anthropic `any` 注入必须调工具的约束；OpenAI `{type:"function",function:{name}}` / Anthropic `{type:"tool",name}` 只保留指定工具。OpenAI `parallel_tool_calls: false` 或 Anthropic `tool_choice.disable_parallel_tool_use: true` 约束本轮最多一个 tool call。非 `function` 的 OpenAI tool（如 `web_search_preview`）、Anthropic server tool（如 `web_search_*`）以及 `provider_defined_tools` 会写入 Cursor `providerDefinedTools`。
 
-`response_format`：`json_object` / `json_schema` 折进 `<output-format>` user 消息（Cursor 无原生 JSON mode）。`n > 1` 返回 400。`max_completion_tokens` 作为 `max_tokens` 别名。`top_p` / `stop` 写入 `modelConfig`。
+OpenAI `response_format` 与 Anthropic `output_config.format`：`json_object` / `json_schema` 折进 `<output-format>` user 消息（Cursor 无原生 JSON mode）。`n > 1` 返回 400。`max_completion_tokens` 作为 `max_tokens` 别名。`top_p` / `stop`（Anthropic 为 `stop_sequences`）写入 `modelConfig`。
 
 ### 图片 / 文件输入
 

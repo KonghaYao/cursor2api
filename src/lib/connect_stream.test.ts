@@ -141,6 +141,21 @@ test("Anthropic SSE stream emits event-named text deltas and complete tool_use a
   assert.equal(toolStarts.length, 1, "expected one complete tool_use block");
 });
 
+test("Anthropic SSE stream emits an Anthropic error event and no successful stop", async () => {
+  const stream = buildAnthropicSseStreamFromFramePayloads({
+    frameChunks: [
+      encodeConnectFrame({ error: { code: "RESOURCE_EXHAUSTED", message: "rate limited" } }),
+    ],
+    model: "composer-2.5-fast",
+    conversationId: "sess-ant-error",
+  });
+  const text = await new Response(stream).text();
+  assert.ok(text.includes("event: error"), text);
+  assert.ok(text.includes('"type":"rate_limit_error"'), text);
+  assert.ok(text.includes("rate limited"), text);
+  assert.equal(text.includes("event: message_stop"), false, text);
+});
+
 test("OpenAI SSE stream emits reasoning_content only for plaintext thinking", async () => {
   const stream = buildOpenAiSseStreamFromFramePayloads({
     frameChunks: [

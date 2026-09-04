@@ -253,6 +253,89 @@ Deno.test("POST /v1/messages stream=true returns Anthropic SSE", async () => {
   }
 });
 
+Deno.test("POST /v1/messages maps inference errors to Anthropic errors", async () => {
+  const kv = createMemoryKv();
+  const original = installMockFetch({
+    onStream: () => {
+      const frame = encodeConnectFrame({ error: { code: "RESOURCE_EXHAUSTED", message: "rate limited" } });
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(frame);
+            controller.close();
+          },
+        }),
+        { status: 200 },
+      );
+    },
+  });
+  try {
+    const res = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${TEST_JWT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "composer-2.5-fast",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      }),
+      { kv },
+    );
+    if (res.status !== 502) throw new Error(`expected 502, got ${res.status}: ${await res.text()}`);
+    const body = await res.json();
+    if (body?.type !== "error" || body?.error?.type !== "rate_limit_error") {
+      throw new Error(`unexpected Anthropic error: ${JSON.stringify(body)}`);
+    }
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+Deno.test("POST /v1/messages stream=true maps inference errors to Anthropic error events", async () => {
+  const kv = createMemoryKv();
+  const original = installMockFetch({
+    onStream: () => {
+      const frame = encodeConnectFrame({ error: { code: "ERROR_BAD_MODEL_NAME", message: "bad model" } });
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(frame);
+            controller.close();
+          },
+        }),
+        { status: 200 },
+      );
+    },
+  });
+  try {
+    const res = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${TEST_JWT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "bad-model",
+          stream: true,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      }),
+      { kv },
+    );
+    const text = await res.text();
+    if (!text.includes("event: error") || !text.includes('"type":"invalid_request_error"')) {
+      throw new Error(`missing Anthropic error event: ${text}`);
+    }
+    if (text.includes("event: message_stop")) throw new Error(`unexpected successful stop: ${text}`);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 Deno.test("POST /v1/messages forwards Anthropic image blocks", async () => {
   const kv = createMemoryKv();
   let upstream: Record<string, unknown> | undefined;

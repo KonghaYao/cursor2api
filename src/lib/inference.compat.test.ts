@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   absorbThinkingPart,
+  anthropicProviderDefinedTools,
   anthropicToCursor,
+  anthropicToolsToCursor,
+  applyResponseFormat,
   applyToolPolicy,
   collectTurn,
   cursorBody,
@@ -16,6 +19,8 @@ import {
   openaiToolsToCursor,
   openAiReasoningFields,
   ROLE,
+  toAnthropicError,
+  toAnthropicMessage,
   toOpenAICompletion,
 } from "./inference.ts";
 
@@ -74,6 +79,36 @@ test("tool_choice required injects policy and keeps tools", () => {
   assert.equal(out.injectToolsPrompt, true);
   assert.ok(String(out.messages[0]?.text).includes("MUST call"));
   assert.ok(String(out.messages[0]?.text).includes("at most one"));
+});
+
+test("Anthropic tool_choice and output_config map to the shared policy", () => {
+  const tools = [{ name: "x", description: "", parameters: { type: "object", properties: {} } }];
+  const out = applyToolPolicy([{ role: ROLE.user, text: "hi" }], tools, {
+    tool_choice: { type: "any", disable_parallel_tool_use: true },
+  });
+  assert.equal(out.tools.length, 1);
+  assert.ok(String(out.messages[0]?.text).includes("MUST call"));
+
+  const formatted = applyResponseFormat([{ role: ROLE.user, text: "hi" }], {
+    output_config: { format: { type: "json_schema", schema: { type: "object" } } },
+  });
+  assert.ok(JSON.stringify(formatted).includes("<output-format>"));
+});
+
+test("Anthropic custom and provider-defined tools are separated", () => {
+  const tools = [
+    { name: "lookup", input_schema: { type: "object", properties: {} } },
+    { type: "web_search_20250305", name: "web_search", max_uses: 2 },
+  ];
+  assert.deepEqual(anthropicToolsToCursor(tools).map((tool) => tool.name), ["lookup"]);
+  assert.deepEqual(anthropicProviderDefinedTools(tools), [
+    {
+      name: "web_search",
+      id: "web_search",
+      type: "web_search_20250305",
+      options: { max_uses: 2 },
+    },
+  ]);
 });
 
 test("openaiProviderDefinedTools splits non-function tools", () => {
@@ -144,6 +179,64 @@ test("anthropicToCursor maps image and document blocks", async () => {
   const parts = (msgs[0]?.parts as { parts: Array<Record<string, unknown>> }).parts;
   assert.deepEqual(parts[0], { text: { text: "look" } });
   assert.deepEqual(parts[1], { image: { data: TINY_PNG_B64, mimeType: "image/png" } });
+});
+
+test("anthropicToCursor preserves text/tool_result ordering and media in tool results", async () => {
+  const msgs = await anthropicToCursor({
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "before" },
+          {
+            type: "tool_result",
+            tool_use_id: "call_1",
+            is_error: true,
+            content: [
+              { type: "text", text: "failed" },
+              { type: "image", source: { type: "base64", media_type: "image/png", data: TINY_PNG_B64 } },
+            ],
+          },
+          { type: "text", text: "after" },
+        ],
+      },
+    ],
+  });
+  assert.equal(msgs.length, 3);
+  assert.equal(msgs[0]?.role, ROLE.user);
+  assert.equal(msgs[0]?.text, "before");
+  assert.equal(msgs[1]?.role, ROLE.tool);
+  const result = (msgs[1]?.toolContent as { parts: Array<Record<string, unknown>> }).parts[0];
+  assert.equal(result?.toolCallId, "call_1");
+  assert.equal(result?.isError, true);
+  assert.ok((result?.experimentalContent as Array<Record<string, unknown>>).some((part) => part.image));
+  assert.equal(msgs[2]?.text, "after");
+});
+
+test("toAnthropicMessage exposes cache usage and maps errors", () => {
+  const turn = {
+    status: 200,
+    frames: [],
+    text: "ok",
+    thinking: "",
+    usage: { promptTokens: 20, completionTokens: 3 },
+    extendedUsage: { cacheReadTokens: 12, cacheWriteTokens: 5 },
+    providerMetadata: null,
+    error: null,
+    toolCalls: [],
+    imageDescriptions: [],
+  };
+  const message = toAnthropicMessage({ model: "composer-2.5-fast", conversationId: "sess-ant-usage", turn });
+  assert.deepEqual(message.usage, {
+    input_tokens: 20,
+    output_tokens: 3,
+    cache_creation_input_tokens: 5,
+    cache_read_input_tokens: 12,
+  });
+  assert.deepEqual(toAnthropicError({ code: "RESOURCE_EXHAUSTED", message: "rate limited" }), {
+    type: "error",
+    error: { type: "rate_limit_error", message: "rate limited" },
+  });
 });
 
 test("openaiMessagesToCursor maps plaintext reasoning_content to reasoningParts", async () => {

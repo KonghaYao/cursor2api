@@ -272,7 +272,8 @@ function grokEffortFamily(modelId: string): string | null {
 export function extractReasoningEffort(body: Record<string, unknown> | null | undefined): unknown {
   if (!body || typeof body !== "object") return undefined;
   const reasoning = body.reasoning as Record<string, unknown> | undefined;
-  return body.reasoning_effort ?? body.reasoningEffort ?? body.effort ?? reasoning?.effort;
+  const outputConfig = (body.output_config ?? body.outputConfig) as Record<string, unknown> | undefined;
+  return body.reasoning_effort ?? body.reasoningEffort ?? body.effort ?? outputConfig?.effort ?? reasoning?.effort;
 }
 
 export function mapGrokEffort(modelId: string, openaiEffort: unknown): string | undefined {
@@ -567,7 +568,24 @@ export function openaiProviderDefinedTools(tools: unknown): CursorProviderTool[]
   for (const t of tools) {
     const rec = t as Record<string, unknown>;
     const type = String(rec?.type || "").toLowerCase();
-    if (!type || type === "function") continue;
+    if (!type || type === "function" || type === "custom") continue;
+    const name = String(rec.name || rec.id || type);
+    const options: Record<string, unknown> = { ...rec };
+    delete options.type;
+    delete options.name;
+    delete options.id;
+    out.push({ name, id: String(rec.id || name), type, options: options as Json });
+  }
+  return out;
+}
+
+export function anthropicProviderDefinedTools(tools: unknown): CursorProviderTool[] {
+  if (!Array.isArray(tools)) return [];
+  const out: CursorProviderTool[] = [];
+  for (const t of tools) {
+    const rec = t as Record<string, unknown>;
+    const type = String(rec?.type || "").toLowerCase();
+    if (!type || type === "custom" || type === "function") continue;
     const name = String(rec.name || rec.id || type);
     const options: Record<string, unknown> = { ...rec };
     delete options.type;
@@ -614,7 +632,17 @@ export function applyToolPolicy(
   body: Record<string, unknown> | null | undefined,
 ): { messages: CursorMessage[]; tools: CursorTool[]; injectToolsPrompt: boolean } {
   const choice = body?.tool_choice ?? body?.toolChoice;
-  const parallel = body?.parallel_tool_calls ?? body?.parallelToolCalls;
+  const choiceRecord = choice && typeof choice === "object" ? (choice as Record<string, unknown>) : undefined;
+  const outputConfig = (body?.output_config ?? body?.outputConfig) as Record<string, unknown> | undefined;
+  const parallel =
+    body?.parallel_tool_calls ??
+    body?.parallelToolCalls ??
+    (choiceRecord?.disable_parallel_tool_use === true ||
+    choiceRecord?.disableParallelToolUse === true ||
+    outputConfig?.disable_parallel_tool_use === true ||
+    outputConfig?.disableParallelToolUse === true
+      ? false
+      : undefined);
   const injectFlag = body?.inject_tools_prompt !== false && body?.injectToolsPrompt !== false;
 
   if (choice === "none" || (choice && typeof choice === "object" && String((choice as Record<string, unknown>).type).toLowerCase() === "none")) {
@@ -651,7 +679,8 @@ export function applyResponseFormat(
   messages: CursorMessage[],
   body: Record<string, unknown> | null | undefined,
 ): CursorMessage[] {
-  const rf = (body?.response_format ?? body?.responseFormat) as Record<string, unknown> | undefined;
+  const outputConfig = (body?.output_config ?? body?.outputConfig) as Record<string, unknown> | undefined;
+  const rf = (body?.response_format ?? body?.responseFormat ?? outputConfig?.format) as Record<string, unknown> | undefined;
   if (!rf || typeof rf !== "object") return messages;
   const type = String(rf.type || "").toLowerCase();
   let inner = "";
@@ -671,6 +700,8 @@ export function anthropicToolsToCursor(tools: unknown): CursorTool[] {
   return tools
     .map((t) => {
       const rec = t as Record<string, unknown>;
+      const type = String(rec?.type || "").toLowerCase();
+      if (type && type !== "custom" && type !== "function") return null;
       if (!rec?.name) return null;
       return {
         name: String(rec.name),
@@ -859,16 +890,32 @@ export async function anthropicToCursor(
       messages.push(next);
       continue;
     }
-    const texts: string[] = [];
-    const mediaParts: Array<Record<string, unknown>> = [];
-    const results: unknown[] = [];
+    const pendingUserParts: Array<Record<string, unknown>> = [];
+    const flushUserParts = () => {
+      if (!pendingUserParts.length) return;
+      const hasMedia = pendingUserParts.some((part) => part.image || part.file);
+      if (hasMedia) {
+        messages.push({ role: ROLE.user, parts: { parts: pendingUserParts.splice(0) } });
+        return;
+      }
+      const text = pendingUserParts
+        .splice(0)
+        .map((part) => String((part.text as Record<string, unknown> | undefined)?.text || ""))
+        .filter(Boolean)
+        .join("\n");
+      if (text) messages.push({ role: ROLE.user, text });
+    };
     for (const part of content as Array<Record<string, unknown>>) {
-      if (part.type === "text") texts.push(String(part.text || ""));
+      if (part.type === "text") {
+        const text = String(part.text || "");
+        if (text) pendingUserParts.push({ text: { text } });
+      }
       if (part.type === "image" || part.type === "document" || part.type === "file") {
         const converted = await anthropicContentToCursorParts([part], opts);
-        mediaParts.push(...converted.parts);
+        pendingUserParts.push(...converted.parts);
       }
       if (part.type === "tool_result") {
+        flushUserParts();
         const inner = await contentToToolResultPart(
           part.tool_use_id,
           String(part.name || ""),
@@ -876,16 +923,11 @@ export async function anthropicToCursor(
           Boolean(part.is_error),
           opts,
         );
-        results.push(inner);
+        messages.push({ role: ROLE.tool, toolContent: { parts: [inner] } });
       }
     }
-    if (mediaParts.length) {
-      const textParts = texts.filter(Boolean).map((text) => ({ text: { text } }));
-      messages.push({ role: ROLE.user, parts: { parts: [...textParts, ...mediaParts] } });
-    } else if (texts.filter(Boolean).length) {
-      messages.push({ role: ROLE.user, text: texts.filter(Boolean).join("\n") });
-    }
-    if (results.length) messages.push({ role: ROLE.tool, toolContent: { parts: results } });
+    flushUserParts();
+    if (!content.length) messages.push({ role: ROLE.user, text: "" });
   }
   return messages;
 }
@@ -989,7 +1031,7 @@ export function cursorBodyFromClient(
   },
 ): Record<string, unknown> {
   const providerDefinedTools = mergeProviderDefinedTools(
-    openaiProviderDefinedTools(body.tools),
+    [...openaiProviderDefinedTools(body.tools), ...anthropicProviderDefinedTools(body.tools)],
     body.provider_defined_tools ?? body.providerDefinedTools,
   );
   if (opts.messagesPipelined) {
@@ -1100,7 +1142,11 @@ function collectImageDescriptions(frames: ConnectFrame[]): ImageDescription[] {
 
 export function collectTurn(frames: ConnectFrame[]) {
   let text = "";
-  let absorbed = { thinking: "", thinkingSignature: undefined as string | undefined, thinkingRedacted: false };
+  let absorbed: { thinking: string; thinkingSignature?: string; thinkingRedacted?: boolean } = {
+    thinking: "",
+    thinkingSignature: undefined,
+    thinkingRedacted: false,
+  };
   let usage: unknown = null;
   let extendedUsage: unknown = null;
   let providerMetadata: unknown = null;
@@ -1221,6 +1267,29 @@ export function toOpenAICompletion({
   };
 }
 
+export function toAnthropicError(error: unknown): { type: "error"; error: { type: string; message: string } } {
+  const outer = error && typeof error === "object" ? (error as Record<string, unknown>) : {};
+  const rec = outer.error && typeof outer.error === "object" ? (outer.error as Record<string, unknown>) : outer;
+  const rawType = String(rec.type || rec.code || outer.type || outer.code || "api_error").toLowerCase();
+  const type =
+    rawType.includes("rate") || rawType.includes("resource_exhausted")
+      ? "rate_limit_error"
+      : rawType.includes("auth") || rawType.includes("unauthenticated")
+        ? "authentication_error"
+        : rawType.includes("permission")
+          ? "permission_error"
+          : rawType.includes("invalid") || rawType.includes("bad_model")
+            ? "invalid_request_error"
+            : "api_error";
+  return {
+    type: "error",
+    error: {
+      type,
+      message: String(rec.message || rec.detail || outer.message || outer.detail || (typeof error === "string" ? error : "Inference request failed")),
+    },
+  };
+}
+
 export function toAnthropicMessage({
   model,
   turn,
@@ -1245,8 +1314,7 @@ export function toAnthropicMessage({
       input: coerceJsonBySchema(parseArgs(c.args), schemaForTool(tools, c.name)),
     });
   }
-  const u = toOpenAIUsage(normalizeCursorUsage(turn));
-  const details = u.prompt_tokens_details as { cached_tokens?: number } | undefined;
+  const normalized = normalizeCursorUsage(turn);
   return {
     id: `msg_${conversationId.slice(0, 8)}`,
     type: "message",
@@ -1255,9 +1323,10 @@ export function toAnthropicMessage({
     content: content.length ? content : [{ type: "text", text: "" }],
     stop_reason: (turn.toolCalls || []).length ? "tool_use" : "end_turn",
     usage: {
-      input_tokens: u.prompt_tokens,
-      output_tokens: u.completion_tokens,
-      cache_read_input_tokens: details?.cached_tokens ?? 0,
+      input_tokens: normalized.promptTokens,
+      output_tokens: normalized.completionTokens,
+      cache_creation_input_tokens: normalized.cacheWriteTokens ?? 0,
+      cache_read_input_tokens: normalized.cacheReadTokens ?? 0,
     },
     conversation_id: conversationId,
     session_id: conversationId,
@@ -1738,7 +1807,13 @@ function sseChunksFromConnectFrameAnthropic(
   if (j.providerMetadata) state.providerMetadata = j.providerMetadata;
   const desc = collectImageDescriptions([frame]);
   if (desc.length) state.imageDescriptions.push(...desc);
-  if (j.error) state.error = j.error;
+  if (j.error) {
+    state.error = j.error;
+    if (!state.errorEmitted) {
+      state.errorEmitted = true;
+      out.push(encodeSseEvent("error", toAnthropicError(j.error)));
+    }
+  }
   return out;
 }
 
@@ -1747,6 +1822,7 @@ function enqueueAnthropicSseFinish(
   state: AnthropicSseState,
   tools?: CursorTool[],
 ): void {
+  if (state.error) return;
   if (state.thinkingOpen) {
     enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index: state.thinkingIndex }));
   }
@@ -1838,7 +1914,7 @@ export async function streamAnthropicMessage(opts: {
   if (upstreamAbort.signal.aborted) {
     return jsonResponse(
       499,
-      { error: { message: "client closed request", type: "invalid_request_error" } },
+      toAnthropicError({ message: "client closed request", type: "invalid_request_error" }),
       opts.sessionId,
     );
   }
@@ -1859,7 +1935,7 @@ export async function streamAnthropicMessage(opts: {
     if (isAbortError(err) || upstreamAbort.signal.aborted) {
       return jsonResponse(
         499,
-        { error: { message: "client closed request", type: "invalid_request_error" } },
+        toAnthropicError({ message: "client closed request", type: "invalid_request_error" }),
         opts.sessionId,
       );
     }
@@ -1870,19 +1946,14 @@ export async function streamAnthropicMessage(opts: {
     const detail = await res.text().catch(() => "");
     return jsonResponse(
       res.status,
-      {
-        error: {
-          message: detail || res.statusText || "inference stream failed",
-          type: "server_error",
-        },
-      },
+      toAnthropicError({ message: detail || res.statusText || "inference stream failed", type: "api_error" }),
       opts.sessionId,
     );
   }
   if (!res.body) {
     return jsonResponse(
       502,
-      { error: { message: "empty inference stream body", type: "server_error" } },
+      toAnthropicError({ message: "empty inference stream body", type: "api_error" }),
       opts.sessionId,
     );
   }

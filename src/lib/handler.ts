@@ -16,6 +16,7 @@ import {
   openaiToolsToCursor,
   streamOpenAiChatCompletion,
   streamAnthropicMessage,
+  toAnthropicError,
   toAnthropicMessage,
   toOpenAICompletion,
   toolCallsToOpenAI,
@@ -162,6 +163,7 @@ async function runInference(
 export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): Promise<Response> {
   const url = new URL(request.url);
   const method = request.method.toUpperCase();
+  const anthropicRequest = url.pathname === "/v1/messages" || url.pathname === "/messages";
   console.log(`${method} ${url.pathname}`);
   try {
     if (method === "OPTIONS") return corsResponse();
@@ -265,7 +267,11 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
           console.log(`  ${c.function.name} ${c.function.arguments.slice(0, 280)}`);
         }
       }
-      return jsonResponse(200, toAnthropicMessage({ model: body.model, turn, conversationId, tools }), sessionId);
+      if (turn.error || turn.status !== 200) {
+        const error = turn.error || { message: `Inference request failed (${turn.status})`, type: "api_error" };
+        return jsonResponse(turn.status === 200 ? 502 : turn.status, toAnthropicError(error), sessionId);
+      }
+      return jsonResponse(turn.status, toAnthropicMessage({ model: body.model, turn, conversationId, tools }), sessionId);
     }
 
     if (method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
@@ -333,11 +339,10 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
     const message = String((err as Error)?.message || err);
     const status = err instanceof AuthError ? 401 : err instanceof ImageInputError ? 400 : 500;
     console.log(`  -> ${status} ${message}`);
-    return jsonResponse(status, {
-      error: {
-        message,
-        type: status === 401 ? "authentication_error" : status === 400 ? "invalid_request_error" : "server_error",
-      },
-    });
+    const error = {
+      message,
+      type: status === 401 ? "authentication_error" : status === 400 ? "invalid_request_error" : "server_error",
+    };
+    return jsonResponse(status, anthropicRequest ? { type: "error", error } : { error });
   }
 }
