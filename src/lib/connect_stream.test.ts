@@ -116,7 +116,7 @@ test("upstreamAbortFromClient aborts when client signal aborts", () => {
 
 test("Anthropic SSE stream emits event-named text deltas and complete tool_use at end", async () => {
   const payloads = [
-    encodeConnectFrame({ thinkingPart: { text: "hmm" } }),
+    encodeConnectFrame({ thinkingPart: { text: "hmm", signature: "verified-signature" } }),
     encodeConnectFrame({ textPart: { text: "hi" } }),
     encodeConnectFrame({
       toolCallPart: { toolCallId: "call_1", toolIndex: 0, toolName: "lookup", args: '{"q":"a"}', isComplete: true },
@@ -135,10 +135,74 @@ test("Anthropic SSE stream emits event-named text deltas and complete tool_use a
   assert.ok(text.includes('"text":"hi"'), text);
   assert.ok(text.includes('"type":"tool_use"'), text);
   assert.ok(text.includes('"name":"lookup"'), text);
+  assert.ok(text.includes('"content_block":{"type":"tool_use","id":"call_1","name":"lookup","input":{}}'), text);
+  assert.ok(text.includes('"type":"input_json_delta","partial_json":"{\\"q\\":\\"a\\"}"'), text);
   assert.ok(text.includes('"stop_reason":"tool_use"'), text);
   assert.ok(text.includes("event: message_stop"), text);
   const toolStarts = text.split("event: content_block_start").filter((s) => s.includes("tool_use"));
   assert.equal(toolStarts.length, 1, "expected one complete tool_use block");
+});
+
+test("Anthropic SSE stream emits full usage and max_tokens stop reason", async () => {
+  const stream = buildAnthropicSseStreamFromFramePayloads({
+    frameChunks: [
+      encodeConnectFrame({
+        textPart: { text: "cut" },
+        usage: { promptTokens: 20, completionTokens: 3 },
+        extendedUsage: { cacheReadTokens: 12, cacheWriteTokens: 5 },
+      }),
+    ],
+    model: "composer-2.5-fast",
+    conversationId: "sess-ant-usage",
+    maxTokens: 3,
+  });
+  const text = await new Response(stream).text();
+  assert.ok(text.includes('"stop_reason":"max_tokens"'), text);
+  assert.ok(text.includes('"input_tokens":20'), text);
+  assert.ok(text.includes('"output_tokens":3'), text);
+  assert.ok(text.includes('"cache_creation_input_tokens":5'), text);
+  assert.ok(text.includes('"cache_read_input_tokens":12'), text);
+});
+
+test("Anthropic SSE stream emits signature_delta only for plaintext thinking", async () => {
+  const stream = buildAnthropicSseStreamFromFramePayloads({
+    frameChunks: [
+      encodeConnectFrame({ thinkingPart: { text: "hmm", signature: "verified-signature" } }),
+      encodeConnectFrame({ textPart: { text: "ok" } }),
+    ],
+    model: "composer-2.5-fast",
+    conversationId: "sess-ant-signature",
+  });
+  const text = await new Response(stream).text();
+  const events = text.split("\n\n").filter(Boolean);
+  const thinkingStop = events.findIndex((event) => event.includes('"type":"content_block_stop","index":0'));
+  const textStart = events.findIndex((event) => event.includes('"content_block":{"type":"text"'));
+  assert.ok(thinkingStop >= 0 && textStart > thinkingStop, text);
+  assert.ok(text.includes('"type":"signature_delta","signature":"verified-signature"'), text);
+  assert.ok(text.indexOf("signature_delta") < text.indexOf('content_block_stop\ndata: {"type":"content_block_stop","index":0}'), text);
+});
+
+test("Anthropic SSE stream omits unsigned or late thinking without overlapping blocks", async () => {
+  const unsigned = buildAnthropicSseStreamFromFramePayloads({
+    frameChunks: [encodeConnectFrame({ thinkingPart: { text: "unsigned" } }), encodeConnectFrame({ textPart: { text: "ok" } })],
+    model: "composer-2.5-fast",
+    conversationId: "sess-ant-unsigned",
+  });
+  const unsignedText = await new Response(unsigned).text();
+  assert.equal(unsignedText.includes("thinking_delta"), false, unsignedText);
+  assert.ok(unsignedText.includes('"text":"ok"'), unsignedText);
+
+  const late = buildAnthropicSseStreamFromFramePayloads({
+    frameChunks: [
+      encodeConnectFrame({ textPart: { text: "first" } }),
+      encodeConnectFrame({ thinkingPart: { text: "late", signature: "late-signature" } }),
+    ],
+    model: "composer-2.5-fast",
+    conversationId: "sess-ant-late",
+  });
+  const lateText = await new Response(late).text();
+  assert.equal(lateText.includes("thinking_delta"), false, lateText);
+  assert.equal(lateText.includes("signature_delta"), false, lateText);
 });
 
 test("Anthropic SSE stream emits an Anthropic error event and no successful stop", async () => {
@@ -159,7 +223,7 @@ test("Anthropic SSE stream emits an Anthropic error event and no successful stop
 test("OpenAI SSE stream emits reasoning_content only for plaintext thinking", async () => {
   const stream = buildOpenAiSseStreamFromFramePayloads({
     frameChunks: [
-      encodeConnectFrame({ thinkingPart: { text: "hmm" } }),
+      encodeConnectFrame({ thinkingPart: { text: "hmm", signature: "verified-signature" } }),
       encodeConnectFrame({ textPart: { text: "ok" } }),
     ],
     model: "composer-2.5-fast",

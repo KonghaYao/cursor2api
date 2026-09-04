@@ -3,6 +3,7 @@ import { computeSessionFp } from "./session_fingerprint.ts";
 import {
   runCanonicalMessagePipeline,
   runCanonicalMessagePipelineFromCursor,
+  flattenContent,
   type CursorMessage,
   type CursorTool,
 } from "./inference.ts";
@@ -87,9 +88,7 @@ export async function resolveSessionForRequest(
   const session_fp = await computeSessionFp(options.body, pipelined.tools, {
     pipelined: pipelined.messages,
     rawMessages: options.preconvertedMessages ? undefined : rawMessages,
-    foldSystem: options.preconvertedMessages
-      ? [String(options.body.system || ""), ""].filter(Boolean).join("")
-      : undefined,
+    foldSystem: options.preconvertedMessages ? flattenContent(options.body.system) : undefined,
   });
 
   return {

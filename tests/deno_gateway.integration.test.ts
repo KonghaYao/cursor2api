@@ -15,12 +15,16 @@ type FetchFn = typeof fetch;
 
 function installMockFetch(handlers: {
   onStream?: (init?: RequestInit) => Response | Promise<Response>;
+  onModels?: (init?: RequestInit) => Response | Promise<Response>;
 }): FetchFn {
   const original = globalThis.fetch;
   const mock: FetchFn = (input, init) => {
     const url = String(input);
     if (url.includes("/aiserver.v1.InferenceService/Stream") && handlers.onStream) {
       return Promise.resolve(handlers.onStream(init));
+    }
+    if (url.includes("/agent.v1.AgentService/GetUsableModels") && handlers.onModels) {
+      return Promise.resolve(handlers.onModels(init));
     }
     if (url.includes("/auth/exchange_user_api_key")) {
       return Promise.resolve(
@@ -39,6 +43,50 @@ Deno.test("GET /health", async () => {
   if (res.status !== 200) throw new Error(`expected 200, got ${res.status}`);
   const body = await res.json();
   if (body?.ok !== true) throw new Error(`unexpected body: ${JSON.stringify(body)}`);
+});
+
+Deno.test("GET /v1/models returns Anthropic pagination shape when requested", async () => {
+  const original = installMockFetch({
+    onModels: () => new Response(JSON.stringify({ models: [{ modelId: "composer-2.5-fast" }, { id: "other-model" }] })),
+  });
+  try {
+    const res = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/models?limit=1", {
+        headers: { "x-api-key": TEST_JWT, "anthropic-version": "2023-06-01" },
+      }),
+      { kv: createMemoryKv() },
+    );
+    if (res.status !== 200) throw new Error(`expected 200, got ${res.status}: ${await res.text()}`);
+    if (!res.headers.get("request-id")) throw new Error("missing request-id");
+    const body = await res.json();
+    if (body?.data?.[0]?.type !== "model" || body?.data?.[0]?.id !== "composer-2.5-fast") {
+      throw new Error(`unexpected Anthropic models body: ${JSON.stringify(body)}`);
+    }
+    if (body.first_id !== "composer-2.5-fast" || body.last_id !== "composer-2.5-fast" || body.has_more !== true) {
+      throw new Error(`unexpected pagination: ${JSON.stringify(body)}`);
+    }
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+Deno.test("GET /v1/models propagates upstream failure", async () => {
+  const original = installMockFetch({ onModels: () => new Response("unavailable", { status: 503 }) });
+  try {
+    const res = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/models", {
+        headers: { "x-api-key": TEST_JWT, "anthropic-version": "2023-06-01" },
+      }),
+      { kv: createMemoryKv() },
+    );
+    if (res.status !== 503) throw new Error(`expected 503, got ${res.status}`);
+    const body = await res.json();
+    if (body?.type !== "error" || body?.error?.type !== "api_error") {
+      throw new Error(`unexpected error body: ${JSON.stringify(body)}`);
+    }
+  } finally {
+    globalThis.fetch = original;
+  }
 });
 
 Deno.test("POST /v1/chat/completions stream=true returns incremental SSE", async () => {
@@ -69,6 +117,7 @@ Deno.test("POST /v1/chat/completions stream=true returns incremental SSE", async
         },
         body: JSON.stringify({
           model: "composer-2.5-fast",
+          max_tokens: 128,
           stream: true,
           messages: [{ role: "user", content: "hi" }],
         }),
@@ -120,6 +169,7 @@ Deno.test("stream abort propagates to upstream fetch signal", async () => {
         },
         body: JSON.stringify({
           model: "composer-2.5-fast",
+          max_tokens: 128,
           stream: true,
           messages: [{ role: "user", content: "hi" }],
         }),
@@ -237,6 +287,7 @@ Deno.test("POST /v1/messages stream=true returns Anthropic SSE", async () => {
         },
         body: JSON.stringify({
           model: "composer-2.5-fast",
+          max_tokens: 128,
           stream: true,
           messages: [{ role: "user", content: "hi" }],
         }),
@@ -279,12 +330,13 @@ Deno.test("POST /v1/messages maps inference errors to Anthropic errors", async (
         },
         body: JSON.stringify({
           model: "composer-2.5-fast",
+          max_tokens: 128,
           messages: [{ role: "user", content: "hi" }],
         }),
       }),
       { kv },
     );
-    if (res.status !== 502) throw new Error(`expected 502, got ${res.status}: ${await res.text()}`);
+    if (res.status !== 429) throw new Error(`expected 429, got ${res.status}: ${await res.text()}`);
     const body = await res.json();
     if (body?.type !== "error" || body?.error?.type !== "rate_limit_error") {
       throw new Error(`unexpected Anthropic error: ${JSON.stringify(body)}`);
@@ -320,6 +372,7 @@ Deno.test("POST /v1/messages stream=true maps inference errors to Anthropic erro
         },
         body: JSON.stringify({
           model: "bad-model",
+          max_tokens: 128,
           stream: true,
           messages: [{ role: "user", content: "hi" }],
         }),
@@ -334,6 +387,62 @@ Deno.test("POST /v1/messages stream=true maps inference errors to Anthropic erro
   } finally {
     globalThis.fetch = original;
   }
+});
+
+Deno.test("POST /v1/messages validates request before calling upstream", async () => {
+  const kv = createMemoryKv();
+  const cases = [
+    {
+      name: "missing max_tokens",
+      body: { model: "composer-2.5-fast", messages: [{ role: "user", content: "hi" }] },
+      message: "max_tokens",
+    },
+    {
+      name: "unsupported top_k",
+      body: { model: "composer-2.5-fast", max_tokens: 128, top_k: 5, messages: [{ role: "user", content: "hi" }] },
+      message: "top_k",
+    },
+    {
+      name: "unsupported content block",
+      body: {
+        model: "composer-2.5-fast",
+        max_tokens: 128,
+        messages: [{ role: "assistant", content: [{ type: "server_tool_use", id: "s1", name: "web_search", input: {} }] }],
+      },
+      message: "server_tool_use",
+    },
+  ];
+  for (const item of cases) {
+    const res = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/messages", {
+        method: "POST",
+        headers: { authorization: `Bearer ${TEST_JWT}`, "content-type": "application/json" },
+        body: JSON.stringify(item.body),
+      }),
+      { kv },
+    );
+    if (res.status !== 400) throw new Error(`${item.name}: expected 400, got ${res.status}`);
+    if (!res.headers.get("request-id")) throw new Error(`${item.name}: missing request-id`);
+    const body = await res.json();
+    if (body?.type !== "error" || body?.error?.type !== "invalid_request_error" || !String(body.error.message).includes(item.message)) {
+      throw new Error(`${item.name}: unexpected body ${JSON.stringify(body)}`);
+    }
+    if (body.request_id !== res.headers.get("request-id")) throw new Error(`${item.name}: request id mismatch`);
+  }
+});
+
+Deno.test("POST /v1/messages returns malformed JSON as Anthropic 400", async () => {
+  const res = await handleGatewayRequest(
+    new Request("http://127.0.0.1/v1/messages", {
+      method: "POST",
+      headers: { authorization: `Bearer ${TEST_JWT}`, "content-type": "application/json" },
+      body: "{",
+    }),
+    { kv: createMemoryKv() },
+  );
+  if (res.status !== 400) throw new Error(`expected 400, got ${res.status}`);
+  const body = await res.json();
+  if (body?.error?.type !== "invalid_request_error") throw new Error(`unexpected body ${JSON.stringify(body)}`);
 });
 
 Deno.test("POST /v1/messages forwards Anthropic image blocks", async () => {
@@ -364,6 +473,7 @@ Deno.test("POST /v1/messages forwards Anthropic image blocks", async () => {
         },
         body: JSON.stringify({
           model: "composer-2.5-fast",
+          max_tokens: 128,
           messages: [
             {
               role: "user",

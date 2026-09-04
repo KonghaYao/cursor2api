@@ -71,7 +71,7 @@ deno task start
 | | |
 |---|---|
 | `GET /health` | 存活检查 |
-| `GET /v1/models` | Cursor 可用模型（原生 route id） |
+| `GET /v1/models` | Cursor 可用模型；普通请求返回 OpenAI list，带 `anthropic-version` 时返回 Anthropic Models 分页格式 |
 | `POST /v1/chat/completions` | OpenAI Chat Completions（含 `stream`） |
 | `POST /v1/messages` | Anthropic Messages（含 `stream`） |
 
@@ -83,18 +83,22 @@ deno task start
 |------|--------------------------------|--------------------------|
 | 鉴权 | `Authorization: Bearer …`（也接受 `x-api-key`） | `x-api-key` 或 `Authorization: Bearer …`；接受 `anthropic-version` |
 | 文本流 | `data:` chunk，结束为 `[DONE]` | `message_start` → `content_block_*` → `message_delta` → `message_stop` |
-| 工具定义 | `tools[].function`；非 function tool 转 `providerDefinedTools` | custom tool 的 `name` / `input_schema`；`web_search_*` 等 server tool 转 `providerDefinedTools` |
+| 工具定义 | `tools[].function`；非 function tool 转 `providerDefinedTools` | custom tool 的 `name` / `input_schema`；server tools 暂不接受（Cursor 无结果块可映射） |
 | 工具结果 | `role: "tool"` + `tool_call_id` | user content 中的 `tool_result` + `tool_use_id` |
 | 工具响应 | `message.tool_calls` / `delta.tool_calls` | `tool_use` content block，`stop_reason: "tool_use"` |
 | Structured output | `response_format` | `output_config.format`；两者都通过 `<output-format>` 提示约束，非服务端强制 JSON schema |
-| Thinking | `reasoning_content` | `thinking` content block；密文 signature 不对外泄露 |
-| Cache usage | `prompt_tokens_details.cached_tokens`、`cache_write_tokens` | `cache_read_input_tokens`、`cache_creation_input_tokens` |
-| 非流式错误 | HTTP 状态 + `{error:{…}}` | HTTP 状态 + `{type:"error",error:{…}}` |
+| Thinking | `reasoning_content` | 仅在 Cursor 同时提供明文 thinking 与可回传 signature 时输出 `thinking` / `thinking_delta` / `signature_delta`；无签名或仅密文时省略 |
+| Cache usage | `prompt_tokens_details.cached_tokens`、`cache_write_tokens` | 非流式及最终 `message_delta.usage` 都含 `input_tokens`、`output_tokens` 和 cache read/write |
+| 非流式错误 | HTTP 状态 + `{error:{…}}` | HTTP 状态 + `{type:"error",error:{…},request_id}`，响应头含 `request-id` |
 | 流式错误 | 带 `error` 的 SSE data | `event: error`；错误后不伪造成功的 `message_stop` |
 
 此前 Anthropic 端点存在几处不对等问题：Connect 错误会被包装成 HTTP 200 空消息、流式错误没有 `error` event、server tools 被误当 custom tools、`output_config.format` / `disable_parallel_tool_use` 未生效，以及同一 user message 内 `text → tool_result → text` 会被重排。现已统一修复，并由 Node 单测和 Deno handler 集成测试覆盖。
 
-**协议边界**：Cursor Agent 不接受增量 tool 参数分片，所以两个端点都先缓冲上游 `toolCallPart`，在流结束前一次性发出完整工具调用。OpenAI 是一条完整 `delta.tool_calls`；Anthropic 是完整 `tool_use` block，而不是逐段 `input_json_delta`。文本和明文 thinking 仍实时增量下发。
+Anthropic `/v1/messages` 会在访问 Cursor 前验证 `model`、`max_tokens`、`messages`、角色/content block、采样范围与 tools。Malformed JSON、未知 content block 和 Cursor 无法表达的 `top_k`、`container`、`context_management`、`service_tier`、server tools 均明确返回 `400 invalid_request_error`，不再静默忽略。`max_tokens: 0` 的 cache prewarming 语义也不支持并返回 400。`thinking.budget_tokens` 会近似映射为 Cursor `low` / `medium` / `high` / `xhigh` effort，并非 Anthropic token budget 的精确执行。
+
+**Cache control 由网关管理**：API 输入里的顶层或 content block `cache_control` 不决定 Cursor cache breakpoint，也不会原样透传。网关继续只按稳定的 system/tools/首消息规则设置断点，避免客户端输入破坏 `session_fp` 与 prompt cache 轨道。
+
+**协议边界**：Cursor Agent 不接受上游 tool 参数逐片转发，所以两个端点都先缓冲 `toolCallPart`。OpenAI 在流结束前发一条完整 `delta.tool_calls`；Anthropic 发标准 `tool_use` start（`input:{}`）+ 一条完整 `input_json_delta` + stop。文本保持实时增量下发；Anthropic thinking 会先缓冲，只有同时取得明文与 signature 才在首个文本块前输出完整、可回传的 thinking block。Cursor 没有真实 stop sequence、server-tool result/citation 和精确 `top_k`/thinking budget 字段，因此网关不伪造这些数据；`stop_reason` 仅可靠给出 `tool_use`、按输出 token 推导的 `max_tokens` 或 `end_turn`。Anthropic `ping` 是可选事件，网关当前不主动发送。
 
 ### 模型 id（简写）
 
@@ -149,7 +153,7 @@ Composer 的 `thinkingPart.text` 是明文，会原样转出。Grok（`grok-4.6`
 
 Cursor 会丢掉 `role: system`，网关会折进 `<system>…</system>` user 消息。**带 `tools[]` 时**会拆成 `<tools-rules>`（固定 agent 约束，可缓存）与 `<tools-catalog>`（按工具名排序的稳定 schema 列表，随工具集变化），并仍传 `body.tools`；`<tools-rules>` 与 `<system>` 会各打 prompt cache 断点。不需要注入时可设 `inject_tools_prompt: false`。
 
-`tool_choice`：`none` 不传 tools；`required` / Anthropic `any` 注入必须调工具的约束；OpenAI `{type:"function",function:{name}}` / Anthropic `{type:"tool",name}` 只保留指定工具。OpenAI `parallel_tool_calls: false` 或 Anthropic `tool_choice.disable_parallel_tool_use: true` 约束本轮最多一个 tool call。非 `function` 的 OpenAI tool（如 `web_search_preview`）、Anthropic server tool（如 `web_search_*`）以及 `provider_defined_tools` 会写入 Cursor `providerDefinedTools`。
+`tool_choice`：`none` 不传 tools；`required` / Anthropic `any` 注入必须调工具的约束；OpenAI `{type:"function",function:{name}}` / Anthropic `{type:"tool",name}` 只保留指定工具。OpenAI `parallel_tool_calls: false` 或 Anthropic `tool_choice.disable_parallel_tool_use: true` 约束本轮最多一个 tool call。非 `function` 的 OpenAI tool（如 `web_search_preview`）及 `provider_defined_tools` 会写入 Cursor `providerDefinedTools`；Anthropic server tools 暂不接受，因为 Cursor 当前没有可映射回 `server_tool_use` / result block 的响应帧。
 
 OpenAI `response_format` 与 Anthropic `output_config.format`：`json_object` / `json_schema` 折进 `<output-format>` user 消息（Cursor 无原生 JSON mode）。`n > 1` 返回 400。`max_completion_tokens` 作为 `max_tokens` 别名。`top_p` / `stop`（Anthropic 为 `stop_sequences`）写入 `modelConfig`。
 
@@ -191,7 +195,7 @@ Cursor Inference **没有** embeddings / TTS / STT / Images API / Responses API�
 
 ### 多轮会话（内容指纹，默认无 KV）
 
-客户端每轮带**全量** `messages`；网关 pipeline 后发往上游。**`session_fp` 就是 Cursor conversation id**：`conversationId` / `x-session-id` = `tenant:session_fp`（**fg 变 = 新 thread**）。公式见 **[docs/canonical-session-fingerprint.md](docs/canonical-session-fingerprint.md)**。
+客户端每轮带**全量** `messages`；网关 pipeline 后发往上游。API 不接受、读取或返回客户端 session/conversation ID；`x-session-id`、`session_id`、`conversation_id` 不参与续会，避免客户端上下文压缩后继续维持旧 ID。网关内部仍从请求内容计算 `session_fp`，并令 Cursor upstream 的 `conversationId` / `conversationGroupId` / `x-session-id` = `tenant:session_fp`（**fg 变 = 新 thread**），以维持 prompt cache。该内部 ID 不暴露给客户端。公式见 **[docs/canonical-session-fingerprint.md](docs/canonical-session-fingerprint.md)**。
 
 **2026-09-01 大 bug**：`0ccb04b` 曾把上游 id 做成每轮 `randomId()`，Agent 多轮 **Cache Read 全 0**。`22376ac` 起必须用 `session_fp`，禁止 fingerprint 路径随机 id。详见 `CLAUDE.md`。
 

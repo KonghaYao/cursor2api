@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getAccessToken } from "./auth.ts";
+import { getAccessToken, modelsFrom } from "./auth.ts";
 import { jwtL1ClearForTests } from "./jwt_l1_cache.ts";
 import { createMemoryKv, type Kv } from "./kv.ts";
 
@@ -33,6 +33,19 @@ function fakeJwt(exp: number): string {
   return `eyJhbGciOiJIUzI1NiJ9.${payload}.sig`;
 }
 
+test("modelsFrom accepts Cursor and generic model id fields", () => {
+  assert.deepEqual(
+    modelsFrom({
+      models: [
+        { modelId: "composer-2.5-fast" },
+        { displayModelId: "cursor-grok-4.6-high-fast" },
+        { id: "third-party-id" },
+        { name: "fallback-name" },
+      ],
+    }),
+    ["composer-2.5-fast", "cursor-grok-4.6-high-fast", "third-party-id", "fallback-name"],
+  );
+});
 test("getAccessToken: client JWT bypasses KV and L1 persistence", async () => {
   jwtL1ClearForTests();
   const kv = countingKv();

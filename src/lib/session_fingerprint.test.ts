@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ROLE, runCanonicalMessagePipeline, type CursorMessage } from "./inference.ts";
+import { ROLE, anthropicToCursor, runCanonicalMessagePipeline, type CursorMessage } from "./inference.ts";
+import { resolveSessionForRequest } from "./session.ts";
 import {
   appendOnlyMerge,
   CanonConflictError,
@@ -11,6 +12,35 @@ import {
 
 const body = { model: "composer-2.5-fast" };
 const tools = [{ name: "f", description: "", parameters: { type: "object" } }];
+
+test("Anthropic system block fingerprint uses converted text and ignores client session fields", async () => {
+  const anthropicBody = {
+    model: "composer-2.5-fast",
+    system: [{ type: "text", text: "system text", cache_control: { type: "ephemeral" } }],
+    messages: [{ role: "user", content: "hi" }],
+    session_id: "stale-client-session",
+    conversation_id: "stale-client-conversation",
+  };
+  const converted = await anthropicToCursor(anthropicBody);
+  const first = await resolveSessionForRequest("tenant", anthropicBody.messages, {
+    body: anthropicBody,
+    tools: [],
+    preconvertedMessages: converted,
+  });
+  const second = await resolveSessionForRequest("tenant", anthropicBody.messages, {
+    body: { ...anthropicBody, session_id: "different", conversation_id: "different" },
+    tools: [],
+    preconvertedMessages: converted,
+  });
+  assert.equal(first.mode, "fingerprint");
+  assert.equal(second.mode, "fingerprint");
+  if (first.mode !== "fingerprint" || second.mode !== "fingerprint") return;
+  assert.equal(first.session_fp, second.session_fp);
+  const canonical = JSON.stringify(first.canon);
+  assert.equal(canonical.includes("system text"), true);
+  assert.equal(canonical.includes("cacheControl"), true);
+  assert.equal(canonical.includes("stale-client-session"), false);
+});
 
 test("appendOnlyMerge accepts tail append and rejects prefix tamper", () => {
   const u: CursorMessage = { role: ROLE.user, text: "a" };

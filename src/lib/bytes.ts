@@ -92,16 +92,14 @@ export function encodeSseEvent(event: string, obj: unknown): Uint8Array {
   return encoder.encode(`event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`);
 }
 
-export function sseStreamResponse(stream: ReadableStream<Uint8Array>, sessionId: string): Response {
-  return new Response(stream, {
-    status: 200,
-    headers: {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
-      "access-control-allow-origin": "*",
-      "x-session-id": sessionId,
-    },
+export function sseStreamResponse(stream: ReadableStream<Uint8Array>, requestId?: string): Response {
+  const headers = new Headers({
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache",
+    "access-control-allow-origin": "*",
   });
+  if (requestId) headers.set("request-id", requestId);
+  return new Response(stream, { status: 200, headers });
 }
 
 export function jwtClaims(token: string): { exp?: number; [key: string]: unknown } | null {
@@ -116,12 +114,12 @@ export function jwtClaims(token: string): { exp?: number; [key: string]: unknown
   }
 }
 
-export function jsonResponse(status: number, obj: unknown, sessionId?: string): Response {
+export function jsonResponse(status: number, obj: unknown, requestId?: string): Response {
   const headers = new Headers({
     "content-type": "application/json; charset=utf-8",
     "access-control-allow-origin": "*",
   });
-  if (sessionId) headers.set("x-session-id", sessionId);
+  if (requestId) headers.set("request-id", requestId);
   return new Response(JSON.stringify(obj), { status, headers });
 }
 
@@ -131,20 +129,19 @@ export function corsResponse(): Response {
     headers: {
       "access-control-allow-origin": "*",
       "access-control-allow-headers":
-        "authorization, content-type, x-api-key, anthropic-version, x-session-id, x-request-id, x-cursor-session-id",
+        "authorization, content-type, x-api-key, anthropic-version, x-request-id",
       "access-control-allow-methods": "GET,POST,OPTIONS",
     },
   });
 }
 
-export function sseResponse(body: string, sessionId: string): Response {
+export function sseResponse(body: string): Response {
   return new Response(body, {
     status: 200,
     headers: {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache",
       "access-control-allow-origin": "*",
-      "x-session-id": sessionId,
     },
   });
 }

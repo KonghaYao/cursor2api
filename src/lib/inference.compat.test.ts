@@ -164,6 +164,41 @@ test("openaiMessagesToCursor maps tool result images to experimentalContent", as
   assert.ok(exp?.some((p) => p.image));
 });
 
+test("anthropicToCursor maps system, tool_use, and tool_result without client cache control", async () => {
+  const body = {
+    model: "composer-2.5-fast",
+    system: [
+      { type: "text", text: "system one", cache_control: { type: "ephemeral" } },
+      { type: "text", text: "system two" },
+    ],
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "calling" },
+          { type: "tool_use", id: "call_1", name: "lookup", input: { q: "x" } },
+        ],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "call_1", content: "done" }],
+      },
+    ],
+  };
+  const msgs = await anthropicToCursor(body);
+  assert.ok(String(msgs[0]?.text).includes("system one\nsystem two"));
+  assert.deepEqual(msgs[1]?.toolCalls, [{ toolCallId: "call_1", toolName: "lookup", args: { q: "x" } }]);
+  assert.equal(msgs[2]?.role, ROLE.tool);
+  const upstream = cursorBodyFromClient(body, {
+    messages: msgs,
+    tools: [{ name: "lookup", description: "", parameters: { type: "object", properties: {} } }],
+    conversationId: "c1",
+  });
+  const serialized = JSON.stringify(upstream.messages);
+  assert.equal(serialized.includes("cache_control"), false);
+  assert.ok(serialized.includes("cacheControl"));
+});
+
 test("anthropicToCursor maps image and document blocks", async () => {
   const msgs = await anthropicToCursor({
     messages: [
@@ -226,17 +261,51 @@ test("toAnthropicMessage exposes cache usage and maps errors", () => {
     toolCalls: [],
     imageDescriptions: [],
   };
-  const message = toAnthropicMessage({ model: "composer-2.5-fast", conversationId: "sess-ant-usage", turn });
+  const message = toAnthropicMessage({
+    model: "composer-2.5-fast",
+    conversationId: "sess-ant-usage",
+    turn,
+    maxTokens: 3,
+  });
   assert.deepEqual(message.usage, {
     input_tokens: 20,
     output_tokens: 3,
     cache_creation_input_tokens: 5,
     cache_read_input_tokens: 12,
   });
+  assert.equal(message.stop_reason, "max_tokens");
+  assert.equal(message.stop_sequence, null);
+  assert.match(message.id, /^msg_[a-f0-9]{32}$/);
+  assert.equal("conversation_id" in message, false);
+  assert.equal("session_id" in message, false);
   assert.deepEqual(toAnthropicError({ code: "RESOURCE_EXHAUSTED", message: "rate limited" }), {
     type: "error",
     error: { type: "rate_limit_error", message: "rate limited" },
   });
+});
+
+test("toAnthropicMessage maps tool calls to tool_use without session fields", () => {
+  const message = toAnthropicMessage({
+    model: "composer-2.5-fast",
+    conversationId: "internal-session",
+    tools: [{ name: "lookup", description: "", parameters: { type: "object", properties: { count: { type: "integer" } } } }],
+    turn: {
+      status: 200,
+      frames: [],
+      text: "",
+      thinking: "",
+      usage: {},
+      extendedUsage: {},
+      providerMetadata: null,
+      error: null,
+      toolCalls: [{ id: "call_1", name: "lookup", args: '{"count":"2"}', complete: true }],
+      imageDescriptions: [],
+    },
+  });
+  assert.equal(message.stop_reason, "tool_use");
+  assert.deepEqual(message.content, [{ type: "tool_use", id: "call_1", name: "lookup", input: { count: 2 } }]);
+  assert.equal("conversation_id" in message, false);
+  assert.equal("session_id" in message, false);
 });
 
 test("openaiMessagesToCursor maps plaintext reasoning_content to reasoningParts", async () => {

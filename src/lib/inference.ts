@@ -1260,34 +1260,64 @@ export function toOpenAICompletion({
     model: resolveModel(model),
     choices: [{ index: 0, message, finish_reason: toolCalls.length ? "tool_calls" : "stop" }],
     usage: toOpenAIUsage(normalizeCursorUsage(turn)),
-    conversation_id: conversationId,
-    session_id: conversationId,
     image_descriptions: turn.imageDescriptions?.length ? turn.imageDescriptions : undefined,
     error: turn.error || undefined,
   };
 }
 
-export function toAnthropicError(error: unknown): { type: "error"; error: { type: string; message: string } } {
+export function toAnthropicError(
+  error: unknown,
+  requestId?: string,
+): { type: "error"; error: { type: string; message: string }; request_id?: string } {
   const outer = error && typeof error === "object" ? (error as Record<string, unknown>) : {};
   const rec = outer.error && typeof outer.error === "object" ? (outer.error as Record<string, unknown>) : outer;
   const rawType = String(rec.type || rec.code || outer.type || outer.code || "api_error").toLowerCase();
   const type =
     rawType.includes("rate") || rawType.includes("resource_exhausted")
       ? "rate_limit_error"
-      : rawType.includes("auth") || rawType.includes("unauthenticated")
-        ? "authentication_error"
-        : rawType.includes("permission")
-          ? "permission_error"
-          : rawType.includes("invalid") || rawType.includes("bad_model")
-            ? "invalid_request_error"
-            : "api_error";
+      : rawType.includes("overload")
+        ? "overloaded_error"
+        : rawType.includes("timeout") || rawType.includes("deadline")
+          ? "timeout_error"
+          : rawType.includes("billing") || rawType.includes("payment")
+            ? "billing_error"
+            : rawType.includes("auth") || rawType.includes("unauthenticated")
+              ? "authentication_error"
+              : rawType.includes("permission")
+                ? "permission_error"
+                : rawType.includes("not_found")
+                  ? "not_found_error"
+                  : rawType.includes("conflict")
+                    ? "conflict_error"
+                    : rawType.includes("too_large") || rawType.includes("payload")
+                      ? "request_too_large"
+                      : rawType.includes("invalid") || rawType.includes("bad_model")
+                        ? "invalid_request_error"
+                        : "api_error";
   return {
     type: "error",
     error: {
       type,
       message: String(rec.message || rec.detail || outer.message || outer.detail || (typeof error === "string" ? error : "Inference request failed")),
     },
+    ...(requestId ? { request_id: requestId } : {}),
   };
+}
+
+function anthropicUsage(turn: { usage?: unknown; extendedUsage?: unknown; providerMetadata?: unknown }) {
+  const normalized = normalizeCursorUsage(turn);
+  return {
+    input_tokens: normalized.promptTokens,
+    output_tokens: normalized.completionTokens,
+    cache_creation_input_tokens: normalized.cacheWriteTokens ?? 0,
+    cache_read_input_tokens: normalized.cacheReadTokens ?? 0,
+  };
+}
+
+function anthropicStopReason(toolCount: number, completionTokens: number, maxTokens?: number): string {
+  if (toolCount > 0) return "tool_use";
+  if (maxTokens != null && completionTokens >= maxTokens) return "max_tokens";
+  return "end_turn";
 }
 
 export function toAnthropicMessage({
@@ -1295,14 +1325,16 @@ export function toAnthropicMessage({
   turn,
   conversationId,
   tools,
+  maxTokens,
 }: {
   model: unknown;
   turn: InferenceTurn;
   conversationId: string;
   tools?: CursorTool[];
+  maxTokens?: unknown;
 }) {
   const content: unknown[] = [];
-  if (turn.thinking) {
+  if (turn.thinking && turn.thinkingSignature) {
     content.push({ type: "thinking", thinking: turn.thinking, signature: turn.thinkingSignature });
   }
   if (turn.text) content.push({ type: "text", text: turn.text });
@@ -1314,23 +1346,21 @@ export function toAnthropicMessage({
       input: coerceJsonBySchema(parseArgs(c.args), schemaForTool(tools, c.name)),
     });
   }
-  const normalized = normalizeCursorUsage(turn);
+  const usage = anthropicUsage(turn);
+  const max = Number(maxTokens);
   return {
-    id: `msg_${conversationId.slice(0, 8)}`,
+    id: `msg_${randomId().replace(/-/g, "")}`,
     type: "message",
     role: "assistant",
     model: resolveModel(model),
     content: content.length ? content : [{ type: "text", text: "" }],
-    stop_reason: (turn.toolCalls || []).length ? "tool_use" : "end_turn",
-    usage: {
-      input_tokens: normalized.promptTokens,
-      output_tokens: normalized.completionTokens,
-      cache_creation_input_tokens: normalized.cacheWriteTokens ?? 0,
-      cache_read_input_tokens: normalized.cacheReadTokens ?? 0,
-    },
-    conversation_id: conversationId,
-    session_id: conversationId,
-    image_descriptions: turn.imageDescriptions?.length ? turn.imageDescriptions : undefined,
+    stop_reason: anthropicStopReason(
+      (turn.toolCalls || []).length,
+      usage.output_tokens,
+      Number.isFinite(max) ? max : undefined,
+    ),
+    stop_sequence: null,
+    usage,
   };
 }
 
@@ -1596,7 +1626,6 @@ export async function streamOpenAiChatCompletion(opts: {
     return jsonResponse(
       499,
       { error: { message: "client closed request", type: "invalid_request_error" } },
-      opts.sessionId,
     );
   }
 
@@ -1617,7 +1646,6 @@ export async function streamOpenAiChatCompletion(opts: {
       return jsonResponse(
         499,
         { error: { message: "client closed request", type: "invalid_request_error" } },
-        opts.sessionId,
       );
     }
     throw err;
@@ -1633,14 +1661,12 @@ export async function streamOpenAiChatCompletion(opts: {
           type: "server_error",
         },
       },
-      opts.sessionId,
     );
   }
   if (!res.body) {
     return jsonResponse(
       502,
       { error: { message: "empty inference stream body", type: "server_error" } },
-      opts.sessionId,
     );
   }
 
@@ -1702,7 +1728,7 @@ export async function streamOpenAiChatCompletion(opts: {
     },
   });
 
-  return sseStreamResponse(stream, opts.sessionId || opts.conversationId);
+  return sseStreamResponse(stream);
 }
 
 type AnthropicSseState = OpenAiSseStreamState & {
@@ -1711,6 +1737,9 @@ type AnthropicSseState = OpenAiSseStreamState & {
   nextIndex: number;
   thinkingIndex: number;
   textIndex: number;
+  thinkingSignature?: string;
+  maxTokens?: number;
+  requestId?: string;
 };
 
 function newAnthropicSseState(): AnthropicSseState {
@@ -1724,6 +1753,50 @@ function newAnthropicSseState(): AnthropicSseState {
   };
 }
 
+function emitBufferedAnthropicThinking(out: Uint8Array[], state: AnthropicSseState): void {
+  if (state.thinkingOpen || state.textOpen || !state.accumulatedThinking || !state.thinkingSignature) return;
+  state.thinkingIndex = state.nextIndex++;
+  state.thinkingOpen = true;
+  out.push(
+    encodeSseEvent("content_block_start", {
+      type: "content_block_start",
+      index: state.thinkingIndex,
+      content_block: { type: "thinking", thinking: "", signature: "" },
+    }),
+  );
+  out.push(
+    encodeSseEvent("content_block_delta", {
+      type: "content_block_delta",
+      index: state.thinkingIndex,
+      delta: { type: "thinking_delta", thinking: state.accumulatedThinking },
+    }),
+  );
+}
+
+function closeAnthropicThinkingBlock(
+  out: Uint8Array[],
+  state: AnthropicSseState,
+): void {
+  if (!state.thinkingOpen) return;
+  if (state.thinkingSignature) {
+    out.push(
+      encodeSseEvent("content_block_delta", {
+        type: "content_block_delta",
+        index: state.thinkingIndex,
+        delta: { type: "signature_delta", signature: state.thinkingSignature },
+      }),
+    );
+  }
+  out.push(encodeSseEvent("content_block_stop", { type: "content_block_stop", index: state.thinkingIndex }));
+  state.thinkingOpen = false;
+}
+
+function closeAnthropicTextBlock(out: Uint8Array[], state: AnthropicSseState): void {
+  if (!state.textOpen) return;
+  out.push(encodeSseEvent("content_block_stop", { type: "content_block_stop", index: state.textIndex }));
+  state.textOpen = false;
+}
+
 function sseChunksFromConnectFrameAnthropic(
   frame: ConnectFrame,
   state: AnthropicSseState,
@@ -1733,32 +1806,25 @@ function sseChunksFromConnectFrameAnthropic(
   if (!j) return out;
 
   const beforeThinking = state.accumulatedThinking;
-  const absorbed = absorbThinkingFromFrame({ thinking: state.accumulatedThinking }, j);
+  const absorbed = absorbThinkingFromFrame(
+    {
+      thinking: state.accumulatedThinking,
+      thinkingSignature: state.thinkingSignature,
+    },
+    j,
+  );
   state.accumulatedThinking = absorbed.thinking;
+  state.thinkingSignature = absorbed.thinkingSignature;
   const thinkingChunk = absorbed.thinking.slice(beforeThinking.length);
-  if (thinkingChunk) {
-    if (!state.thinkingOpen) {
-      state.thinkingIndex = state.nextIndex++;
-      state.thinkingOpen = true;
-      out.push(
-        encodeSseEvent("content_block_start", {
-          type: "content_block_start",
-          index: state.thinkingIndex,
-          content_block: { type: "thinking", thinking: "" },
-        }),
-      );
-    }
-    out.push(
-      encodeSseEvent("content_block_delta", {
-        type: "content_block_delta",
-        index: state.thinkingIndex,
-        delta: { type: "thinking_delta", thinking: thinkingChunk },
-      }),
-    );
+  if (thinkingChunk && state.textOpen) {
+    // Anthropic blocks cannot overlap. A late reasoning summary cannot be inserted before text already emitted.
+    state.accumulatedThinking = beforeThinking;
   }
 
   const textPart = j.textPart as Record<string, unknown> | undefined;
   if (textPart?.text) {
+    emitBufferedAnthropicThinking(out, state);
+    closeAnthropicThinkingBlock(out, state);
     const chunk = String(textPart.text);
     state.accumulatedText += chunk;
     if (chunk) {
@@ -1811,7 +1877,7 @@ function sseChunksFromConnectFrameAnthropic(
     state.error = j.error;
     if (!state.errorEmitted) {
       state.errorEmitted = true;
-      out.push(encodeSseEvent("error", toAnthropicError(j.error)));
+      out.push(encodeSseEvent("error", toAnthropicError(j.error, state.requestId)));
     }
   }
   return out;
@@ -1823,12 +1889,11 @@ function enqueueAnthropicSseFinish(
   tools?: CursorTool[],
 ): void {
   if (state.error) return;
-  if (state.thinkingOpen) {
-    enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index: state.thinkingIndex }));
-  }
-  if (state.textOpen) {
-    enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index: state.textIndex }));
-  }
+  const closing: Uint8Array[] = [];
+  emitBufferedAnthropicThinking(closing, state);
+  closeAnthropicThinkingBlock(closing, state);
+  closeAnthropicTextBlock(closing, state);
+  for (const bytes of closing) enqueue(bytes);
   const merged = mergedToolCallsFromState(state);
   for (const c of merged) {
     const index = state.nextIndex++;
@@ -1837,27 +1902,53 @@ function enqueueAnthropicSseFinish(
       encodeSseEvent("content_block_start", {
         type: "content_block_start",
         index,
-        content_block: { type: "tool_use", id: c.id, name: c.name, input },
+        content_block: { type: "tool_use", id: c.id, name: c.name, input: {} },
+      }),
+    );
+    enqueue(
+      encodeSseEvent("content_block_delta", {
+        type: "content_block_delta",
+        index,
+        delta: { type: "input_json_delta", partial_json: JSON.stringify(input) },
       }),
     );
     enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index }));
   }
-  const u = toOpenAIUsage(
-    normalizeCursorUsage({
-      usage: state.usage,
-      extendedUsage: state.extendedUsage,
-      providerMetadata: state.providerMetadata,
-    }),
-  );
-  const stopReason = merged.length ? "tool_use" : "end_turn";
+  const usage = anthropicUsage({
+    usage: state.usage,
+    extendedUsage: state.extendedUsage,
+    providerMetadata: state.providerMetadata,
+  });
+  const stopReason = anthropicStopReason(merged.length, usage.output_tokens, state.maxTokens);
   enqueue(
     encodeSseEvent("message_delta", {
       type: "message_delta",
       delta: { stop_reason: stopReason, stop_sequence: null },
-      usage: { output_tokens: u.completion_tokens },
+      usage,
     }),
   );
   enqueue(encodeSseEvent("message_stop", { type: "message_stop" }));
+}
+
+function anthropicMessageStart(id: string, model: string) {
+  return encodeSseEvent("message_start", {
+    type: "message_start",
+    message: {
+      id,
+      type: "message",
+      role: "assistant",
+      model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    },
+  });
 }
 
 /** Test helper: Connect frames → Anthropic SSE. */
@@ -1866,28 +1957,17 @@ export function buildAnthropicSseStreamFromFramePayloads(opts: {
   model: unknown;
   conversationId: string;
   tools?: CursorTool[];
+  maxTokens?: number;
 }): ReadableStream<Uint8Array> {
-  const id = `msg_${opts.conversationId.slice(0, 8)}`;
+  const id = `msg_${randomId().replace(/-/g, "")}`;
   const model = resolveModel(opts.model);
   const state = newAnthropicSseState();
+  state.maxTokens = opts.maxTokens;
   const parser = new ConnectFrameParser();
   return new ReadableStream({
     async start(controller) {
       const enqueue = (bytes: Uint8Array) => controller.enqueue(bytes);
-      enqueue(
-        encodeSseEvent("message_start", {
-          type: "message_start",
-          message: {
-            id,
-            type: "message",
-            role: "assistant",
-            model,
-            content: [],
-            stop_reason: null,
-            usage: { input_tokens: 0, output_tokens: 0 },
-          },
-        }),
-      );
+      enqueue(anthropicMessageStart(id, model));
       for (const chunk of opts.frameChunks) {
         parser.push(chunk);
         const frames = await parser.drainAvailableFrames();
@@ -1909,13 +1989,14 @@ export async function streamAnthropicMessage(opts: {
   conversationId: string;
   tools?: CursorTool[];
   signal?: AbortSignal;
+  requestId?: string;
 }): Promise<Response> {
   const upstreamAbort = upstreamAbortFromClient(opts.signal);
   if (upstreamAbort.signal.aborted) {
     return jsonResponse(
       499,
-      toAnthropicError({ message: "client closed request", type: "invalid_request_error" }),
-      opts.sessionId,
+      toAnthropicError({ message: "client closed request", type: "invalid_request_error" }, opts.requestId),
+      opts.requestId,
     );
   }
 
@@ -1935,8 +2016,8 @@ export async function streamAnthropicMessage(opts: {
     if (isAbortError(err) || upstreamAbort.signal.aborted) {
       return jsonResponse(
         499,
-        toAnthropicError({ message: "client closed request", type: "invalid_request_error" }),
-        opts.sessionId,
+        toAnthropicError({ message: "client closed request", type: "invalid_request_error" }, opts.requestId),
+        opts.requestId,
       );
     }
     throw err;
@@ -1946,41 +2027,31 @@ export async function streamAnthropicMessage(opts: {
     const detail = await res.text().catch(() => "");
     return jsonResponse(
       res.status,
-      toAnthropicError({ message: detail || res.statusText || "inference stream failed", type: "api_error" }),
-      opts.sessionId,
+      toAnthropicError({ message: detail || res.statusText || "inference stream failed", type: "api_error" }, opts.requestId),
+      opts.requestId,
     );
   }
   if (!res.body) {
     return jsonResponse(
       502,
-      toAnthropicError({ message: "empty inference stream body", type: "api_error" }),
-      opts.sessionId,
+      toAnthropicError({ message: "empty inference stream body", type: "api_error" }, opts.requestId),
+      opts.requestId,
     );
   }
 
-  const id = `msg_${opts.conversationId.slice(0, 8)}`;
+  const id = `msg_${randomId().replace(/-/g, "")}`;
   const model = resolveModel(opts.model);
   const state = newAnthropicSseState();
+  const configuredMaxTokens = Number((opts.body.modelConfig as Record<string, unknown> | undefined)?.maxTokens);
+  state.maxTokens = Number.isFinite(configuredMaxTokens) ? configuredMaxTokens : undefined;
+  state.requestId = opts.requestId;
   const parser = new ConnectFrameParser();
   const reader = res.body.getReader();
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const enqueue = (bytes: Uint8Array) => controller.enqueue(bytes);
-      enqueue(
-        encodeSseEvent("message_start", {
-          type: "message_start",
-          message: {
-            id,
-            type: "message",
-            role: "assistant",
-            model,
-            content: [],
-            stop_reason: null,
-            usage: { input_tokens: 0, output_tokens: 0 },
-          },
-        }),
-      );
+      enqueue(anthropicMessageStart(id, model));
       try {
         while (true) {
           if (upstreamAbort.signal.aborted) break;
@@ -2021,7 +2092,7 @@ export async function streamAnthropicMessage(opts: {
     },
   });
 
-  return sseStreamResponse(stream, opts.sessionId || opts.conversationId);
+  return sseStreamResponse(stream, opts.requestId);
 }
 
 function inferenceHeaders(accessToken: string, sessionId?: string): Record<string, string> {

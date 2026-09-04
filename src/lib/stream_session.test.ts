@@ -19,7 +19,7 @@ test("fingerprint upstream sessionId matches tenant-scoped conversationId (not b
   assert.equal(conversationId, `${tenant}:${session.clientId}`);
 });
 
-test("streamOpenAiChatCompletion passes sessionId to x-session-id header", async () => {
+test("streamOpenAiChatCompletion keeps sessionId internal to upstream", async () => {
   const upstreamSessionId = `${"b".repeat(16)}:${"c".repeat(64)}`;
   const frame = encodeConnectFrame({ textPart: { text: "ok" } });
   let seenSessionHeader: string | null = null;
@@ -48,6 +48,7 @@ test("streamOpenAiChatCompletion passes sessionId to x-session-id header", async
     });
     assert.equal(res.status, 200);
     assert.equal(seenSessionHeader, upstreamSessionId);
+    assert.equal(res.headers.get("x-session-id"), null);
     const text = await res.text();
     assert.ok(text.includes("data:"));
   } finally {

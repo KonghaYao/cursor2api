@@ -151,6 +151,6 @@ export async function connectUnary(
 export function modelsFrom(json: Record<string, unknown> | null): string[] {
   const list = (json?.models as Array<Record<string, unknown>> | undefined) || [];
   return list
-    .map((m) => String(m.modelId || m.model_id || m.displayModelId || m.display_name || ""))
+    .map((m) => String(m.modelId || m.model_id || m.displayModelId || m.display_name || m.id || m.name || ""))
     .filter(Boolean);
 }
