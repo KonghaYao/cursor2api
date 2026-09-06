@@ -64,6 +64,12 @@ Composer **不使用** `reasoning_effort` 选档。**Max** 通过 `requestedMode
 
 映射完成后 **不再** 设置 `requestedModel.parameters`（effort 已编码在 route id 里）。
 
+## Other Models（`gpt-5.6-luna` 等）
+
+`gpt-5.6-luna` / `terra` / `sol` **不是** Cursor Models。`GET /v1/models`（`GetUsableModels`）只列 Composer / Grok / Auto，**不会出现** GPT-5.6。网关对这类 id **原样透传**，要的是账号 **Other Models 额度**（试用 key 会 `Trial usage limit reached`），以及出口地区未被禁（本机常见 `provider is not supported in your region`）。
+
+Inference wire id 常带 effort：`gpt-5.6-luna-high`、`gpt-5.6-luna-high-fast`。不要传无档位的 `gpt-5.6-luna-fast`（`ERROR_BAD_MODEL_NAME`）。详备忘：[CLAUDE.md](../CLAUDE.md)「2026-09-03：`gpt-5.6-luna` 是 Other Models」。
+
 ## 响应与调试
 
 - JSON 里的 `model` 字段一般为客户端传入的 id（如 `grok-4.6-fast`）。

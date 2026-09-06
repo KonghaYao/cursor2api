@@ -30,10 +30,30 @@ hit = Cache Read / (Cache Read + Input (w/o Cache Write))
 
 **冷启动**：`Cache Read ≤ 1`（与 Cursor 导出里「几乎没读到缓存」一致）。
 
-**全局命中率**（按 token 加权）：
+**全局命中率（SLO · 跨轮次，2026-09-05 起）**（按 token 加权，**剔除会话首轮**）：
 
 ```text
-global_hit = Σ Cache Read / (Σ Cache Read + Σ Input (w/o Cache Write))
+global_hit = Σ CR / (Σ CR + Σ in_wo)   # 仅计入「非首轮」计费行
+global_hit_all = 含首轮的旧算法（对照用，summary.global_hit_all）
+```
+
+**首轮判定**（CSV 无 conversationId，固定规则）：`Cache Read ≤ 1` **且** `Input (w/o Cache Write) ≤ 25000`（**25k 以下算初始**）。  
+`T = 25000` 常量：`scripts/usage_cache_metrics.py` → `FIRST_TURN_INWO_THRESHOLD`。
+
+| 字段 | 含义 |
+|------|------|
+| `summary.global_hit` | **跨轮次**（M1 SLO） |
+| `summary.global_hit_all` | 含首轮 |
+| `summary.first_turn_excluded_n` | 剔除行数 |
+| `summary.first_turn_threshold` | 固定 `T`（当前 25000） |
+
+**为何改**：多会话并行时大量「首轮 CR=0、in_wo 小」会 **拉低** 旧 `global_hit`，掩盖 **第 2 枪及以后** 的 cache 是否正常。  
+**不变**：`cold` / streak / reships / 成本仍用全量行；仅 **命中率聚合** 剔除首轮。
+
+**旧公式（含首轮）**：
+
+```text
+global_hit_all = Σ Cache Read / (Σ Cache Read + Σ Input (w/o Cache Write))
 ```
 
 ### 与 9/1 事故对照（是否「网关把 conversationId 打随机」）
@@ -57,6 +77,154 @@ global_hit = Σ Cache Read / (Σ Cache Read + Σ Input (w/o Cache Write))
 4. **计费离群**：Composer 上 `cost / (in_wo+CR)` 在**热路径**（hit≥90%）应稳定；**冷枪**单价约为热路径 **4～6 倍**属定价结构，不是 warm 乱扣。
 5. **多 thread 假突变**：30 秒内 `Cache Read` 从 ~120k 跳到 ~24k 且**两边都 &gt;10k、仍高命中** → 多为**并行会话交错**，不是单会话 cache 丢失。
 
+### 监控指标（SLO · 日常告警）
+
+数据源：Team Usage CSV → `analyze_team_usage_chart_group.py`（`D.summary` / `D.perModel.model_summary`）+ `analyze_team_usage.py`（`D.anomalies`）。**时区一律 CST**。计费行定义同脚本：`Cost≠Free` 且 `Input (w/o Cache Write)` 非空。
+
+**健康底线**：**全局 token 加权命中率 &lt; 90% 视为不健康**，必须做根因分析（先查 `composer-2.5` 与并行冷启动，再查网关 `session_fp` / conversationId，对照下文 P0）。
+
+#### 每日流程（建议）
+
+```bash
+python3 scripts/analyze_team_usage_chart_group.py team-usage-events-*.csv -o reports/usage-<date>-by-model.html
+python3 scripts/analyze_team_usage.py team-usage-events-*.csv -o reports/usage-<date>-cache-cost.html
+```
+
+1. 看 by-model 汇总卡：**global_hit**、分模型 hit、冷/热成本；**吞吐 Tab** 看 **M12–M14** 尖峰 badge。
+2. 看 cache-cost：**token_mismatch**、**reships**、**cold_streaks**、burst 竖线；**按小时成本** 看 **M15**。
+3. 尖峰与 **M4/M5/M11** 是否 **同一 CST 小时或同一分钟**（见「请求 / 成本尖峰」）。
+4. 任一项触发 **P0 / P1** → 按「触发后动作」列处理；仅 P2/O → 记入台账或观察。
+
+#### 指标表
+
+| ID | 指标 | 计算方式 | 健康 | 警告 | 严重（P0） | 触发后动作 |
+|----|------|----------|------|------|------------|------------|
+| **M1** | **全局命中率（跨轮次）** `global_hit` | 剔除首轮后 `Σ CR / (Σ CR + Σ in_wo)`（见上） | **≥ 90%** | 85%–90% | **&lt; 85%** 或 **&lt;90% 且连续 2 个导出日** | 对照 `global_hit_all`；拆 M2/M3/M7 |
+| **M2** | **`composer-2.5` 命中率** | 同 M1，仅该 model 行 | **≥ 90%** | 88%–90% | **&lt; 88%** | 能改路由则优先 **fast**；查长会话是否误用标准档 |
+| **M3** | **`composer-2.5-fast` 命中率** | 同上 | **≥ 92%** | 90%–92% | **&lt; 90%** | 查网关 conversationId / 换轨频率；与 M5 同查 |
+| **M4** | **冷请求占比** `cold_pct` | `CR≤1` 行数 / 计费行数 | **≤ 12%** | 12%–18% | **&gt; 18%** | 看 burst/subagent；冷枪正常但占比高 → 并行新 thread 多 |
+| **M5** | **最长冷 streak** | 时间正序连续 `CR≤1` 最大长度 | **≤ 10** | 11–19 | **≥ 20**（尤其 **≥ 30**） | **≥20 按 P0 疑 conversationId**；11–19 多为并行冷启动，结合 M6 |
+| **M6** | **滚动 20 枪低命中占比** | 窗口 `ΣCR/(ΣCR+Σin_wo)&lt;90%` 的窗口数 / 总窗口数 | **≤ 35%** | 35%–55% | **&gt; 55%** 且 M1&lt;90% | **勿单独告警**；仅在与 M1/M5 同坏时作辅证 |
+| **M7** | **冷启动成本占比** | `cold_cost / total_cost`（脚本 summary） | **≤ 12%** | 12%–18% | **&gt; 18%** | 查大 `in_wo` 冷枪（换轨一次付清）与 Grok 大 output |
+| **M8** | **整前缀重送** `reships` | 脚本相邻枪检测（见上） | 仅趋势 | 较前日 **+50%** | 与 M5≥20 **同现** | 区分换轨（预期）vs 每轮 random（事故） |
+| **M9** | **Token 一致性** | `Total ≠ in_wo+CR+Out` 行数 | **0** | — | **≥ 1** | 导出/解析 bug，勿用于 cache 结论 |
+| **M10** | **非 fast Grok（Agent 路径）** | `cursor-grok-4.6-high` 等 **无 `-fast`** 且带 tools 的计费行 | **0** | 任意 **&gt;0** | 持续日增 | 客户端改 **high-fast**；网关应已 `upgradeGrokRouteForTools` |
+| **M11** | **单小时 unhealthy** | CST 小时桶 token 加权 hit | 无 **&lt;85%** 且 **in_wo≥1M** 的小时 | 1 个此类小时 | **≥2** 个或 **最差 &lt;80%** | 对齐 Agent 高峰；看该小时模型 mix 与 burst |
+| **M12** | **Roll5 吞吐压力** | 1min 桶 **Roll5 RPM / Roll5 TPM** 全日最大值（by-model badge） | RPM **≤25** 且 TPM **≤2M** | RPM 26–40 或 TPM 2–5M | RPM **≥41** 或 TPM **&gt;5M** | 限流/减并行；对照 M13 是否瞬时更高 |
+| **M13** | **1min 瞬时 RPM 尖峰** | 单分钟计费行数最大值 + **发生时刻 (CST)** | **≤25** | 26–40 | **≥41** | 与 **M5 streak / M16 burst** 同分钟 → 并行 subagent；台账必记时刻 |
+| **M14** | **1min 瞬时 TPM 尖峰** | 单分钟 Σ(`in_wo+CR+Out`) 最大值 + **时刻 (CST)** | **≤2M** | 2–5M | **&gt;5M** | 长上下文批量推理；与 M15 同小时看成本 |
+| **M15** | **单小时成本尖峰** | CST 小时 Σ`Cost` 最大值；辅：是否 **≥ max($12, 3× 当日有量小时中位数)** | 无超阈小时 | 1 个小时超阈 | **≥2** 小时超阈或单小时 **≥$20** | 拆模型（5min 堆叠）；区分热路径贵 vs 冷枪贵 |
+| **M16** | **冷 burst × 请求尖峰共现** | `D.anomalies.bursts` 中心时刻 ±1min 内 **M13≥26** 或该分钟 **≥4 冷启动** | 无共现 | 1 段/日 | **≥3 段/日** 或共现且 **M11 同小时** | 预期：批量 Agent；异常：共现且 **M5≥20** 转 P0 查 id |
+
+#### 请求 / 成本尖峰（与 cache 联动）
+
+**尖峰 alone 不升格事故**（多为合法并发），但 **必须记录时刻**，并与 cache 指标 **同屏看**：
+
+| 联动 | 含义 | 典型动作 |
+|------|------|----------|
+| **M13 高 + M5 11–19** | 并行新 thread 冷启动 | 控 subagent 并发；台账 **坏段** 写「CST 分钟 + streak 长」 |
+| **M13 高 + M1 仍 ≥90%** | 热路径仍健康 | **O**；只记尖峰，不必当 S |
+| **M15 高 + M11 低 hit** | 高峰又贵又缺缓存 | **S/P1** 强化；查 composer-2.5 占比 |
+| **M15 高 + M3 高 hit** | 贵但主要是 **fast 热路径 + 大 CR** | 正常 heavy 使用；看 output/Grok 是否拉高 $ |
+| **M16 共现** | burst 竖线与 RPM 柱 **同一时间** | 对齐 Agent 调度；非 9/1 类 id 问题时 **勿回滚网关** |
+
+**读图顺序**（by-model）：吞吐 Tab（M12–M14）→ 5min 成本/Token 堆叠（M15 结构）→ 5min 命中率折线（同段 hit 是否掉）。
+
+**台账字段**：除小时 hit 外，增加 **「请求尖峰 (CST)」**（M13/M14 时刻与数值）、**「成本尖峰 (CST)」**（M15 小时与 $）。
+
+#### 优先级（怎么判事故）
+
+| 级别 | 条件（满足任一） | 含义 |
+|------|------------------|------|
+| **P0** | M5 **≥ 20**；或 M1 **&lt;85%**；或 M3 **&lt;90%** 且 M5 **≥15** | 优先怀疑 **conversationId / session_fp**（9/1 类） |
+| **P1** | M1 **&lt;90%**（不健康）；或 M2 **&lt;90%**；或 M7 **&gt;18%**；或 **M15 超阈且 M11 同小时 unhealthy** | 成本与 cache 偏离，**必须分析**（常见：标准 Composer + 并行 subagent） |
+| **P2** | 仅 M4/M6/M12–M16 警告（**无 P0/P1**） | 记录尖峰与趋势；**M13≥41** 单独 → 台账 **O** 或坏段备注 |
+
+#### 报告字段对照
+
+| 指标 | HTML / JSON 位置 |
+|------|------------------|
+| M1,M4,M7 | `cache-cost` / `by-model` → `D.summary`（`global_hit`, `cold_pct`, `cold_cost`, `cost`） |
+| M2,M3 | `by-model` → `D.perModel.model_summary[]`（`model`, `hit`, `cold_pct`, `cost`） |
+| M5,M8,M9,M16 | `cache-cost` → `D.anomalies`（`cold_streaks`, `reships`, `token_mismatch`, `bursts`） |
+| M11,M15 | `cache-cost` → `hour_hit[]`、`hour_inwo_m[]`、`hour_cost[]`（CST 小时） |
+| M12–M14 | `by-model` → `D.throughput`（1min `rpm[]`/`tpm[]`、Roll5、压力 badge；见「吞吐计算标准」） |
+
+#### 改阈值时
+
+- **M1/M2/M3 的 90%** 为产品 SLO，与脚本「热路径 hit≥90%」离群检测一致；动阈值请 **同时改** 本节与 `analyze_team_usage*.py` 中汇总卡片文案（若有硬编码）。
+- **M5 的 20/30** 来自 9/1 事故 streak 对照；**不要用 M6 单独驱动告警**（多 thread 交错时 M6 常年偏高）。
+- **M12–M14 压力档** 与 `RPM_PRESSURE_BREAKS` / `TPM_PRESSURE_BREAKS` 同步改（`analyze_team_usage_chart_group.py`）；**M13 用瞬时 1min，M12 用 Roll5**，勿混读。
+
+#### 事故台账（大小分级 · 时间记录）
+
+**新条目只增不改**（结论变更用「备注 / 续记」）。编号：`INC-YYYY-MM-DD[-序号]`，同一导出日多条加 `-2`、`-3`。
+
+##### 大小怎么定
+
+| 分级 | 代号 | 判定（满足任一即可归入该档，**就高不就低**） | 典型处置 |
+|------|------|---------------------------------------------|----------|
+| **大事故** | **L** | **P0**；或 **M1 &lt; 85%**；或 **已确认**网关/会话 id 缺陷（如 random `conversationId`）；或 **M5 ≥ 30** 且 Composer 长会话 CR 持续≈0 | 停发/回滚、修网关、发版验证；写详细根因节（见 9/1） |
+| **小事故** | **S** | **P1 且非 L**：如 **90% &gt; M1 ≥ 85%**、**M2 &lt; 90%**、**M7 &gt; 18%**；**M5 11–19** 且无 L 证据 | 运营侧优化（模型/并发）；抽查 `session_fp`；**不必**紧急发版 |
+| **观察** | **O** | 仅 **P2** 或单小时噪声（如 **&lt;10 枪** 且 M1 仍 ≥90%） | 记入台账趋势，日报可略 |
+| **已关闭** | — | 修复已上线 + 下一导出日指标回到健康 | 在条目「状态」标 closed，保留时间窗 |
+
+**时间怎么写**
+
+- **观测窗**：Team Usage CSV 覆盖的 **UTC 起止**，正文统一转 **CST**（`Date` 列）。
+- **坏段**：除全天 summary 外，列出 **CST 小时** 或 **burst/streak 起止**（来自 `D.anomalies.cold_streaks` / 小时 hit），便于和 Agent 日志对齐。
+- **尖峰时刻**：**M13/M14** 精确到 **CST 分钟**；**M15** 写到 **小时 + $**（可与 M11 hit 同列）。
+- **发版关联**（若相关）：CST **push ≈ 线上 +1min**（Deno），与坏段比先后。
+
+##### 条目模板（复制填写）
+
+```markdown
+### INC-YYYY-MM-DD — 【L/S/O】标题
+
+| 字段 | 内容 |
+|------|------|
+| 分级 | L / S / O |
+| 观测窗 (CST) | YYYY-MM-DD HH:MM — YYYY-MM-DD HH:MM |
+| 主要坏段 (CST) | 例：09-04 12:00–13:00 hit 79.6%；07:20:26 streak 16 |
+| 请求/成本尖峰 (CST) | 例：07:20 RPM=65；10:00 成本 $14.5/h |
+| 触发指标 | M1=…% M2=… M5=… M13=… M15=… P0/P1/P2 |
+| 用户/团队 | email / team id |
+| 证据 | `team-usage-events-….csv`；`reports/usage-….html` |
+| 根因结论 | 一句话 + 是否网关 |
+| 状态 | open / mitigated / closed |
+| 续记 | YYYY-MM-DD：… |
+```
+
+##### 已登记
+
+###### INC-2026-09-01 — 【L】random conversationId，长会话 Cache Read 全灭
+
+| 字段 | 内容 |
+|------|------|
+| 分级 | **L（大事故）** |
+| 观测窗 (CST) | **2026-09-01** 全天（norin439 长会话）；坏段见下 |
+| 主要坏段 (CST) | **22:41–22:45** 连续 **15** 次 CR≈0（`6dc1abc`）；**23:11–23:23** 连续 **50** 次 CR≈0（`0ccb04b`）；**23:23:54** 起修复后回升（`22376ac`） |
+| 触发指标 | M1 极低；M5 **≥50**；滚动 20 **&lt;20%**；**P0** |
+| 用户/团队 | norin439；`team-usage-events-29803137-2026-09-01 (2).csv` |
+| 证据 | `reports/incident-2026-09-01-windows.html`；详述见下文 **「2026-09-01：每轮 random conversationId」** |
+| 根因结论 | fingerprint 路径每轮 `randomId()`，非 KV/无状态设计本身；**已修** `session_fp` → `tenant:session_fp` |
+| 状态 | **closed**（`22376ac`） |
+
+###### INC-2026-09-05 — 【S】全局命中率未达 90%（SLO 边缘）
+
+| 字段 | 内容 |
+|------|------|
+| 分级 | **S（小事故）** |
+| 观测窗 (CST) | **2026-09-04 08:58** — **2026-09-05 22:36**（CSV 文件名 09-05） |
+| 主要坏段 (CST) | **09-04 12:00** hit **79.6%**（255 枪，85 冷）；**09-04 18:00** hit **76.1%**；**09-05 07:20** streak **16**（~7s）；**09-05 16:00** in_wo **3.66M**、hit **89.2%**；22/31 小时 **&lt;90%** |
+| 请求/成本尖峰 (CST) | **07:20** **M13 RPM=65**（与 streak 16 同段）；**09-04 10:00** **M15≈$14.5/h**（当日成本最高小时，fast 为主、hit **96.7%**）；16:00 成本 **≈$11/h** + 大 in_wo |
+| 触发指标 | **M1（跨轮次）=91.7%**（T=**25000**、剔除 **590** 行）；含首轮 **89.63%**；**M5=16**；**M13=65** |
+| 用户/团队 | cosima15102@corradyn.com；`team-usage-events-29803137-2026-09-05.csv` |
+| 证据 | `reports/usage-2026-09-05-by-model.html`；`reports/usage-2026-09-05-cache-cost.html` |
+| 根因结论 | 跨轮次看 **cache 正常**；含首轮偏低来自多会话 + **&gt;25k 的冷枪**（换轨整段 in_wo，**不算初始**） |
+| 状态 | **closed（M1）**；坏段/尖峰仍作运营参考 |
+| 续记 | T 固定 **25k**（前 **33k**→91.84%/604 行）；**33k→25k** 少剔 14 行、M1 **91.7%**；旧自适应 T=4096 只剔 157 行 |
+
 ### 成本归因（简表）
 
 - **冷启动 + 超长 in_wo**（10万+）：单枪 $0.05–0.07，换轨一次付清。
@@ -67,6 +235,104 @@ global_hit = Σ Cache Read / (Σ Cache Read + Σ Input (w/o Cache Write))
 
 - `reports/usage-<date>-cache-cost.html`：汇总卡片、按小时成本/命中、命中率分布、滚动命中、**时间轴散点 + burst 竖线**、冷启动 streak 表。
 - 与事故对比图：`reports/incident-2026-09-01-windows.html`（若存在）。
+
+### 定稿报告模板（by-model · 以后按此构建）
+
+**主报告**用 `scripts/analyze_team_usage_chart_group.py`（单文件 HTML 模板 + JSON 内嵌）。**辅助**仍可用 `analyze_team_usage.py` 做 cache 事故向的时间轴 / burst / reships，二者互补，不互相替代。
+
+```bash
+# 从仓库根目录
+python3 scripts/analyze_team_usage_chart_group.py \
+  team-usage-events-<team>-<YYYY-MM-DD>.csv \
+  -o reports/usage-<YYYY-MM-DD>-by-model.html
+
+open reports/usage-<YYYY-MM-DD>-by-model.html
+```
+
+对外分享定稿：生成后用 `artifact` 上传 `reports/usage-*-by-model.html`（默认 7d，需要 30d 显式传 `ttl: 30d`）。
+
+#### 页面结构（布局约定 · 勿随意加回重复图）
+
+自上而下，保持紧凑、**禁止横向滚动**：
+
+1. **Sticky 模型筛选**：chip 开关；**默认仅 Top4 使用量（请求次数）**；「全选 / Top4 使用量 / Top4 成本」；下方所有时序图同步 `enabled`（可点图例）。
+2. **吞吐（统一 1 分钟标准 · CST）**  
+   - `<details>` 折叠 **计算标准**（见下表）。  
+   - **单面板 Tab**：`RPM` | `Token TPM`（320px）；柱色 = 压力档，灰线 = Roll5。  
+   - **同一行** RPM + TPM 压力 badge（各自峰值）。
+3. **结构占比**：一个 `pies-block`，**2×2** 环形图（**legend 关闭**，tooltip + 标题）；固定 4 张：
+   - Composer vs Grok **成本**
+   - 模型 **Top5 + 其他** 成本
+   - 冷 / 热 **请求次数**（note 含冷热 $）
+   - **命中率六档**（与 `build_report_data` bins 一致）
+4. **模型汇总表**：全称 model id、可排序；Token 列自动 k/M/B。
+5. **5 分钟桶 · 分模型**（**单面板 Tab**：成本 | Token | 请求）：堆叠柱；**与 1min 吞吐分开算**，仅看结构占比。
+6. **缓存命中率**：5min 桶、分模型折线（300px hero）。
+
+** intentionally 不再做**：分模型 1min RPM 堆叠、60s 滚动并发堆叠（与总览 RPM/Roll5 重复）。
+
+#### 吞吐计算标准（改阈值只动脚本常量）
+
+| 项 | 定义 |
+|----|------|
+| 时区 | CSV `Date` → **CST**（UTC+8） |
+| 桶 | 秒归零的 **1 分钟**；无事件分钟填 0 |
+| **RPM** | 该分钟内计费行数（`Cost≠Free` 且 `in_wo` 非空，同 `parse_rows`） |
+| **TPM** | 该分钟 Σ(`in_wo` + `Cache Read` + `Output Tokens`) = `Total Tokens` |
+| **Roll5** | 含当前分钟在内 **5 分钟** 的 RPM 或 TPM 之和 |
+| **RPM 压力**（柱色） | 绝对档：`0` 空闲 · `1–10` 低 · `11–25` 中 · `26–40` 高 · `≥41` 极高 |
+| **TPM 压力**（柱色） | 绝对档：`0` · `≤0.5M` · `≤2M` · `≤5M` · `>5M` tokens/min |
+
+常量位置：`scripts/analyze_team_usage_chart_group.py` 内 `RPM_PRESSURE_BREAKS`、`TPM_PRESSURE_BREAKS`。不要用分位数给 RPM 上色（避免「柱上 19 RPM 却标成高压力」）。
+
+#### 改模板时约束
+
+- 饼图：**2×2**、`minmax(0,1fr)`、`overflow-x: hidden`；模型名 **全称**（`composer-2.5-fast`）。
+- 5min 堆叠 Token 轴：按桶内 raw tokens 自动 k/M/B；**不要**与 1min TPM 混在同一 Y 轴口径里解释压力。
+- 新 CSV 分析流程：**先跑 chart_group 出 by-model 定稿**；若怀疑 cache 事故再跑 `analyze_team_usage.py` 对照 burst/streak/reships。
+
+---
+
+## 2026-09-03：`gpt-5.6-luna` 是 Other Models，要额度
+
+### 结论
+
+`gpt-5.6-luna` / `terra` / `sol` 是 OpenAI 第三方模型，走 Cursor **Other Models** 池，**不是** Composer / Grok 所在的 **Cursor Models** 池。网关对未知 id **原样透传** `modelId`，不必先写简写映射才能打到上游。打不通通常是 **额度或地区**，不是协议。
+
+### 实测（本仓库 `crsr_`）
+
+| 路径 | 现象 |
+|------|------|
+| `GET /v1/models`（`GetUsableModels`） | 只回 **19** 条 Composer / Grok / Auto；**没有** `gpt-5.6-*` |
+| 本机直连 Inference | `ERROR_CUSTOM_MESSAGE`：`This model provider is not supported in your region` |
+| 生产 Deno 网关 | `ERROR_RATE_LIMITED`：`Trial usage limit reached`（Other Models **试用额度**用完） |
+| 同 key `composer-2.5-fast` | 正常 `PONG`（Cursor Models 不受 Other Models 试用上限影响） |
+
+复现：`node --experimental-strip-types scripts/probe-luna.ts`。
+
+### Wire id
+
+官方产品 id：`gpt-5.6-luna`。Inference route 常带 effort：
+
+```text
+gpt-5.6-luna-{none|low|medium|high|xhigh|max}(-fast)?
+```
+
+- `gpt-5.6-luna` / `gpt-5.6-luna-high` 上游认（本账号被额度/地区拦）
+- `gpt-5.6-luna-fast`（无 effort）→ `ERROR_BAD_MODEL_NAME`
+- Fast 用 `gpt-5.6-luna-high-fast` 这种带档位的 id
+
+### 要用起来
+
+1. 账号 **Pro 及以上**，且 **Other Models** 额度未耗尽（试用 key 常见 `Trial usage limit reached`）
+2. 出口不在 Cursor 地区限制内（见 cursor.com/docs/account/regions）；本机受限时，生产 Deno 出口仍可能打到上游，然后才撞额度
+3. **不要**用 `GetUsableModels` / `/v1/models` 判断「支不支持 Luna」——那个 RPC 只列 Cursor Models
+
+### 约束
+
+- 空 `content` + HTTP 200 + `error` = 上游拒，不是网关把 id 映射丢了
+- 不要为了 Luna 去改 `session_fp` / `conversationId`
+- 不要假设「列表里没有 = 网关没接」；Other Models 本来就不在 `GetUsableModels` 里
 
 ---
 

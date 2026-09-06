@@ -11,6 +11,12 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
+from usage_cache_metrics import (
+    annotate_first_turn,
+    hit_rate_meta,
+    rows_for_hit_rate,
+)
+
 
 def parse_rows(path: Path) -> list[dict]:
     rows: list[dict] = []
@@ -168,11 +174,15 @@ def detect_anomalies(num: list[dict]) -> dict:
 
 
 def build_report_data(num: list[dict], anomalies: dict) -> dict:
+    threshold = annotate_first_turn(num)
+    hit_meta = hit_rate_meta(num, threshold)
+
     total_cost = sum(r["cost"] for r in num)
     total_inwo = sum(r["inwo"] for r in num)
     total_cr = sum(r["cr"] for r in num)
     total_out = sum(r["out"] for r in num)
-    global_hit = total_cr / (total_cr + total_inwo) * 100 if (total_cr + total_inwo) else 0
+    global_hit = hit_meta["global_hit"]
+    global_hit_all = hit_meta["global_hit_all"]
     cold_n = sum(1 for r in num if r["cold"])
     cold_cost = sum(r["cost"] for r in num if r["cold"])
 
@@ -181,8 +191,9 @@ def build_report_data(num: list[dict], anomalies: dict) -> dict:
         h = r["cst"].strftime("%H:00")
         by_hour[h]["n"] += 1
         by_hour[h]["cost"] += r["cost"]
-        by_hour[h]["inwo"] += r["inwo"]
-        by_hour[h]["cr"] += r["cr"]
+        if not r.get("first_turn"):
+            by_hour[h]["inwo"] += r["inwo"]
+            by_hour[h]["cr"] += r["cr"]
         if r["cold"]:
             by_hour[h]["cold"] += 1
 
@@ -199,6 +210,8 @@ def build_report_data(num: list[dict], anomalies: dict) -> dict:
 
     bins = {"0–1% (冷)": 0, "1–50%": 0, "50–80%": 0, "80–90%": 0, "90–98%": 0, "98–100%": 0}
     for r in num:
+        if r.get("first_turn"):
+            continue
         h = r["hit"]
         if h is None:
             continue
@@ -228,7 +241,7 @@ def build_report_data(num: list[dict], anomalies: dict) -> dict:
     roll_labels, roll_hit = [], []
     window = 20
     for i in range(window - 1, len(num)):
-        chunk = num[i - window + 1 : i + 1]
+        chunk = rows_for_hit_rate(num[i - window + 1 : i + 1], exclude_first_turn=True)
         inwo = sum(r["inwo"] for r in chunk)
         cr = sum(r["cr"] for r in chunk)
         roll_labels.append(num[i]["cst"].strftime("%H:%M"))
@@ -259,7 +272,10 @@ def build_report_data(num: list[dict], anomalies: dict) -> dict:
         "summary": {
             "n": len(num),
             "cost": round(total_cost, 2),
-            "global_hit": round(global_hit, 2),
+            "global_hit": global_hit,
+            "global_hit_all": global_hit_all,
+            "first_turn_threshold": hit_meta["first_turn_threshold"],
+            "first_turn_excluded_n": hit_meta["first_turn_excluded_n"],
             "cold_n": cold_n,
             "cold_pct": round(cold_n / len(num) * 100, 1) if num else 0,
             "cold_cost": round(cold_cost, 2),
@@ -403,7 +419,7 @@ document.getElementById('subtitle').textContent = D.meta.subtitle;
 document.getElementById('cards').innerHTML = `
   <div class="card"><div class="label">计费请求</div><div class="val">${s.n}</div></div>
   <div class="card"><div class="label">估算成本</div><div class="val">$${s.cost}</div></div>
-  <div class="card"><div class="label">全局命中率</div><div class="val good">${s.global_hit}%</div></div>
+  <div class="card"><div class="label">跨轮次命中率</div><div class="val good">${s.global_hit}%</div><div class="note" style="font-size:11px;margin-top:4px">含首轮 ${s.global_hit_all}% · 剔除 ${s.first_turn_excluded_n} · T=${s.first_turn_threshold}</div></div>
   <div class="card"><div class="label">冷启动</div><div class="val warn">${s.cold_n} (${s.cold_pct}%)</div></div>
   <div class="card"><div class="label">冷启动成本</div><div class="val warn">$${s.cold_cost}</div></div>
   <div class="card"><div class="label">整前缀重送≈</div><div class="val">${D.anomalies.reships} 次</div></div>
