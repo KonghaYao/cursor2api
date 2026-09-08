@@ -503,6 +503,8 @@ export function normalizeToolArguments(raw: unknown, schema: JsonObject): string
   return JSON.stringify(coerceJsonBySchema(parsed, schema || {}));
 }
 
+const EPHEMERAL_CACHE_CONTROL = { anthropic: { cacheControl: { type: "ephemeral" } } } as const;
+
 function cachedTextContent(text: string) {
   return {
     parts: {
@@ -510,7 +512,7 @@ function cachedTextContent(text: string) {
         {
           text: {
             text,
-            providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+            providerOptions: EPHEMERAL_CACHE_CONTROL,
           },
         },
       ],
@@ -518,13 +520,92 @@ function cachedTextContent(text: string) {
   };
 }
 
+function contentPartHasCacheControl(part: Record<string, unknown>): boolean {
+  for (const key of ["text", "image", "file"] as const) {
+    const bag = part[key] as Record<string, unknown> | undefined;
+    if (!bag) continue;
+    const opts = bag.providerOptions as Record<string, unknown> | undefined;
+    const cc = (opts?.anthropic as Record<string, unknown> | undefined)?.cacheControl;
+    if (cc) return true;
+  }
+  return false;
+}
+
+function markContentPartWithCache(part: Record<string, unknown>): Record<string, unknown> {
+  if (contentPartHasCacheControl(part)) return part;
+  if (part.text && typeof part.text === "object") {
+    const text = part.text as Record<string, unknown>;
+    return { text: { ...text, providerOptions: EPHEMERAL_CACHE_CONTROL } };
+  }
+  if (part.image && typeof part.image === "object") {
+    const image = part.image as Record<string, unknown>;
+    return { image: { ...image, providerOptions: EPHEMERAL_CACHE_CONTROL } };
+  }
+  if (part.file && typeof part.file === "object") {
+    const file = part.file as Record<string, unknown>;
+    return { file: { ...file, providerOptions: EPHEMERAL_CACHE_CONTROL } };
+  }
+  return part;
+}
+
+function partsList(message: CursorMessage): Array<Record<string, unknown>> | null {
+  const bag = message.parts as { parts?: Array<Record<string, unknown>> } | undefined;
+  return bag?.parts?.length ? bag.parts : null;
+}
+
+function partsContainMedia(parts: Array<Record<string, unknown>>): boolean {
+  return parts.some((p) => p.image || p.file);
+}
+
+function markCacheBreakpointOnParts(message: CursorMessage): CursorMessage {
+  const parts = partsList(message);
+  if (!parts?.length) return message;
+  const next = parts.map((p) => ({ ...p }));
+  const lastIdx = next.length - 1;
+  next[lastIdx] = markContentPartWithCache(next[lastIdx]!);
+  return { ...message, parts: { parts: next } };
+}
+
+function markCacheBreakpointOnToolMedia(message: CursorMessage): CursorMessage {
+  const tc = message.toolContent as { parts?: Array<Record<string, unknown>> } | undefined;
+  if (!tc?.parts?.length) return message;
+  let changed = false;
+  const toolParts = tc.parts.map((tp) => {
+    const exp = tp.experimentalContent as Array<Record<string, unknown>> | undefined;
+    if (!Array.isArray(exp) || !exp.length || !exp.some((e) => e.image || e.file)) return tp;
+    const expCopy = exp.map((e) => ({ ...e }));
+    const lastIdx = expCopy.length - 1;
+    expCopy[lastIdx] = markContentPartWithCache(expCopy[lastIdx]!);
+    changed = true;
+    return { ...tp, experimentalContent: expCopy };
+  });
+  if (!changed) return message;
+  return { ...message, toolContent: { parts: toolParts } };
+}
+
 function markCacheBreakpoint(message: CursorMessage): CursorMessage {
-  if (!message?.text || message.parts || message.toolContent) return message;
+  if (message.toolContent) return message;
+  const parts = partsList(message);
+  if (parts?.length) return markCacheBreakpointOnParts(message);
+  if (!message?.text) return message;
   const { text, ...rest } = message;
   return { ...rest, ...cachedTextContent(String(text)) };
 }
 
-function applyPromptCache(messages: CursorMessage[]): CursorMessage[] {
+const CACHE_TAGGED_USER_PREFIXES = [
+  "<tools-rules>",
+  "<tools-catalog>",
+  "<tool-policy>",
+  "<system>",
+  "<output-format>",
+] as const;
+
+function isCacheTaggedUserText(text: string): boolean {
+  return CACHE_TAGGED_USER_PREFIXES.some((tag) => text.startsWith(tag));
+}
+
+/** Inject Cursor/Anthropic ephemeral cache breakpoints for stable prompt prefixes. */
+export function applyPromptCache(messages: CursorMessage[]): CursorMessage[] {
   if (!messages?.length) return messages;
   let marked = false;
   const out = messages.map((m) => {
@@ -532,10 +613,22 @@ function applyPromptCache(messages: CursorMessage[]): CursorMessage[] {
       marked = true;
       return markCacheBreakpoint(m);
     }
+    if (m.role === ROLE.tool) {
+      const next = markCacheBreakpointOnToolMedia(m);
+      if (next !== m) marked = true;
+      return next;
+    }
     const text = typeof m.text === "string" ? m.text.trim() : "";
-    if (m.role === ROLE.user && text && (text.startsWith("<tools-rules>") || text.startsWith("<system>"))) {
+    if (m.role === ROLE.user && text && isCacheTaggedUserText(text)) {
       marked = true;
       return markCacheBreakpoint(m);
+    }
+    if (m.role === ROLE.user) {
+      const parts = partsList(m);
+      if (parts?.length && partsContainMedia(parts)) {
+        marked = true;
+        return markCacheBreakpointOnParts(m);
+      }
     }
     return m;
   });
