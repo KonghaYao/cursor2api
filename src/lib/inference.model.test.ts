@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  applyPromptCache,
   countCursorImageParts,
   cursorBody,
   extractFastMode,
@@ -13,8 +12,6 @@ import {
   parseImageDataUrl,
   ROLE,
   resolveCursorModelRoute,
-  runCanonicalMessagePipeline,
-  stableStringify,
   upgradeGrokRouteForTools,
 } from "./inference.ts";
 
@@ -219,57 +216,4 @@ test("openaiMessagesToCursor rejects non-http image URLs", async () => {
       return true;
     },
   );
-});
-
-test("runCanonicalMessagePipeline marks tools-catalog and multimodal user image with cacheControl", async () => {
-  const body = { model: "composer-2.5-fast" };
-  const tools = [{ name: "Read", description: "read file", parameters: { type: "object", properties: {} } }];
-  const pipelined = await runCanonicalMessagePipeline(
-    [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: "describe" },
-          { type: "image_url", image_url: { url: TINY_PNG_DATA_URL } },
-        ],
-      },
-    ],
-    body,
-    tools,
-  );
-  const serialized = stableStringify(pipelined.messages);
-  assert.ok(serialized.includes("cacheControl"));
-  const catalog = pipelined.messages.find(
-    (m) => typeof m.text === "string" && String(m.text).startsWith("<tools-catalog>"),
-  );
-  assert.equal(catalog, undefined, "tools-catalog should be converted to parts with cacheControl");
-  const imageMsg = pipelined.messages.find((m) => stableStringify(m).includes(TINY_PNG_B64));
-  assert.ok(imageMsg);
-  const imagePart = (
-    imageMsg?.parts as { parts: Array<{ image?: { providerOptions?: unknown } }> } | undefined
-  )?.parts?.find((p) => p.image);
-  assert.ok(imagePart?.image?.providerOptions);
-});
-
-test("applyPromptCache marks tool result experimentalContent image", async () => {
-  const marked = applyPromptCache([
-    {
-      role: ROLE.tool,
-      toolContent: {
-        parts: [
-          {
-            toolCallId: "c1",
-            toolName: "Read",
-            result: "",
-            isError: false,
-            experimentalContent: [{ image: { data: TINY_PNG_B64, mimeType: "image/png" } }],
-          },
-        ],
-      },
-    },
-  ]);
-  const exp = (
-    marked[0]?.toolContent as { parts: Array<{ experimentalContent?: Array<{ image?: { providerOptions?: unknown } }> }> }
-  ).parts[0]?.experimentalContent;
-  assert.ok(exp?.[0]?.image?.providerOptions);
 });

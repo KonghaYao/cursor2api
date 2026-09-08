@@ -293,43 +293,6 @@ open reports/usage-<YYYY-MM-DD>-by-model.html
 
 ---
 
-## 2026-09-08：带图会话 prompt cache 偏低（~30%）与 `applyPromptCache` 缺口
-
-### 现象
-
-多模态（user `image_url` / tool 结果里的图）长会话里，Team Usage 常见 **CR/(CR+in_wo) ≈ 25–35%**（大图时 in_wo 占 ~70%），而纯文本 Agent 热路径常 **≥90%**。`session_fp` 在 **第一条 tool 之后仍稳定**（不是 9/1 random id）。
-
-### 根因（网关可控部分）
-
-`applyPromptCache` 原先只给 **纯 `text`** 的 `<tools-rules>` / `<system>` 打 `cacheControl`：
-
-- **`<tools-catalog>`** 未打 breakpoint
-- **多模态 user**（`parts` 含 `image`/`file`）被跳过
-- **tool 结果**里 `experimentalContent` 的图未打 breakpoint
-
-Cursor 侧是否缓存 vision token 无法从 CSV 拆开，但上述缺口会导致「前缀文本能读缓存、图及之后段落反复进 in_wo」。
-
-### 修复
-
-扩展 `applyPromptCache`（`src/lib/inference.ts`）：
-
--  tagged user：增加 `<tools-catalog>`、`<tool-policy>`、`<output-format>`
-- user `parts` 含 media：在 **最后一个 part**（含 `image`/`file`/`text`）加 `providerOptions.anthropic.cacheControl.ephemeral`
-- `ROLE.tool` 且 `experimentalContent` 含 media：在最后一个 experimental part 打 breakpoint
-
-### 约束（后续改 cache / 多模态时）
-
-- 不要假设「只有 `{ text }` 消息才需要 cache breakpoint」
-- 发版后用 Usage 看同会话 **fp 不变** 前提下 hit 是否回升；若仍 ~30% 且 in_wo 与大图 token 成比例，属 **上游 vision cache 能力**，不是 conversationId 事故
-
-### 验证
-
-```bash
-npm test   # inference.model.test.ts · cacheControl on catalog / image / tool media
-```
-
----
-
 ## 2026-09-03：`gpt-5.6-luna` 是 Other Models，要额度
 
 ### 结论
