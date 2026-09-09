@@ -45,7 +45,7 @@ curl -sS https://cursor2api.freetavily.deno.net/v1/chat/completions \
 | 流式 `stream: true` | 可用，但不逐字推 | 能收到 SSE；正文往往等这一轮结束后一次性出来。工具调用仍是一整块，不会拆碎 |
 | 工具调用 | 可用 | 和 OpenAI / Anthropic 一样：先拿到 `tool_calls` / `tool_use`，本地执行后再回传结果 |
 | `system` 提示 | 可用 | 同一会话里，系统提示只在第一轮生效 |
-| 上下文缓存 | 部分可用 | 网关不重启时，同一会话多轮能复用上下文、费用会低一些。一重启或重新发版，会话会断，缓存要从头开始。账单侧的缓存命中还没完整核对 |
+| 上下文缓存 | 部分可用 | 同一 `x-session-id`（或 `conversation_id`）且模型 / 工具 / 系统提示不变时，多轮会复用 Cursor 会话。Deno Deploy 用 KV 只记会话 id（不存聊天正文），换实例也能续上。工具执行（`tool_calls` 到回传 `role: tool`）必须在**同一进程**里完成；换实例后会把工具结果折进新的 user 消息继续 |
 | `usage` 用量 | 可用 | 响应里有 token 数。OpenAI 看 `prompt_tokens`、`completion_tokens`、`prompt_tokens_details.cached_tokens`；Anthropic 看 `input_tokens`、`output_tokens`、`cache_read_input_tokens`。模型正在等你跑工具时，这一枪的 usage 经常是 0，最终回复那一枪才带上整轮 |
 | Fast 档 | 可用 | 模型名带 `-fast`，或请求体写 `"fast": true`。`composer-2.5`、`grok-4.6` 默认是标准档，不是 Fast |
 | 思考强度 effort | 可用（仅 Grok） | 用 `reasoning_effort`（`low` / `medium` / `high` / `max`）。不写则按 `high`。Composer 没有这个档位 |

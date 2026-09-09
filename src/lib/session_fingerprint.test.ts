@@ -5,6 +5,7 @@ import { resolveSessionForRequest } from "./session.ts";
 import {
   appendOnlyMerge,
   CanonConflictError,
+  computeAgentRunFp,
   computeSessionFp,
   extractFCTR,
   prefixThroughFirstTool,
@@ -115,4 +116,22 @@ test("tools catalog change alters session_fp", async () => {
   const a = await computeSessionFp(body, tA as never, { pipelined: p.messages, rawMessages: msgs });
   const b = await computeSessionFp(body, tB as never, { pipelined: p.messages, rawMessages: msgs });
   assert.notEqual(a, b);
+});
+
+test("agent-run fp stays put when user text grows and moves on model/tools/system", async () => {
+  const t1 = [{ role: "user", content: "one" }];
+  const t2 = [{ role: "user", content: "one" }, { role: "assistant", content: "a" }, { role: "user", content: "two" }];
+  const env1 = await computeAgentRunFp(body, tools, { rawMessages: t1 });
+  const env2 = await computeAgentRunFp(body, tools, { rawMessages: t2 });
+  assert.equal(env1, env2);
+  const otherModel = await computeAgentRunFp({ model: "composer-2.5" }, tools, { rawMessages: t1 });
+  const otherTools = await computeAgentRunFp(body, [{ name: "g", description: "", parameters: { type: "object" } }], {
+    rawMessages: t1,
+  });
+  const otherSystem = await computeAgentRunFp(body, tools, {
+    rawMessages: [{ role: "system", content: "other" }, ...t1],
+  });
+  assert.notEqual(env1, otherModel);
+  assert.notEqual(env1, otherTools);
+  assert.notEqual(env1, otherSystem);
 });

@@ -327,20 +327,20 @@ function rejectRandomSession(): Response | undefined {
 export async function handleCloudChatCompletions(
   headers: Headers,
   body: Record<string, unknown>,
-  _kv: Kv,
+  kv: Kv,
   opts: { signal?: AbortSignal },
 ): Promise<Response> {
   const rejected = rejectRandomSession();
   if (rejected) return rejected;
   const tools = clientToolDefs(body, false);
-  return handleCustomToolChatCompletions({ headers, body, tools, signal: opts.signal });
+  return handleCustomToolChatCompletions({ headers, body, tools, kv, signal: opts.signal });
 }
 
 export async function handleCloudMessages(
   headers: Headers,
   body: Record<string, unknown>,
   requestId: string,
-  _kv: Kv,
+  kv: Kv,
   opts: { signal?: AbortSignal },
 ): Promise<Response> {
   if (resolveSessionMode() === "random") {
@@ -357,7 +357,7 @@ export async function handleCloudMessages(
     );
   }
   const tools = clientToolDefs(body, true);
-  return handleCustomToolMessages({ headers, body, tools, requestId, signal: opts.signal });
+  return handleCustomToolMessages({ headers, body, tools, requestId, kv, signal: opts.signal });
 }
 
 function streamCloudAsOpenAiSse(opts: {

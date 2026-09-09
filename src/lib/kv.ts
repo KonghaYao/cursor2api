@@ -26,6 +26,11 @@ export const KV_TTL_SECONDS = 300;
 /** Cloud session → agent bindings. Cursor agents outlive JWT exchange cache. */
 export const CLOUD_AGENT_KV_TTL_SECONDS = 7 * 24 * 60 * 60;
 
+/** AgentService conversation id + compact checkpoint for Deno isolate hops. */
+export const AGENT_RUN_KV_TTL_SECONDS = 24 * 60 * 60;
+/** Keep the KV value small: ids always; conversationState only under this cap. */
+export const AGENT_RUN_STATE_MAX_BYTES = 24 * 1024;
+
 /** Seconds to store in KV; capped at `cap` (default {@link KV_TTL_SECONDS}). */
 export function kvEntryTtlSeconds(preferred?: number, cap = KV_TTL_SECONDS): number {
   const max = cap > 0 ? cap : KV_TTL_SECONDS;
@@ -58,6 +63,56 @@ export async function kvSetCloudAgent(kv: Kv, tenant: string, sessionId: string,
 
 export async function kvRemoveCloudAgent(kv: Kv, tenant: string, sessionId: string): Promise<void> {
   await kv.removeItem(cloudAgentKvKey(tenant, sessionId));
+}
+
+export type AgentRunBinding = {
+  fp: string;
+  conversationId: string;
+  agentSessionId: string;
+  conversationState?: Record<string, unknown>;
+};
+
+export function agentRunKvKey(tenant: string, sessionId: string): string {
+  return `agent-run:${tenant}:${sessionId}`;
+}
+
+function utf8Bytes(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+export function compactAgentRunBinding(row: AgentRunBinding): AgentRunBinding {
+  const base: AgentRunBinding = {
+    fp: row.fp,
+    conversationId: row.conversationId,
+    agentSessionId: row.agentSessionId,
+  };
+  if (!row.conversationState) return base;
+  const withState = { ...base, conversationState: row.conversationState };
+  try {
+    if (utf8Bytes(JSON.stringify(withState)) <= AGENT_RUN_STATE_MAX_BYTES) return withState;
+  } catch {
+    /* circular / non-JSON */
+  }
+  return base;
+}
+
+export async function kvGetAgentRun(kv: Kv, tenant: string, sessionId: string, fp: string): Promise<AgentRunBinding | null> {
+  const row = await kv.getItem<AgentRunBinding>(agentRunKvKey(tenant, sessionId));
+  if (!row || typeof row.fp !== "string" || typeof row.conversationId !== "string" || typeof row.agentSessionId !== "string") {
+    return null;
+  }
+  if (row.fp !== fp) return null;
+  if (row.conversationState != null && (typeof row.conversationState !== "object" || Array.isArray(row.conversationState))) {
+    return { fp: row.fp, conversationId: row.conversationId, agentSessionId: row.agentSessionId };
+  }
+  return row;
+}
+
+export async function kvSetAgentRun(kv: Kv, tenant: string, sessionId: string, row: AgentRunBinding): Promise<void> {
+  await kv.setItem(agentRunKvKey(tenant, sessionId), compactAgentRunBinding(row), {
+    ttl: AGENT_RUN_KV_TTL_SECONDS,
+    cap: AGENT_RUN_KV_TTL_SECONDS,
+  });
 }
 
 /** Seconds until JWT refresh (60s before exp). */

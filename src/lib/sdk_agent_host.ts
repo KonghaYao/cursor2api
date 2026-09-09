@@ -89,8 +89,8 @@ export function createSdkAgentHost(opts?: {
   return {
     async create(createOpts) {
       const accessToken = await resolveAccessToken(createOpts.apiKey, exchange);
-      const agentId = randomId();
-      const conversationId = randomId();
+      const agentId = createOpts.agentSessionId || randomId();
+      const conversationId = createOpts.conversationId || randomId();
       const selection = gatewayAgentModelSelection(createOpts.model, {
         fast: createOpts.fast,
         reasoningEffort: createOpts.reasoningEffort,
@@ -98,7 +98,7 @@ export function createSdkAgentHost(opts?: {
       const cwd = createOpts.cwd || readEnv("GATEWAY_AGENT_CWD") || "/tmp";
       const tools = specsFromCustomTools(createOpts.customTools);
       const blobs = new Map<string, string>();
-      let conversationState: JsonObject | undefined;
+      let conversationState: JsonObject | undefined = createOpts.conversationState;
       let closed = false;
 
       const handle: CustomToolAgentHandle = {
@@ -121,6 +121,7 @@ export function createSdkAgentHost(opts?: {
             conversationState,
             onCheckpoint: (state) => {
               conversationState = state;
+              createOpts.onCheckpoint?.(state);
             },
           });
           return { wait: () => run };

@@ -71,6 +71,8 @@ Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。不要为了半
 
 Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里的 legacy abort）。**不要**把这个 signal 接到 AgentService 双工或 `settleCustomTools` 上，否则第一枪 `tool_calls` 返回后 park 被掐掉，第二枪 `role: tool` 会 409。`deno.json` 开 `--unstable-no-legacy-abort`。若 isolate / 流已经没了，跟进改为把 tool results 写成新 user prompt，而不是 409。
 
+**会话 id（Deno isolate / serverless）：** `conversationId` = `tenant:sha256(clientSessionId ⟂ agentRunFp)`。`agentRunFp` = model / effort / flags / tools / system（**不含** messages 前缀；AgentService 只送最新 user，上文在 Cursor `conversationState`）。`liveTurns` 只 park `execute()`（键 `tenant:sessionId:fp`）。KV `agent-run:${tenant}:${sessionId}` 只存 `{fp, conversationId, agentSessionId, conversationState?}`，TTL 24h，checkpoint 超 `AGENT_RUN_STATE_MAX_BYTES`（24KiB）则丢掉 state 只留 ids。**不要**把 messages / canon 写进 KV。换 isolate 后 `role: tool` 仍走 park_miss flatten。
+
 ### 不要做的
 
 - 把 tools 改回 `InferenceService/Stream`
@@ -88,6 +90,8 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 - 把 HTTP `request.signal` 绑到 parked AgentService/Run 上（Deno.serve 成功响应会 abort，第二枪 `role: tool` 变 409）
 - 给 AgentService 只送 `modelId: composer-2.5` 而不带 `parameters.fast=false`（上游默认 Fast，Team Usage 记成 `composer-2.5-fast`）
 - 给 AgentService 的 Grok 只剥 `-fast`、不传 `parameters.effort`（思考强度会掉回上游默认，而不是客户端的 `reasoning_effort` / id 里的 `low|medium|high|xhigh`）
+- 给 AgentService 每轮 `randomId()` 当 conversationId（isolate 一跳就丢 cache；用 `tenant:sha256(sessionId ⟂ agentRunFp)`，fp **不要**混进 pending transcript）
+- 把 messages / canon / 整段 transcript 写进 `agent-run:` KV（只允许 ids + 可选小 checkpoint）
 
 ---
 
@@ -324,7 +328,7 @@ python3 scripts/analyze_team_usage.py team-usage-events-*.csv -o reports/usage-<
 | 证据 | 本机探针 Stream 信封 `ERROR_NOT_LOGGED_IN`；同 key `GET https://api.cursor.com/v1/models` 200；`AgentService/Run` 可聊 |
 | 根因结论 | **Cursor 上游**：Inference 这条 RPC 对 Dashboard API key 不再当已登录会话。不是网关把 model id / session_fp 弄丢。 |
 | 状态 | **mitigated**：聊天改 `agent.v1.AgentService/Run` + 进程内 customTools（`684da64` / `454122d`）。Inference 仍死，禁止加回。 |
-| 续记 | 2026-09-09：实机 Deno `8789` OpenAI probe 7/7、Anthropic `system`、`grok-4.6-fast` PONG。上游另拒 `excludeWorkspaceContext` 与 `customSystemPrompt`（`--system-prompt`）。AgentService 会话 id 仍是进程内 random，**未**绑 `tenant:session_fp`；Team Usage Cache Read 尚未用 CSV 验证。 |
+| 续记 | 2026-09-09：实机 Deno `8789` OpenAI probe 7/7、Anthropic `system`、`grok-4.6-fast` PONG。上游另拒 `excludeWorkspaceContext` 与 `customSystemPrompt`（`--system-prompt`）。AgentService `conversationId` = `tenant:sha256(x-session-id ⟂ agentRunFp)`（env fp，不含 messages 前缀），KV `agent-run:` 只绑 ids（可带小 checkpoint）；`execute()` park 仍必须同 isolate。Team Usage Cache Read 尚未用 CSV 验证。 |
 
 ### 成本归因（简表）
 
@@ -467,7 +471,7 @@ L1 TTL 与 KV 一致：条目最长 **5 分钟**，且 JWT `exp` 前 **60s** 失
 
 ### 约束（后续改鉴权时）
 
-- **不要**把 `session_fp`、canon、messages 写回 KV（已删除的 canon 路径勿复活）。
+- **不要**把 canon、messages 写回 KV（已删除的 canon 路径勿复活）。聊天路径允许 `agent-run:` 小绑定：`{fp, conversationId, agentSessionId, conversationState?}`，不要把 transcript 塞进去。
 - **不要**在 `crsr_` 路径去掉 L1 又对每次请求强制 exchange（会打满 Cursor 换票与付费 KV）。
 - Cloudflare：KV 仅作 **L2**；不绑 KV 时仍有 L1 + 内存 `createMemoryKv()`。
 
@@ -517,7 +521,7 @@ Team Usage：`team-usage-events-29803137-2026-09-01 (2).csv`（norin439，Compos
 |------|------|
 | `session_fp` | SHA256(modelId ⟂ effort ⟂ flags ⟂ tools ⟂ system ⟂ pipeline[0..第一条 tool]) |
 | 上游会话 id | **`tenant:session_fp`**，与 `x-session-id` 一致 |
-| KV | **不存** canon / 不靠 KV 续会话 |
+| KV | Inference **不存** canon；AgentService 只存 `agent-run:` 小绑定（ids ± compact checkpoint），不靠 KV park `execute()` |
 | 换轨 | fg 变 = 新 thread = 新 conversationId（cache 从 0 再积） |
 
 不要再假设「Cursor 只按 messages 前缀 cache、id 可以乱跳」。

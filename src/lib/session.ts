@@ -1,5 +1,5 @@
-import { randomId } from "./bytes.ts";
-import { computeSessionFp } from "./session_fingerprint.ts";
+import { randomId, sha256Hex } from "./bytes.ts";
+import { computeSessionFp, FINGERPRINT_RS } from "./session_fingerprint.ts";
 import {
   runCanonicalMessagePipeline,
   runCanonicalMessagePipelineFromCursor,
@@ -100,4 +100,26 @@ export async function resolveSessionForRequest(
     session_fp,
     canon_len: pipelined.messages.length,
   };
+}
+
+export type AgentRunIds = {
+  conversationId: string;
+  agentSessionId: string;
+};
+
+/**
+ * Cursor AgentService conversation id for serverless: unique per API key,
+ * client session, and session_fp (model / tools / system / first-tool prefix).
+ * Same isolate or another Deno isolate with the same triple maps to the same id.
+ */
+export async function agentRunIds(tenant: string, sessionId: string, sessionFp: string): Promise<AgentRunIds> {
+  const digest = await sha256Hex(`${sessionId}${FINGERPRINT_RS}${sessionFp}`);
+  return {
+    conversationId: `${tenant}:${digest}`,
+    agentSessionId: digest,
+  };
+}
+
+export async function agentRunConversationId(tenant: string, sessionId: string, sessionFp: string): Promise<string> {
+  return (await agentRunIds(tenant, sessionId, sessionFp)).conversationId;
 }

@@ -6,13 +6,30 @@
  *
  * Built-in agent tools stay off except the `mcp` capability group, which is
  * required for customTools to be offered. An empty allowlist also kills MCP.
+ *
+ * Conversation id is `tenant:sha256(x-session-id ⟂ agentRunFp)` and can be
+ * restored from KV (`agent-run:`) after a Deno isolate hop. `liveTurns` only
+ * parks in-process `execute()`; it is not a serverless session store.
  */
 import { encodeSseData, encodeSseEvent, jsonResponse, sseStreamResponse } from "./bytes.ts";
 import { CloudChatError } from "./cloud_errors.ts";
 import { cloudApiKeyFromHeaders } from "./cloud_agents.ts";
 import { credentialFingerprint } from "./auth.ts";
-import { extractFastMode, extractReasoningEffort, toAnthropicError, toAnthropicUsage, toOpenAIUsage, normalizeCursorUsage } from "./inference.ts";
+import {
+  anthropicToolsToCursor,
+  extractFastMode,
+  extractReasoningEffort,
+  flattenContent,
+  openaiToolsToCursor,
+  toAnthropicError,
+  toAnthropicUsage,
+  toOpenAIUsage,
+  normalizeCursorUsage,
+} from "./inference.ts";
 import { resolveSessionKvId } from "./cloud_session.ts";
+import { kvGetAgentRun, kvSetAgentRun, type Kv } from "./kv.ts";
+import { agentRunIds, resolveSessionMode } from "./session.ts";
+import { computeAgentRunFp } from "./session_fingerprint.ts";
 import {
   clientToolsToAnthropic,
   clientToolsToOpenAi,
@@ -33,7 +50,6 @@ import {
 import { gatewayAgentModelSelection, type AgentInlineImage, type AgentTurnUsage } from "./agent_json.ts";
 import { openaiContentToCursorParts } from "./content_parts.ts";
 import { defaultSdkAgentHost } from "./sdk_agent_host.ts";
-import { resolveSessionMode } from "./session.ts";
 
 export type SdkCustomToolMap = ReturnType<typeof toSdkCustomTools>;
 
@@ -193,15 +209,21 @@ export type CustomToolAgentHandle = {
   close: () => Promise<void>;
 };
 
+export type CustomToolAgentCreateOpts = {
+  apiKey: string;
+  model: unknown;
+  fast?: boolean;
+  reasoningEffort?: unknown;
+  customTools: SdkCustomToolMap;
+  cwd?: string;
+  conversationId?: string;
+  agentSessionId?: string;
+  conversationState?: Record<string, unknown>;
+  onCheckpoint?: (state: Record<string, unknown>) => void;
+};
+
 export type CustomToolAgentHost = {
-  create: (opts: {
-    apiKey: string;
-    model: unknown;
-    fast?: boolean;
-    reasoningEffort?: unknown;
-    customTools: SdkCustomToolMap;
-    cwd?: string;
-  }) => Promise<CustomToolAgentHandle>;
+  create: (opts: CustomToolAgentCreateOpts) => Promise<CustomToolAgentHandle>;
 };
 
 type LiveTurn = {
@@ -227,8 +249,47 @@ export function customToolChatClearForTests(): void {
   liveTurns.clear();
 }
 
-function liveKey(tenant: string, sessionId: string): string {
-  return `${tenant}:${sessionId}`;
+function liveKey(tenant: string, sessionId: string, sessionFp: string): string {
+  return `${tenant}:${sessionId}:${sessionFp}`;
+}
+
+function closeStaleLiveTurns(tenant: string, sessionId: string, keepKey: string): void {
+  const prefix = `${tenant}:${sessionId}:`;
+  for (const [key, live] of [...liveTurns.entries()]) {
+    if (!key.startsWith(prefix) || key === keepKey) continue;
+    void live.agent.close();
+    liveTurns.delete(key);
+  }
+}
+
+/** Anthropic `thinking.budget_tokens` → fingerprint `reasoning_effort` (same bands as /v1/messages). */
+function foldAnthropicReasoningEffort(body: Record<string, unknown>): void {
+  if (body.reasoning_effort != null && String(body.reasoning_effort).trim() !== "") return;
+  const thinking = body.thinking as Record<string, unknown> | undefined;
+  if (!thinking || thinking.type === "disabled") return;
+  const budget = Number(thinking.budget_tokens ?? thinking.budgetTokens);
+  if (!Number.isFinite(budget)) {
+    if (thinking.type === "enabled" || thinking.type === "adaptive") body.reasoning_effort = "high";
+    return;
+  }
+  if (budget < 4_096) body.reasoning_effort = "low";
+  else if (budget < 12_000) body.reasoning_effort = "medium";
+  else if (budget < 32_000) body.reasoning_effort = "high";
+  else body.reasoning_effort = "xhigh";
+}
+
+async function sessionFpForCustomTools(
+  body: Record<string, unknown>,
+  protocol: "openai" | "anthropic",
+): Promise<string> {
+  if (protocol === "anthropic") {
+    foldAnthropicReasoningEffort(body);
+    return computeAgentRunFp(body, anthropicToolsToCursor(body.tools), {
+      foldSystem: flattenContent(body.system),
+    });
+  }
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  return computeAgentRunFp(body, openaiToolsToCursor(body.tools), { rawMessages: messages });
 }
 
 function readEnv(name: string): string | undefined {
@@ -300,6 +361,8 @@ async function startCustomToolTurn(opts: {
   headers: Headers;
   tools: CustomToolDef[];
   signal?: AbortSignal;
+  kv?: Kv;
+  protocol?: "openai" | "anthropic";
 }): Promise<{ live: LiveTurn; session: ClientToolSession; sessionId: string; continued: boolean }> {
   const tenant = await credentialFingerprint(opts.apiKey);
   const resolved = await resolveSessionKvId(opts.body, opts.headers);
@@ -307,10 +370,13 @@ async function startCustomToolTurn(opts: {
     throw new CloudChatError("Client custom tools require a stable x-session-id / conversation_id (not SESSION_MODE=random).", 400);
   }
   const sessionId = resolved.sessionId;
+  const protocol = opts.protocol ?? "openai";
+  const sessionFp = await sessionFpForCustomTools(opts.body, protocol);
   const session = upsertClientToolSession(tenant, sessionId, opts.tools);
   const messages = Array.isArray(opts.body.messages) ? opts.body.messages : [];
   const toolResults = extractClientToolResults(messages);
-  const key = liveKey(tenant, sessionId);
+  const key = liveKey(tenant, sessionId, sessionFp);
+  closeStaleLiveTurns(tenant, sessionId, key);
   const existing = liveTurns.get(key);
   const canResumePark =
     Boolean(existing) &&
@@ -326,6 +392,21 @@ async function startCustomToolTurn(opts: {
 
   if (session.parked.length) failParkedClientTools(session, "cancelled: new user turn");
 
+  const binding = opts.kv ? await kvGetAgentRun(opts.kv, tenant, sessionId, sessionFp) : null;
+  const ids = binding
+    ? { conversationId: binding.conversationId, agentSessionId: binding.agentSessionId }
+    : await agentRunIds(tenant, sessionId, sessionFp);
+  const checkpoint: { state?: Record<string, unknown> } = { state: binding?.conversationState };
+  const persistBinding = async (state?: Record<string, unknown>) => {
+    if (!opts.kv) return;
+    await kvSetAgentRun(opts.kv, tenant, sessionId, {
+      fp: sessionFp,
+      conversationId: ids.conversationId,
+      agentSessionId: ids.agentSessionId,
+      conversationState: state,
+    });
+  };
+
   const host = await resolveHost();
   const customTools = toSdkCustomTools(session);
   const agent = existing?.agent ?? (await host.create({
@@ -334,11 +415,19 @@ async function startCustomToolTurn(opts: {
     fast: extractFastMode(opts.body),
     reasoningEffort: extractReasoningEffort(opts.body),
     customTools,
+    conversationId: ids.conversationId,
+    agentSessionId: ids.agentSessionId,
+    conversationState: checkpoint.state,
+    onCheckpoint: (state) => {
+      checkpoint.state = state;
+      void persistBinding(state);
+    },
   }));
+  const hadPriorTurn = Boolean(existing) || Boolean(binding);
   const toolFollowUp = lastTurnIsToolResult(messages) && toolResults.length > 0;
   if (toolFollowUp) {
     console.log(
-      `  custom_tools park_miss session=${sessionId.slice(0, 24)} existing=${Boolean(existing)} done=${Boolean(existing?.done)} — continuing as follow-up prompt`,
+      `  custom_tools park_miss session=${sessionId.slice(0, 24)} existing=${Boolean(existing)} kv=${Boolean(binding)} done=${Boolean(existing?.done)} — continuing as follow-up prompt`,
     );
   }
   const prompt = toolFollowUp
@@ -349,7 +438,7 @@ async function startCustomToolTurn(opts: {
               body: opts.body,
               tools: opts.tools,
               messages,
-              followUp: false,
+              followUp: hadPriorTurn,
             }),
         composeToolResultPrompt(toolResults),
       ]
@@ -359,9 +448,10 @@ async function startCustomToolTurn(opts: {
         body: opts.body,
         tools: opts.tools,
         messages,
-        followUp: Boolean(existing),
+        followUp: hadPriorTurn,
       });
   const images = toolFollowUp ? [] : await lastUserAgentImages(messages);
+  if (!existing) await persistBinding(checkpoint.state);
   const run = await agent.send(prompt, images.length ? { images } : undefined);
   const live: LiveTurn = {
     agent,
@@ -378,8 +468,10 @@ async function startCustomToolTurn(opts: {
     live.thinking = result.thinking;
     live.error = result.error;
     live.usage = result.usage;
+    void persistBinding(checkpoint.state);
   });
-  console.log(`  custom_tools ${existing ? "follow" : "create"} session=${sessionId.slice(0, 24)} agent=${agent.agentId.slice(0, 14)} tools=${opts.tools.length} images=${images.length}`);
+  const origin = existing ? "follow" : binding ? "kv_hit" : "create";
+  console.log(`  custom_tools ${origin} session=${sessionId.slice(0, 24)} agent=${agent.agentId.slice(0, 14)} tools=${opts.tools.length} images=${images.length}`);
   return { live, session, sessionId, continued: false };
 }
 
@@ -465,9 +557,18 @@ export async function handleCustomToolChatCompletions(opts: {
   body: Record<string, unknown>;
   tools: CustomToolDef[];
   signal?: AbortSignal;
+  kv?: Kv;
 }): Promise<Response> {
   const apiKey = cloudApiKeyFromHeaders(opts.headers);
-  const started = await startCustomToolTurn({ apiKey, body: opts.body, headers: opts.headers, tools: opts.tools, signal: opts.signal });
+  const started = await startCustomToolTurn({
+    apiKey,
+    body: opts.body,
+    headers: opts.headers,
+    tools: opts.tools,
+    signal: opts.signal,
+    kv: opts.kv,
+    protocol: "openai",
+  });
   const agentId = started.live.agent.agentId;
   if (opts.body.stream) {
     return streamCustomOpenAi({ ...started, model: opts.body.model, agentId, signal: opts.signal });
@@ -512,9 +613,18 @@ export async function handleCustomToolMessages(opts: {
   tools: CustomToolDef[];
   requestId: string;
   signal?: AbortSignal;
+  kv?: Kv;
 }): Promise<Response> {
   const apiKey = cloudApiKeyFromHeaders(opts.headers);
-  const started = await startCustomToolTurn({ apiKey, body: opts.body, headers: opts.headers, tools: opts.tools, signal: opts.signal });
+  const started = await startCustomToolTurn({
+    apiKey,
+    body: opts.body,
+    headers: opts.headers,
+    tools: opts.tools,
+    signal: opts.signal,
+    kv: opts.kv,
+    protocol: "anthropic",
+  });
   const agentId = started.live.agent.agentId;
   if (opts.body.stream) {
     return streamCustomAnthropic({ ...started, model: opts.body.model, agentId, requestId: opts.requestId, signal: opts.signal });

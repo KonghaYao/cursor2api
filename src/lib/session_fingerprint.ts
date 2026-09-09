@@ -117,14 +117,20 @@ export async function computeSessionFp(
   return sha256Hex(payload);
 }
 
-/** @deprecated use computeSessionFp */
-export async function computeEnvFp(
+/**
+ * AgentService thread identity (model / effort / flags / tools / system).
+ * Does **not** hash the message prefix: AgentService only sends the latest
+ * user turn and Cursor holds the rest in conversationState. Including the
+ * pending transcript would mint a new conversationId on every user message
+ * (and close the in-process agent) before the first tool call.
+ */
+export async function computeAgentRunFp(
   body: Record<string, unknown>,
   tools: CursorTool[],
-  opts: { rawMessages?: unknown[]; baseMessages?: CursorMessage[]; foldSystem?: string } = {},
+  opts: { rawMessages?: unknown[]; foldSystem?: string } = {},
 ): Promise<string> {
   return computeSessionFp(body, tools, {
-    pipelined: opts.baseMessages ?? [],
+    pipelined: [],
     rawMessages: opts.rawMessages,
     foldSystem: opts.foldSystem,
   });

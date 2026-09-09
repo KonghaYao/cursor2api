@@ -9,6 +9,8 @@ import {
   setCustomToolAgentHostForTests,
 } from "./custom_tool_chat.ts";
 import type { AgentInlineImage } from "./agent_json.ts";
+import { createMemoryKv } from "./kv.ts";
+import type { CustomToolAgentCreateOpts } from "./custom_tool_chat.ts";
 
 afterEach(() => {
   customToolsClearForTests();
@@ -132,4 +134,173 @@ test("Anthropic image blocks are forwarded as AgentService selectedImages", asyn
   assert.equal(res.status, 200);
   assert.equal(sent?.length, 1);
   assert.equal(sent?.[0]?.data, PNG_B64);
+});
+
+test("AgentService conversationId survives an isolate hop via KV", async () => {
+  const kv = createMemoryKv();
+  const creates: CustomToolAgentCreateOpts[] = [];
+  const prompts: string[] = [];
+  setCustomToolAgentHostForTests({
+    async create(opts) {
+      creates.push(opts);
+      return {
+        agentId: opts.agentSessionId || "agent-hop",
+        async send(prompt) {
+          prompts.push(prompt);
+          return { wait: async () => ({ text: "ok" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const headers = new Headers({ authorization: "Bearer crsr_test", "x-session-id": "sess-hop" });
+  const firstBody = {
+    model: "composer-2.5",
+    messages: [
+      { role: "system", content: "be brief" },
+      { role: "user", content: "hi" },
+    ],
+  };
+  const first = await handleCustomToolChatCompletions({ headers, body: firstBody, tools: [], kv });
+  assert.equal(first.status, 200);
+  assert.equal(creates.length, 1);
+  assert.ok(creates[0]?.conversationId);
+  assert.match(prompts[0] || "", /<system>/);
+
+  customToolChatClearForTests();
+  setCustomToolAgentHostForTests({
+    async create(opts) {
+      creates.push(opts);
+      return {
+        agentId: opts.agentSessionId || "agent-hop-2",
+        async send(prompt) {
+          prompts.push(prompt);
+          return { wait: async () => ({ text: "ok2" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const second = await handleCustomToolChatCompletions({
+    headers,
+    body: {
+      model: "composer-2.5",
+      messages: [
+        { role: "system", content: "be brief" },
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "again" },
+      ],
+    },
+    tools: [],
+    kv,
+  });
+  assert.equal(second.status, 200);
+  assert.equal(creates.length, 2);
+  assert.equal(creates[1]?.conversationId, creates[0]?.conversationId);
+  assert.equal(creates[1]?.agentSessionId, creates[0]?.agentSessionId);
+  assert.doesNotMatch(prompts[1] || "", /<system>/);
+  assert.match(prompts[1] || "", /again/);
+});
+
+test("same isolate keeps two client sessions on different AgentService conversation ids", async () => {
+  const kv = createMemoryKv();
+  const ids: string[] = [];
+  setCustomToolAgentHostForTests({
+    async create(opts) {
+      ids.push(String(opts.conversationId));
+      return {
+        agentId: opts.agentSessionId || "agent",
+        async send() {
+          return { wait: async () => ({ text: "ok" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const body = { model: "composer-2.5", messages: [{ role: "user", content: "hi" }] };
+  await handleCustomToolChatCompletions({
+    headers: new Headers({ authorization: "Bearer crsr_test", "x-session-id": "sess-a" }),
+    body,
+    tools: [],
+    kv,
+  });
+  await handleCustomToolChatCompletions({
+    headers: new Headers({ authorization: "Bearer crsr_test", "x-session-id": "sess-b" }),
+    body,
+    tools: [],
+    kv,
+  });
+  assert.equal(ids.length, 2);
+  assert.notEqual(ids[0], ids[1]);
+});
+
+test("model change starts a new AgentService conversation", async () => {
+  const kv = createMemoryKv();
+  const ids: string[] = [];
+  setCustomToolAgentHostForTests({
+    async create(opts) {
+      ids.push(String(opts.conversationId));
+      return {
+        agentId: opts.agentSessionId || "agent",
+        async send() {
+          return { wait: async () => ({ text: "ok" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const headers = new Headers({ authorization: "Bearer crsr_test", "x-session-id": "sess-model" });
+  await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [{ role: "user", content: "hi" }] },
+    tools: [],
+    kv,
+  });
+  await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5-fast", messages: [{ role: "user", content: "hi" }] },
+    tools: [],
+    kv,
+  });
+  assert.equal(ids.length, 2);
+  assert.notEqual(ids[0], ids[1]);
+});
+
+test("same session follow-up reuses the in-process agent", async () => {
+  let creates = 0;
+  setCustomToolAgentHostForTests({
+    async create(opts) {
+      creates += 1;
+      return {
+        agentId: opts.agentSessionId || "agent-reuse",
+        async send() {
+          return { wait: async () => ({ text: "ok" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const kv = createMemoryKv();
+  const headers = new Headers({ authorization: "Bearer crsr_test", "x-session-id": "sess-reuse" });
+  await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [{ role: "user", content: "one" }] },
+    tools: [],
+    kv,
+  });
+  await handleCustomToolChatCompletions({
+    headers,
+    body: {
+      model: "composer-2.5",
+      messages: [
+        { role: "user", content: "one" },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "two" },
+      ],
+    },
+    tools: [],
+    kv,
+  });
+  assert.equal(creates, 1);
 });

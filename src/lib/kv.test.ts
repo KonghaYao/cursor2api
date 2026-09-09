@@ -1,6 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { KV_TTL_SECONDS, CLOUD_AGENT_KV_TTL_SECONDS, cloudAgentKvKey, createMemoryKv, kvEntryTtlSeconds, kvGetCloudAgent, kvSetCloudAgent } from "./kv.ts";
+import {
+  AGENT_RUN_STATE_MAX_BYTES,
+  CLOUD_AGENT_KV_TTL_SECONDS,
+  KV_TTL_SECONDS,
+  compactAgentRunBinding,
+  cloudAgentKvKey,
+  createMemoryKv,
+  kvEntryTtlSeconds,
+  kvGetAgentRun,
+  kvGetCloudAgent,
+  kvSetAgentRun,
+  kvSetCloudAgent,
+} from "./kv.ts";
 
 test("kvEntryTtlSeconds caps at 5 minutes", () => {
   assert.equal(KV_TTL_SECONDS, 300);
@@ -22,4 +34,29 @@ test("cloud agent KV binding round-trips and ignores garbage", async () => {
   await kv.removeItem(cloudAgentKvKey("t1", "sess-a"));
   await kv.setItem(cloudAgentKvKey("t1", "sess-a"), { agentId: "not-an-agent" });
   assert.equal(await kvGetCloudAgent(kv, "t1", "sess-a"), null);
+});
+
+test("agent-run KV binding round-trips and ignores fp mismatch", async () => {
+  const kv = createMemoryKv();
+  await kvSetAgentRun(kv, "t1", "sess-a", {
+    fp: "fp-1",
+    conversationId: "t1:abc",
+    agentSessionId: "abc",
+    conversationState: { cursor: 1 },
+  });
+  const hit = await kvGetAgentRun(kv, "t1", "sess-a", "fp-1");
+  assert.equal(hit?.conversationId, "t1:abc");
+  assert.deepEqual(hit?.conversationState, { cursor: 1 });
+  assert.equal(await kvGetAgentRun(kv, "t1", "sess-a", "fp-other"), null);
+});
+
+test("compactAgentRunBinding drops oversized conversationState", () => {
+  const row = compactAgentRunBinding({
+    fp: "fp",
+    conversationId: "c",
+    agentSessionId: "a",
+    conversationState: { blob: "x".repeat(AGENT_RUN_STATE_MAX_BYTES) },
+  });
+  assert.equal(row.conversationState, undefined);
+  assert.equal(row.conversationId, "c");
 });

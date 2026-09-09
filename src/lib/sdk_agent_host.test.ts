@@ -251,3 +251,35 @@ async function waitFor<T>(fn: () => T | undefined, timeoutMs = 1000): Promise<T>
   }
   throw new Error("timed out");
 }
+
+test("in-repo host reuses caller conversationId and conversationState", async () => {
+  const duplex = new InteractiveDuplex();
+  duplex.onSend = (message) => {
+    if (field(message, "runRequest")) {
+      duplex.push({ interactionUpdate: { textDelta: { text: "PONG" } } });
+      duplex.push({ interactionUpdate: { turnEnded: {} } });
+    }
+  };
+  const host = createSdkAgentHost({
+    openRun: async (opts) => {
+      assert.equal(opts.conversationId, "tenant:fixed-conversation");
+      return duplex;
+    },
+    exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+  });
+  const agent = await host.create({
+    apiKey: "crsr_test",
+    model: "composer-2.5",
+    customTools: {},
+    conversationId: "tenant:fixed-conversation",
+    agentSessionId: "fixed-agent",
+    conversationState: { cursor: 7 },
+  });
+  assert.equal(agent.agentId, "fixed-agent");
+  await (await agent.send("ping")).wait();
+  const run = asObject(field(duplex.sent[0], "runRequest"));
+  assert.equal(run?.conversationId, "tenant:fixed-conversation");
+  assert.equal(run?.agentSessionId, "fixed-agent");
+  assert.deepEqual(run?.conversationState, { cursor: 7 });
+  await agent.close();
+});

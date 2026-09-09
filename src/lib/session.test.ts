@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isNewConversationMessages, resolveSessionForRequest, resolveSessionMode } from "./session.ts";
+import { agentRunConversationId, isNewConversationMessages, resolveSessionForRequest, resolveSessionMode } from "./session.ts";
 
 test("isNewConversationMessages ignores system", () => {
   assert.equal(
@@ -45,4 +45,17 @@ test("fingerprint session_fp is stable after first tool via resolveSessionForReq
   assert.equal(r1.upstreamConversationId, r1.session_fp);
   assert.equal(r2.upstreamConversationId, r1.session_fp);
   assert.ok(r2.canon_len > r1.canon_len);
+});
+
+test("agentRunConversationId is stable per tenant+session+fp and splits clients", async () => {
+  const a = await agentRunConversationId("tenant-a", "sess-1", "fp-1");
+  const b = await agentRunConversationId("tenant-a", "sess-1", "fp-1");
+  const otherSess = await agentRunConversationId("tenant-a", "sess-2", "fp-1");
+  const otherFp = await agentRunConversationId("tenant-a", "sess-1", "fp-2");
+  const otherTenant = await agentRunConversationId("tenant-b", "sess-1", "fp-1");
+  assert.equal(a, b);
+  assert.match(a, /^tenant-a:[0-9a-f]{64}$/);
+  assert.notEqual(a, otherSess);
+  assert.notEqual(a, otherFp);
+  assert.notEqual(a, otherTenant);
 });
