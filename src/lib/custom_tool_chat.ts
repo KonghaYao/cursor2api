@@ -11,7 +11,7 @@ import { encodeSseData, encodeSseEvent, jsonResponse, sseStreamResponse } from "
 import { CloudChatError } from "./cloud_errors.ts";
 import { cloudApiKeyFromHeaders } from "./cloud_agents.ts";
 import { credentialFingerprint } from "./auth.ts";
-import { extractFastMode, toAnthropicError, toAnthropicUsage, toOpenAIUsage, normalizeCursorUsage } from "./inference.ts";
+import { extractFastMode, extractReasoningEffort, toAnthropicError, toAnthropicUsage, toOpenAIUsage, normalizeCursorUsage } from "./inference.ts";
 import { resolveSessionKvId } from "./cloud_session.ts";
 import {
   clientToolsToAnthropic,
@@ -44,13 +44,14 @@ export function sdkLocalAgentCreateOptions(opts: {
   apiKey: string;
   model: unknown;
   fast?: boolean;
+  reasoningEffort?: unknown;
   customTools: SdkCustomToolMap;
   cwd?: string;
 }): Record<string, unknown> {
   const cwd = opts.cwd || readEnv("GATEWAY_AGENT_CWD") || "/tmp";
   const selection = gatewayAgentModelSelection(opts.model, {
     fast: opts.fast,
-    hasClientTools: Object.keys(opts.customTools).length > 0,
+    reasoningEffort: opts.reasoningEffort,
   });
   return {
     apiKey: opts.apiKey,
@@ -151,6 +152,7 @@ export type CustomToolAgentHost = {
     apiKey: string;
     model: unknown;
     fast?: boolean;
+    reasoningEffort?: unknown;
     customTools: SdkCustomToolMap;
     cwd?: string;
   }) => Promise<CustomToolAgentHandle>;
@@ -282,6 +284,7 @@ async function startCustomToolTurn(opts: {
     apiKey: opts.apiKey,
     model: opts.body.model,
     fast: extractFastMode(opts.body),
+    reasoningEffort: extractReasoningEffort(opts.body),
     customTools,
   }));
   const toolFollowUp = lastTurnIsToolResult(messages) && toolResults.length > 0;

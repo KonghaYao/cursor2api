@@ -22,7 +22,8 @@ import {
   openaiToolsToCustom,
   type CustomToolDef,
 } from "./custom_tools.ts";
-import { toAnthropicError } from "./inference.ts";
+import { extractFastMode, extractReasoningEffort, toAnthropicError } from "./inference.ts";
+import { gatewayAgentModelSelection } from "./agent_json.ts";
 import type { Kv } from "./kv.ts";
 import { resolveSessionMode } from "./session.ts";
 
@@ -181,20 +182,16 @@ export function extractRepos(body: Record<string, unknown>): CloudRepo[] | undef
 export function cloudModelSelection(
   model: unknown,
   body?: Record<string, unknown>,
-  hasClientTools = false,
 ): { id: string; params?: Array<{ id: string; value: string }> } | undefined {
   const id = String(model ?? "").trim();
   if (!id || id === "default" || id === "auto") return undefined;
-  const suffixFast = /(-fast)$/i.test(id) || body?.fast === true;
-  const base = id.replace(/-fast$/i, "");
-  const grok = /grok/i.test(base);
-  const composer = /^composer-/i.test(base);
-  const fast = suffixFast || (hasClientTools && grok);
-  // Composer’s omitted `fast` param defaults to true on Agent/Cloud APIs.
-  if (composer || grok || suffixFast) {
-    return { id: base, params: [{ id: "fast", value: fast ? "true" : "false" }] };
-  }
-  return { id };
+  const selection = gatewayAgentModelSelection(id, {
+    fast: extractFastMode(body),
+    reasoningEffort: extractReasoningEffort(body),
+  });
+  return selection.parameters?.length
+    ? { id: selection.modelId, params: selection.parameters }
+    : { id: selection.modelId };
 }
 
 function clientToolDefs(body: Record<string, unknown>, anthropic: boolean): CustomToolDef[] {
@@ -270,7 +267,7 @@ async function startCloudTurnFromBody(
     promptCreate: promptFromMessages(messages, false),
     promptFollowUp: promptFromMessages(messages, true),
     mcpServers: extractMcpServers(body),
-    model: cloudModelSelection(body.model, body, false),
+    model: cloudModelSelection(body.model, body),
     repos: extractRepos(body),
     signal,
   });

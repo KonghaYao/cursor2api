@@ -80,14 +80,27 @@ test("cloudModelSelection maps -fast to model.params", () => {
   assert.equal(cloudModelSelection("auto"), undefined);
 });
 
-test("cloudModelSelection upgrades Grok to fast when client tools are present", () => {
-  assert.deepEqual(cloudModelSelection("grok-4.6", {}, true), {
-    id: "grok-4.6",
-    params: [{ id: "fast", value: "true" }],
-  });
+test("cloudModelSelection keeps grok-4.6 off fast unless the id asks for it", () => {
   assert.deepEqual(cloudModelSelection("grok-4.6", {}), {
     id: "grok-4.6",
-    params: [{ id: "fast", value: "false" }],
+    params: [
+      { id: "fast", value: "false" },
+      { id: "effort", value: "high" },
+    ],
+  });
+  assert.deepEqual(cloudModelSelection("grok-4.6-fast", {}), {
+    id: "grok-4.6",
+    params: [
+      { id: "fast", value: "true" },
+      { id: "effort", value: "high" },
+    ],
+  });
+  assert.deepEqual(cloudModelSelection("grok-4.6-fast", { reasoning_effort: "low" }), {
+    id: "grok-4.6",
+    params: [
+      { id: "fast", value: "true" },
+      { id: "effort", value: "low" },
+    ],
   });
 });
 

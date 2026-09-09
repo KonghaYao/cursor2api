@@ -35,9 +35,19 @@ Composer **不使用** `reasoning_effort` 选档。**Max** 通过 `requestedMode
 - `grok-4.5` / `grok-4.5-fast`
 - 带 effort 的简写：`grok-4.6-high`、`grok-4.6-high-fast`、`grok-4.6-medium-fast` 等（映射到对应 `cursor-grok-*` route）
 
-也可直接传 Cursor id：`cursor-grok-4.6-high-fast`（原样透传）。
+也可直接传 Cursor id：`cursor-grok-4.6-high-fast`（Inference 原样透传）。
 
-**Tool calling：** Cursor 的非 fast Grok route（如 `cursor-grok-4.6-high`）不支持 `tools`。网关在有 `tools[]` 时会自动升级到 `-fast` route（`grok-4.6` + tools → `cursor-grok-4.6-high-fast`）。纯文本对话仍走标准档。
+**Tool calling（Inference）：** Cursor 的非 fast Grok route（如 `cursor-grok-4.6-high`）不支持 `tools`。Inference 路径在有 `tools[]` 时会自动升级到 `-fast` route（`grok-4.6` + tools → `cursor-grok-4.6-high-fast`）。纯文本对话仍走标准档。
+
+**AgentService：** 不因 tools 升 Fast。`grok-4.6` → `fast=false`；只有 `grok-4.6-fast` 或请求体 `fast: true` 才是 Fast。思考强度走 `parameters.effort`（默认 `high`），**不是** Inference 那种写进 route id 的 `cursor-grok-4.6-high-fast`。
+
+| 客户端 | AgentService `requestedModel` |
+|--------|-------------------------------|
+| `grok-4.6` | `{ modelId: "grok-4.6", parameters: [{ id: "fast", value: "false" }, { id: "effort", value: "high" }] }` |
+| `grok-4.6-fast` | `fast=true`，`effort=high` |
+| `grok-4.6-medium` | `fast=false`，`effort=medium` |
+| `grok-4.6-fast` + `reasoning_effort: max` | `fast=true`，`effort=xhigh` |
+| `cursor-grok-4.6-low-fast` | 先拆成家族 `grok-4.6`，再按上表写 param |
 
 ### `reasoning_effort`
 
@@ -64,7 +74,7 @@ Composer **不使用** `reasoning_effort` 选档。**Max** 通过 `requestedMode
 
 与 4.6 相同，但 **没有** `xhigh` 列；`max` / `xhigh` / 非法值均映射到 `high` 或 `high-fast`。
 
-映射完成后 **不再** 设置 `requestedModel.parameters`（effort 已编码在 route id 里）。
+映射完成后 Inference **不再** 设置 `requestedModel.parameters`（effort 已编码在 route id 里）。AgentService 相反：effort 必须写进 `parameters.effort`。
 
 ## Other Models（`gpt-5.6-luna` 等）
 

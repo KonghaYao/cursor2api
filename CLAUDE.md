@@ -67,6 +67,8 @@ Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。不要为了半
 
 客户端 `usage`：从 `interactionUpdate.turnEnded` 读 token 字段（proto JSON 的 `inputTokens` 等，uint64 可能是字符串），映射成 OpenAI `prompt_tokens` / `cached_tokens` 与 Anthropic `input_tokens` / `cache_read_input_tokens`。同一 `send()` 内多段 turnEnded 相加。park 成 `tool_calls` 时 turn 还没结束，那一枪 usage 为 0。不要为了 usage 去调 Cloud `getUsage` 或装 SDK。
 
+**2026-09-09 实机**：Deno + `crsr_` + `composer-2.5-fast` 无 tools PONG，`turnEnded` = `inputTokens=3672` `outputTokens=91` `cacheReadTokens=3616` `cacheWriteTokens=0`，OpenAI `usage` 同数。首轮高 Cache Read 是 Composer 前缀缓存。
+
 Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里的 legacy abort）。**不要**把这个 signal 接到 AgentService 双工或 `settleCustomTools` 上，否则第一枪 `tool_calls` 返回后 park 被掐掉，第二枪 `role: tool` 会 409。`deno.json` 开 `--unstable-no-legacy-abort`。若 isolate / 流已经没了，跟进改为把 tool results 写成新 user prompt，而不是 409。
 
 ### 不要做的
@@ -85,6 +87,7 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 - 跟进轮次再把 system / 整段 history 叠进 `userMessageAction`（Cursor `conversationState` 里已经有上文，会打坏 cache）
 - 把 HTTP `request.signal` 绑到 parked AgentService/Run 上（Deno.serve 成功响应会 abort，第二枪 `role: tool` 变 409）
 - 给 AgentService 只送 `modelId: composer-2.5` 而不带 `parameters.fast=false`（上游默认 Fast，Team Usage 记成 `composer-2.5-fast`）
+- 给 AgentService 的 Grok 只剥 `-fast`、不传 `parameters.effort`（思考强度会掉回上游默认，而不是客户端的 `reasoning_effort` / id 里的 `low|medium|high|xhigh`）
 
 ---
 

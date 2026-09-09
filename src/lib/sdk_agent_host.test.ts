@@ -125,7 +125,11 @@ test("JWT credentials skip exchange_user_api_key", async () => {
 });
 
 test("AgentService requestedModel sends explicit fast for composer standard vs fast", async () => {
-  async function requestedModelFor(model: string, customTools: Record<string, unknown> = {}) {
+  async function requestedModelFor(
+    model: string,
+    customTools: Record<string, unknown> = {},
+    extra?: { reasoningEffort?: unknown },
+  ) {
     const duplex = new InteractiveDuplex();
     duplex.onSend = (message) => {
       if (field(message, "runRequest")) {
@@ -137,7 +141,12 @@ test("AgentService requestedModel sends explicit fast for composer standard vs f
       openRun: async () => duplex,
       exchange: async () => ({ accessToken: "tok", refreshToken: null }),
     });
-    const agent = await host.create({ apiKey: "crsr_test", model, customTools: customTools as never });
+    const agent = await host.create({
+      apiKey: "crsr_test",
+      model,
+      reasoningEffort: extra?.reasoningEffort,
+      customTools: customTools as never,
+    });
     await (await agent.send("ping")).wait();
     await agent.close();
     const run = asObject(field(duplex.sent[0], "runRequest"));
@@ -151,6 +160,26 @@ test("AgentService requestedModel sends explicit fast for composer standard vs f
   const fast = await requestedModelFor("composer-2.5-fast");
   assert.equal(fast?.modelId, "composer-2.5");
   assert.deepEqual(fast?.parameters, [{ id: "fast", value: "true" }]);
+
+  const grok = await requestedModelFor("grok-4.6", { lookup: { description: "x", inputSchema: {} } });
+  assert.equal(grok?.modelId, "grok-4.6");
+  assert.deepEqual(grok?.parameters, [
+    { id: "fast", value: "false" },
+    { id: "effort", value: "high" },
+  ]);
+
+  const grokFast = await requestedModelFor("grok-4.6-fast");
+  assert.equal(grokFast?.modelId, "grok-4.6");
+  assert.deepEqual(grokFast?.parameters, [
+    { id: "fast", value: "true" },
+    { id: "effort", value: "high" },
+  ]);
+
+  const grokMax = await requestedModelFor("grok-4.6-fast", {}, { reasoningEffort: "max" });
+  assert.deepEqual(grokMax?.parameters, [
+    { id: "fast", value: "true" },
+    { id: "effort", value: "xhigh" },
+  ]);
 });
 
 test("in-repo host returns turnEnded usage to wait()", async () => {

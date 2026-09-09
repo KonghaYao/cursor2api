@@ -49,6 +49,20 @@ function parsePublicGrokModel(
   return null;
 }
 
+/** Public grok-* ids and Inference `cursor-grok-*` routes → family + effort + fast. */
+export function parseAgentGrokModel(
+  clientModel: string,
+): { family: "4.6" | "4.5"; effort?: string; fast: boolean } | null {
+  const pub = parsePublicGrokModel(clientModel);
+  if (pub) return pub;
+  const id = clientModel.toLowerCase().trim();
+  let m = id.match(/^cursor-grok-4\.6-(low|medium|high|xhigh)(?:-fast)?$/);
+  if (m) return { family: "4.6", effort: m[1], fast: id.endsWith("-fast") };
+  m = id.match(/^cursor-grok-4\.5-(low|medium|high)(?:-fast)?$/);
+  if (m) return { family: "4.5", effort: m[1], fast: id.endsWith("-fast") };
+  return null;
+}
+
 function grokCursorFlatRoute(family: "4.6" | "4.5", effort: string, fast: boolean): string {
   const ver = family;
   return `cursor-grok-${ver}-${effort}${fast ? "-fast" : ""}`;

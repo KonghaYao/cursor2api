@@ -92,7 +92,7 @@ export function createSdkAgentHost(opts?: {
       const conversationId = randomId();
       const selection = gatewayAgentModelSelection(createOpts.model, {
         fast: createOpts.fast,
-        hasClientTools: Object.keys(createOpts.customTools).length > 0,
+        reasoningEffort: createOpts.reasoningEffort,
       });
       const cwd = createOpts.cwd || readEnv("GATEWAY_AGENT_CWD") || "/tmp";
       const tools = specsFromCustomTools(createOpts.customTools);

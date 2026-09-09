@@ -15,6 +15,7 @@ import {
 
 test("gatewayAgentModelId strips trailing -fast and defaults composer-2.5", () => {
   assert.equal(gatewayAgentModelId("composer-2.5-fast"), "composer-2.5");
+  assert.equal(gatewayAgentModelId("grok-4.6-high-fast"), "grok-4.6");
   assert.equal(gatewayAgentModelId("auto"), "composer-2.5");
   assert.equal(gatewayAgentModelId(""), "composer-2.5");
 });
@@ -32,13 +33,47 @@ test("gatewayAgentModelSelection sends explicit fast=false for composer-2.5", ()
     modelId: "composer-2.5",
     parameters: [{ id: "fast", value: "true" }],
   });
-  assert.deepEqual(gatewayAgentModelSelection("grok-4.6", { hasClientTools: true }), {
-    modelId: "grok-4.6",
-    parameters: [{ id: "fast", value: "true" }],
-  });
   assert.deepEqual(gatewayAgentModelSelection("grok-4.6"), {
     modelId: "grok-4.6",
-    parameters: [{ id: "fast", value: "false" }],
+    parameters: [
+      { id: "fast", value: "false" },
+      { id: "effort", value: "high" },
+    ],
+  });
+  assert.deepEqual(gatewayAgentModelSelection("grok-4.6-fast"), {
+    modelId: "grok-4.6",
+    parameters: [
+      { id: "fast", value: "true" },
+      { id: "effort", value: "high" },
+    ],
+  });
+  assert.deepEqual(gatewayAgentModelSelection("grok-4.6-low"), {
+    modelId: "grok-4.6",
+    parameters: [
+      { id: "fast", value: "false" },
+      { id: "effort", value: "low" },
+    ],
+  });
+  assert.deepEqual(gatewayAgentModelSelection("grok-4.6-fast", { reasoningEffort: "max" }), {
+    modelId: "grok-4.6",
+    parameters: [
+      { id: "fast", value: "true" },
+      { id: "effort", value: "xhigh" },
+    ],
+  });
+  assert.deepEqual(gatewayAgentModelSelection("cursor-grok-4.6-medium-fast"), {
+    modelId: "grok-4.6",
+    parameters: [
+      { id: "fast", value: "true" },
+      { id: "effort", value: "medium" },
+    ],
+  });
+  assert.deepEqual(gatewayAgentModelSelection("grok-4.5-fast", { reasoningEffort: "max" }), {
+    modelId: "grok-4.5",
+    parameters: [
+      { id: "fast", value: "true" },
+      { id: "effort", value: "high" },
+    ],
   });
   assert.deepEqual(gatewayAgentModelSelection("gpt-5.6-luna"), { modelId: "gpt-5.6-luna" });
 });

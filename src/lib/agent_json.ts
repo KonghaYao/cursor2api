@@ -3,6 +3,8 @@
  * In-repo stand-in for the @cursor/sdk local Agent + custom-user-tools MCP executor.
  */
 
+import { mapGrokEffort, parseAgentGrokModel } from "./inference.ts";
+
 export const CUSTOM_USER_TOOLS_SERVER = "custom-user-tools";
 
 /** Proto tool names for SDK public group `"mcp"`. */
@@ -45,21 +47,37 @@ export type AgentModelSelection = {
 };
 
 /**
- * AgentService family ids omit `-fast`. Composer’s `fast` param defaults to
- * true when omitted, so Team Usage bills `composer-2.5` as `composer-2.5-fast`.
- * Always send an explicit true/false for Composer (and Grok).
+ * AgentService family ids omit `-fast` and Grok effort suffixes. SDK/AgentService
+ * default omitted `fast` to true, so Composer and Grok always get an explicit
+ * true/false. Grok also always gets `effort` (default `high`, same as Inference).
+ * Fast is on only for a `-fast` suffix or `fast: true`; tools do not upgrade Grok.
  */
 export function gatewayAgentModelSelection(
   model: unknown,
-  opts?: { fast?: boolean; hasClientTools?: boolean },
+  opts?: { fast?: boolean; reasoningEffort?: unknown },
 ): AgentModelSelection {
   const raw = typeof model === "string" && model.trim() && model !== "auto" ? model.trim() : "composer-2.5";
+  const grok = parseAgentGrokModel(raw);
+  if (grok) {
+    const familyKey = grok.family === "4.6" ? "grok-4.6" : "grok-4.5";
+    const hasBodyEffort = opts?.reasoningEffort != null && String(opts.reasoningEffort).trim() !== "";
+    const effort =
+      (hasBodyEffort ? mapGrokEffort(familyKey, opts?.reasoningEffort) : undefined) ?? grok.effort ?? "high";
+    const fast = grok.fast || Boolean(opts?.fast);
+    return {
+      modelId: familyKey,
+      parameters: [
+        { id: "fast", value: fast ? "true" : "false" },
+        { id: "effort", value: effort },
+      ],
+    };
+  }
+
   const suffixFast = /-fast$/i.test(raw);
   const modelId = raw.replace(/-fast$/i, "");
   const composer = /^composer-/i.test(modelId);
-  const grok = /grok/i.test(modelId);
-  const fast = suffixFast || Boolean(opts?.fast) || (Boolean(opts?.hasClientTools) && grok);
-  if (composer || grok || suffixFast || opts?.fast) {
+  const fast = suffixFast || Boolean(opts?.fast);
+  if (composer || suffixFast || opts?.fast) {
     return { modelId, parameters: [{ id: "fast", value: fast ? "true" : "false" }] };
   }
   return { modelId };
