@@ -105,6 +105,7 @@ export function createSdkAgentHost(opts?: {
         agentId,
         async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void }) {
           if (closed) throw new Error("agent is closed");
+          const abort = new AbortController();
           const run = runTurn({
             openRun,
             accessToken,
@@ -116,6 +117,7 @@ export function createSdkAgentHost(opts?: {
             prompt,
             images: sendOpts?.images,
             onDelta: sendOpts?.onDelta,
+            signal: abort.signal,
             tools,
             customTools: createOpts.customTools,
             blobs,
@@ -125,7 +127,7 @@ export function createSdkAgentHost(opts?: {
               createOpts.onCheckpoint?.(state);
             },
           });
-          return { wait: () => run };
+          return { wait: () => run, abort: () => abort.abort() };
         },
         async close() {
           closed = true;
@@ -147,6 +149,7 @@ async function runTurn(opts: {
   prompt: string;
   images?: AgentInlineImage[];
   onDelta?: (chunk: { text?: string; thinking?: string }) => void;
+  signal?: AbortSignal;
   tools: CustomToolSpec[];
   customTools: SdkCustomToolMap;
   blobs: Map<string, string>;
@@ -156,6 +159,7 @@ async function runTurn(opts: {
   const duplex = await opts.openRun({
     accessToken: opts.accessToken,
     conversationId: opts.conversationId,
+    signal: opts.signal,
   });
   const runId = randomId();
   let text = "";

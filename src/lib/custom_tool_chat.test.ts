@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test, { afterEach } from "node:test";
-import { customToolsClearForTests } from "./custom_tools.ts";
+import { customToolsClearForTests, openaiToolsToCustom } from "./custom_tools.ts";
 import {
   agentImagesFromCursorParts,
   customToolChatClearForTests,
@@ -579,5 +579,65 @@ test("Anthropic stream=true forwards thinking then text deltas", async () => {
   assert.match(sse, /"thinking":"plan"/);
   assert.match(sse, /text_delta/);
   assert.match(sse, /"text":"ok"/);
+});
+
+test("role:tool opens a new send; tool_calls closes the previous AgentService run", async () => {
+  const prompts: string[] = [];
+  let aborts = 0;
+  setCustomToolAgentHostForTests({
+    async create({ customTools }) {
+      return {
+        agentId: "agent-scoped",
+        async send(prompt) {
+          prompts.push(prompt);
+          const wait = (async () => {
+            if (prompt.includes("executed your custom tools")) return { text: "22c" };
+            const tool = Object.values(customTools)[0];
+            if (!tool) return { text: "no-tools" };
+            await tool.execute({}, {});
+            return { text: "should-not-reach-client" };
+          })();
+          return {
+            wait: () => wait,
+            abort: () => {
+              aborts += 1;
+            },
+          };
+        },
+        async close() {},
+      };
+    },
+  });
+  const tools = openaiToolsToCustom([{ type: "function", function: { name: "lookup" } }]);
+  const headers = new Headers({ authorization: "Bearer crsr_test" });
+  const first = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [{ role: "user", content: "weather?" }] },
+    tools,
+  });
+  assert.equal(first.status, 200);
+  const body = await first.json();
+  assert.equal(body.choices[0].finish_reason, "tool_calls");
+  const tc = body.choices[0].message.tool_calls;
+  assert.equal(aborts, 1);
+  const second = await handleCustomToolChatCompletions({
+    headers,
+    body: {
+      model: "composer-2.5",
+      messages: [
+        { role: "user", content: "weather?" },
+        { role: "assistant", content: null, tool_calls: tc },
+        { role: "tool", tool_call_id: tc[0].id, content: '{"temp":22}' },
+      ],
+    },
+    tools,
+  });
+  assert.equal(second.status, 200);
+  const body2 = await second.json();
+  assert.equal(body2.choices[0].message.content, "22c");
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1] || "", /executed your custom tools/);
+  assert.match(prompts[1] || "", /22/);
+  assert.doesNotMatch(prompts[1] || "", /weather\?/);
 });
 

@@ -36,7 +36,7 @@
 | `https://api.cursor.com/v1/agents` Cloud REST | 能用 | **仅** `GET /v1/models`；不要用它跑对话（VM 会自带 shell/edit，且没有 OpenAI 那种 park `tool_calls`） |
 | `POST https://api2.cursor.sh/agent.v1.AgentService/Run` | 能用（先 `exchange_user_api_key`） | **全部** `/v1/chat/completions` 与 `/v1/messages` |
 
-AgentService **没有** Chat Completions HTTP。自定义工具走合成 MCP server `custom-user-tools`（`GetMcpTools` / `CallMcpTool` / `mcp_args`），`execute()` 在网关进程内。网关把 `execute()` **park** 成 OpenAI `tool_calls`，由调用方执行后再 POST `role: tool`。这不是 HTTP `/mcp`，Cloud VM 不会回调本网关。
+AgentService **没有** Chat Completions HTTP。自定义工具走合成 MCP server `custom-user-tools`（`GetMcpTools` / `CallMcpTool` / `mcp_args`），只在**同一枪 HTTP** 里折成 OpenAI `tool_calls` 后关掉 `Run`。调用方 POST `role: tool` 时**新开** Run，把最近一轮结果写成 `userMessageAction`。这不是 HTTP `/mcp`，Cloud VM 不会回调本网关。
 
 ### 屏蔽自带工具（只留 custom）
 
@@ -67,9 +67,8 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 |------|------------------------------------------|
 | 首轮 | 工具政策 + `<system>` + 第一条 user |
 | 跟进 user | 上次成功 `messages.length` 之后的新 user（可多条拼成一条 delta）；长度 KV 未命中则回退最新一条 user。不要 system / 历史 / 工具政策 |
-| 同进程 `role: tool` | park resume，`execute()` 只匹配**最近一轮** tool id |
-| park_miss（有 KV/会话） | **只有**最近一轮 tool 结果；不要重发首条 user，也不要 dump 全部历史 tool |
-| park_miss（无会话） | 冷启动：首条 user + 全部 tool 结果 |
+| `role: tool`（有 KV/会话） | **新开** AgentService/Run，只送最近一轮 tool 结果；不要重发首条 user，也不要 dump 全部历史 tool。上一枪返回 `tool_calls` 时后向连接已关掉 |
+| `role: tool`（无会话） | 冷启动：首条 user + 全部 tool 结果 |
 
 `agentRunFp` 锚 **第一条 user** 成立，正是因为客户端保证这条前缀不变。单测多轮必须用**全量 transcript** 复现，不要用「只发最后一条」当产品场景。
 
@@ -90,9 +89,9 @@ Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。不要为了半
 
 **2026-09-09 实机**：Deno + `crsr_` + `composer-2.5-fast` 无 tools PONG，`turnEnded` = `inputTokens=3672` `outputTokens=91` `cacheReadTokens=3616` `cacheWriteTokens=0`，OpenAI `usage` 同数。首轮高 Cache Read 是 Composer 前缀缓存。
 
-Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里的 legacy abort）。**不要**把这个 signal 接到 AgentService 双工或 `settleCustomTools` 上，否则第一枪 `tool_calls` 返回后 park 被掐掉，第二枪 `role: tool` 会 409。`deno.json` 开 `--unstable-no-legacy-abort`。若 isolate / 流已经没了，跟进改为把 tool results 写成新 user prompt，而不是 409。
+Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里的 legacy abort）。**不要**把这个 signal 接到 AgentService 双工上。`tool_calls` 返回时网关自己关后向 `Run`；`role: tool` 本来就是新开的一枪，不再依赖跨请求 park。`deno.json` 仍开 `--unstable-no-legacy-abort`。
 
-**会话 id（Deno isolate / serverless）：** `conversationId` = `tenant:agentRunFp`。`agentRunFp` = model / effort / flags / tools / system / **第一条 user**（不含后续轮次；AgentService 只送最新 delta，上文在 Cursor `conversationState`）。客户端 `x-session-id` / `conversation_id` **忽略**。`liveTurns` 只 park `execute()`（键 `tenant:fp`）。KV `agent-run:${tenant}:${fp}` 只存 `{fp, conversationId, agentSessionId, conversationState?}`，TTL 24h，checkpoint 超 `AGENT_RUN_STATE_MAX_BYTES`（24KiB）则丢掉 state 只留 ids。KV `agent-run-len:` 只存上次成功处理的 `messages.length`，TTL **5 分钟**，用来 `slice` 增量；**不要**并进 24h 的 `agent-run`，也**不要**把 messages / canon 写进 KV。换 isolate 后 `role: tool` 仍走 park_miss flatten。
+**会话 id（Deno isolate / serverless）：** `conversationId` = `tenant:agentRunFp`。`agentRunFp` = model / effort / flags / tools / system / **第一条 user**（不含后续轮次；AgentService 只送最新 delta，上文在 Cursor `conversationState`）。客户端 `x-session-id` / `conversation_id` **忽略**。**每一枪 HTTP 开/关一条 `AgentService/Run`**：返回 `tool_calls` 就关掉双工。`role: tool` 一律新开 Run，把最近一轮 tool 结果写成 `userMessageAction`。KV `agent-run:${tenant}:${fp}` 只存 `{fp, conversationId, agentSessionId, conversationState?}`，TTL 24h，checkpoint 超 `AGENT_RUN_STATE_MAX_BYTES`（24KiB）则丢掉 state 只留 ids。KV `agent-run-len:` 只存上次成功处理的 `messages.length`，TTL **5 分钟**，用来 `slice` 增量；**不要**并进 24h 的 `agent-run`，也**不要**把 messages / canon 写进 KV。
 
 ### 不要做的
 

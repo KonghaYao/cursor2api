@@ -86,6 +86,6 @@ agentRunFp = SHA256_hex( join(RS, [
 conversationId = tenant + ":" + agentRunFp
 ```
 
-`firstUser` = messages 里第一条 `role=user`（跳过 `tool_result`）。这条锚能跨轮不变，是因为客户端保证前缀稳定，不是因为网关存了 transcript。成功处理后 KV `agent-run-len:` 记 `messages.length`（TTL 5min），下一枪从该下标 slice 新 suffix（跳过 assistant 回声；多条新 user 拼成一条 delta）。长度未命中则回退「最新一条 user」。park `execute()` 和跟进不必带客户端 session header，但跟进必须仍带上**同一条第一条 user**（完整 history）。
+`firstUser` = messages 里第一条 `role=user`（跳过 `tool_result`）。这条锚能跨轮不变，是因为客户端保证前缀稳定，不是因为网关存了 transcript。成功处理后 KV `agent-run-len:` 记 `messages.length`（TTL 5min），下一枪从该下标 slice 新 suffix（跳过 assistant 回声；多条新 user 拼成一条 delta）。长度未命中则回退「最新一条 user」。跟进不必带客户端 session header，但必须仍带上**同一条第一条 user**（完整 history）。`role: tool` 是新的一枪 AgentService/Run，不是把结果塞回上一枪还开着的流。
 
 换 model / tools / system / 第一条 user → 新 thread。

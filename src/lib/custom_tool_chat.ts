@@ -1,18 +1,20 @@
 /**
  * Custom-tools chat path: OpenAI tools → in-process `customTools.execute`.
- * The agent loop is AgentService/Run (MCP family only). execute() is parked
- * for the gateway client. Not HTTP MCP, not @cursor/sdk, not SDK/agent
- * binaries, not a Cursor-hosted Cloud Agents sandbox VM.
- *
- * Built-in agent tools stay off except the `mcp` capability group, which is
- * required for customTools to be offered. An empty allowlist also kills MCP.
+ * The agent loop is AgentService/Run. Client tools stay OpenAI / Anthropic
+ * function tools; this gateway is not an MCP server and does not expose
+ * HTTP `/mcp`. AgentService's wire allowlist still has to name the MCP
+ * family or custom function tools never appear — that is Cursor's constraint,
+ * not a product surface.
  *
  * Conversation id is `tenant:agentRunFp` (model / effort / tools / system /
  * first user). Client `x-session-id` / `conversation_id` are ignored. KV
  * `agent-run:` restores ids after a Deno isolate hop (TTL 24h). KV
  * `agent-run-len:` stores the last successful `messages.length` (TTL 5 min)
- * so the next request can slice only the new suffix. `liveTurns` only parks
- * in-process `execute()`; it is not a serverless session store.
+ * so the next request can slice only the new suffix.
+ *
+ * Each HTTP request opens and closes one AgentService/Run. Returning
+ * `tool_calls` closes that duplex. The next `role: tool` is a new Run
+ * with the latest tool results flattened into `userMessageAction`.
  *
  * Client contract (the normal path, not an edge case): every request carries
  * the full OpenAI/Anthropic transcript, and the client keeps that prefix
@@ -47,7 +49,6 @@ import {
   failParkedClientTools,
   lastTurnIsToolResult,
   offerClientToolBatch,
-  resolveClientToolResults,
   toSdkCustomTools,
   toolPolicyPrompt,
   upsertClientToolSession,
@@ -288,7 +289,7 @@ export type CustomToolAgentHandle = {
   send: (
     prompt: string,
     opts?: CustomToolSendOpts,
-  ) => Promise<{ wait: () => Promise<CustomToolTurnResult> }>;
+  ) => Promise<{ wait: () => Promise<CustomToolTurnResult>; abort?: () => void }>;
   close: () => Promise<void>;
 };
 
@@ -387,6 +388,7 @@ type LiveTurn = {
   agent: CustomToolAgentHandle;
   session: ClientToolSession;
   wait: () => Promise<CustomToolTurnResult>;
+  abort?: () => void;
   done: boolean;
   text: string;
   thinking?: string;
@@ -394,6 +396,12 @@ type LiveTurn = {
   usage?: AgentTurnUsage;
   deltas: TextDeltaHub;
 };
+
+/** Close this HTTP request's AgentService/Run after offering tool_calls. */
+function releaseUpstreamAfterPark(live: LiveTurn, session: ClientToolSession): void {
+  live.abort?.();
+  failParkedClientTools(session, "released: request-scoped AgentService run");
+}
 
 const liveTurns = new Map<string, LiveTurn>();
 let testHost: CustomToolAgentHost | undefined;
@@ -525,25 +533,23 @@ async function startCustomToolTurn(opts: {
   const toolResults = extractLatestClientToolResults(messages);
   const key = liveKey(tenant, sessionFp);
   const existing = liveTurns.get(key);
-  const canResumePark =
-    Boolean(existing) &&
-    !existing!.done &&
-    session.parked.some((p) => p.resolve);
 
   const persistCommittedLength = async () => {
     if (!opts.kv) return;
     await kvSetAgentRunLen(opts.kv, tenant, sessionFp, messages.length);
   };
 
-  if (lastTurnIsToolResult(messages) && toolResults.length && canResumePark) {
-    const n = resolveClientToolResults(session, toolResults);
-    if (!n) throw new CloudChatError("tool results did not match a parked custom tool call", 400);
-    console.log(`  custom_tools resume session=${computedIds.conversationId.slice(0, 24)} agent=${existing!.agent.agentId.slice(0, 14)}`);
-    await persistCommittedLength();
-    return { live: existing!, session, sessionId: computedIds.conversationId, continued: true };
+  if (existing && !existing.done) {
+    existing.abort?.();
+    failParkedClientTools(session, "cancelled: new user turn");
+    try {
+      await existing.wait();
+    } catch {
+      /* previous AgentService/Run closed */
+    }
+  } else if (session.parked.length) {
+    failParkedClientTools(session, "cancelled: new user turn");
   }
-
-  if (session.parked.length) failParkedClientTools(session, "cancelled: new user turn");
 
   const binding = opts.kv ? await kvGetAgentRun(opts.kv, tenant, sessionFp, sessionFp) : null;
   const priorMessageCount = opts.kv ? await kvGetAgentRunLen(opts.kv, tenant, sessionFp) : null;
@@ -582,7 +588,7 @@ async function startCustomToolTurn(opts: {
   const toolFollowUp = lastTurnIsToolResult(messages) && toolResults.length > 0;
   if (toolFollowUp) {
     console.log(
-      `  custom_tools park_miss session=${sessionId.slice(0, 24)} existing=${Boolean(existing)} kv=${Boolean(binding)} done=${Boolean(existing?.done)} — continuing as follow-up prompt`,
+      `  custom_tools follow_tool session=${sessionId.slice(0, 24)} existing=${Boolean(existing)} kv=${Boolean(binding)} — new AgentService/Run`,
     );
   }
   const prompt = composeCustomToolTurnPrompt({
@@ -607,6 +613,7 @@ async function startCustomToolTurn(opts: {
     agent,
     session,
     wait: run.wait,
+    abort: run.abort,
     done: false,
     text: "",
     deltas,
@@ -728,6 +735,7 @@ export async function handleCustomToolChatCompletions(opts: {
   const settled = await settleCustomTools(started.session, started.live);
   if (settled.kind === "tools") {
     offerClientToolBatch(started.session, settled.batch);
+    releaseUpstreamAfterPark(started.live, started.session);
     const toolCalls = clientToolsToOpenAi(settled.batch);
     console.log(`  custom_tools park ${toolCalls.map((c) => c.function.name).join(",")}`);
     ackLiveDeltas(started.live, started.live.thinking, started.live.text);
@@ -785,6 +793,7 @@ export async function handleCustomToolMessages(opts: {
   const settled = await settleCustomTools(started.session, started.live);
   if (settled.kind === "tools") {
     offerClientToolBatch(started.session, settled.batch);
+    releaseUpstreamAfterPark(started.live, started.session);
     const toolUses = clientToolsToAnthropic(settled.batch);
     ackLiveDeltas(started.live, started.live.thinking, started.live.text);
     return jsonResponse(200, {
@@ -864,6 +873,7 @@ function streamCustomOpenAi(opts: {
         const usage = openaiUsageFromAgent(live.usage);
         if (settled.kind === "tools") {
           offerClientToolBatch(session, settled.batch);
+          releaseUpstreamAfterPark(live, session);
           const toolCalls = clientToolsToOpenAi(settled.batch);
           console.log(`  custom_tools park ${toolCalls.map((c) => c.function.name).join(",")}`);
           controller.enqueue(chunk({ tool_calls: toolCalls }));
@@ -1020,6 +1030,7 @@ function streamCustomAnthropic(opts: {
         live.deltas.ackedText = emittedText;
         if (settled.kind === "tools") {
           offerClientToolBatch(session, settled.batch);
+          releaseUpstreamAfterPark(live, session);
           for (const call of clientToolsToAnthropic(settled.batch)) {
             controller.enqueue(
               encodeSseEvent("content_block_start", {
