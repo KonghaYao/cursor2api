@@ -127,7 +127,7 @@ test("mcp tool definitions use custom-user-tools wire names", () => {
   assert.match(String(defs[0]?.inputSchemaJson), /object/);
 });
 
-test("buildRunRequest omits excludeWorkspaceContext and only carries mcp tools", () => {
+test("buildRunRequest omits excludeWorkspaceContext and sends empty mcpTools", () => {
   const req = buildRunRequest({
     prompt: "hi",
     modelId: "composer-2.5",
@@ -141,11 +141,11 @@ test("buildRunRequest omits excludeWorkspaceContext and only carries mcp tools",
   const rm = req.requestedModel as { modelId: string; parameters?: Array<{ id: string; value: string }> };
   assert.equal(rm.modelId, "composer-2.5");
   assert.deepEqual(rm.parameters, [{ id: "fast", value: "false" }]);
-  const tools = (req.mcpTools as { mcpTools: Array<{ toolName: string }> }).mcpTools;
-  assert.equal(tools[0]?.toolName, "lookup");
+  const tools = (req.mcpTools as { mcpTools: unknown[] }).mcpTools;
+  assert.deepEqual(tools, []);
 });
 
-test("buildRunRequest does not send customSystemPrompt", () => {
+test("buildRunRequest omits customSystemPrompt by default", () => {
   const req = buildRunRequest({
     prompt: "hi",
     modelId: "composer-2.5",
@@ -155,6 +155,19 @@ test("buildRunRequest does not send customSystemPrompt", () => {
     tools: [],
   });
   assert.equal(req.customSystemPrompt, undefined);
+});
+
+test("buildRunRequest sets customSystemPrompt when systemPrompt is passed", () => {
+  const req = buildRunRequest({
+    prompt: "hi",
+    modelId: "composer-2.5",
+    conversationId: "c1",
+    runId: "r1",
+    agentSessionId: "a1",
+    tools: [],
+    systemPrompt: "  You are a helpful assistant.  ",
+  });
+  assert.equal(req.customSystemPrompt, "You are a helpful assistant.");
 });
 
 test("parseServerMessage reads camelCase and snake_case interaction updates", () => {

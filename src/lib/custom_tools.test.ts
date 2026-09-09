@@ -90,6 +90,7 @@ test("extractLatestClientToolResults keeps only the last assistant tool round", 
     extractLatestClientToolResults(full).map((r) => r.id),
     ["call_2"],
   );
+  assert.equal(extractLatestClientToolResults(full)[0]?.name, "lookup");
   assert.deepEqual(
     extractClientToolResults(full).map((r) => r.id),
     ["call_1", "call_2"],
@@ -102,8 +103,8 @@ test("extractLatestClientToolResults keeps only the last assistant tool round", 
     { role: "user", content: [{ type: "tool_result", tool_use_id: "u2", content: "new" }] },
   ];
   assert.deepEqual(
-    extractLatestClientToolResults(anthropic).map((r) => ({ id: r.id, content: r.content })),
-    [{ id: "u2", content: "new" }],
+    extractLatestClientToolResults(anthropic).map((r) => ({ id: r.id, content: r.content, name: r.name })),
+    [{ id: "u2", content: "new", name: "lookup" }],
   );
 });
 
@@ -123,7 +124,7 @@ test("parked customTools.execute resolves when the client posts tool results", a
   assert.match(result.content[0]!.text, /temp/);
 });
 
-test("system and Anthropic body.system are folded into the user prompt", () => {
+test("system is folded into first-shot user prompt by default", () => {
   const openai = systemPromptFromClient({
     messages: [
       { role: "system", content: "Reply with exactly TOKEN" },
@@ -177,6 +178,23 @@ test("system and Anthropic body.system are folded into the user prompt", () => {
   assert.equal(followWithTools, "second");
 });
 
+test("GATEWAY_FOLD_SYSTEM=0 keeps first-shot user prompt without <system>", () => {
+  const prev = process.env.GATEWAY_FOLD_SYSTEM;
+  process.env.GATEWAY_FOLD_SYSTEM = "0";
+  try {
+    const prompt = composeCustomToolPrompt({
+      body: { messages: [{ role: "system", content: "secret ALPHA" }, { role: "user", content: "code?" }] },
+      tools: [],
+      messages: [{ role: "system", content: "secret ALPHA" }, { role: "user", content: "code?" }],
+    });
+    assert.equal(prompt, "code?");
+    assert.doesNotMatch(prompt, /<system>/);
+  } finally {
+    if (prev === undefined) delete process.env.GATEWAY_FOLD_SYSTEM;
+    else process.env.GATEWAY_FOLD_SYSTEM = prev;
+  }
+});
+
 test("composeCustomToolTurnPrompt does not reship full tool history on a warm thread", () => {
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "lookup" } }]);
   const messages = [
@@ -199,16 +217,19 @@ test("composeCustomToolTurnPrompt does not reship full tool history on a warm th
   const warm = composeCustomToolTurnPrompt({ body, tools, messages, hadPriorTurn: true });
   assert.match(warm, /call_2/);
   assert.match(warm, /humidity/);
+  assert.match(warm, /<gw_tool_results>/);
   assert.doesNotMatch(warm, /call_1/);
   assert.doesNotMatch(warm, /weather in tokyo/);
   assert.doesNotMatch(warm, /<system>/);
-  assert.doesNotMatch(warm, /You may call these custom tools/);
+  assert.doesNotMatch(warm, /executed your custom tools/);
 
   const cold = composeCustomToolTurnPrompt({ body, tools, messages, hadPriorTurn: false });
   assert.match(cold, /call_1/);
   assert.match(cold, /call_2/);
   assert.match(cold, /weather in tokyo/);
+  assert.match(cold, /<gw_tool_results>/);
   assert.match(cold, /<system>/);
+  assert.match(cold, /be brief/);
 
   const nextUser = composeCustomToolTurnPrompt({
     body,
@@ -250,13 +271,16 @@ test("composeCustomToolTurnPrompt slices multiple new users after priorMessageCo
   assert.equal(sameLen, "first");
 });
 
-test("composeToolResultPrompt lists client tool output", () => {
-  const text = composeToolResultPrompt([{ id: "call_1", content: '{"temp":22}' }]);
+test("composeToolResultPrompt wraps gw_tool_results JSON", () => {
+  const text = composeToolResultPrompt([{ id: "call_1", name: "lookup", content: '{"temp":22}' }]);
+  assert.match(text, /<gw_tool_results>/);
   assert.match(text, /call_1/);
+  assert.match(text, /"name":"lookup"/);
   assert.match(text, /22/);
   const failed = composeToolResultPrompt([{ id: "call_2", content: "lookup failed", isError: true }]);
-  assert.match(failed, /call_2 ERROR:/);
+  assert.match(failed, /call_2/);
   assert.match(failed, /lookup failed/);
+  assert.match(failed, /"is_error":true/);
 });
 
 test("sdk local agent allowlists only mcp so customTools work and builtins stay off", () => {

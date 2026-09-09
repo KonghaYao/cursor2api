@@ -8,7 +8,7 @@ import { encodeConnectFrame } from "../src/lib/bytes.ts";
 import { handleGatewayRequest } from "../src/lib/handler.ts";
 import { createMemoryKv } from "../src/lib/kv.ts";
 import { cloudClientToolsClearForTests } from "../src/lib/cloud_openai.ts";
-import { setCustomToolAgentHostForTests, type SdkCustomToolMap } from "../src/lib/custom_tool_chat.ts";
+import { setCustomToolAgentHostForTests } from "../src/lib/custom_tool_chat.ts";
 
 /** JWT-shaped test credential (skips exchange_user_api_key). */
 const TEST_JWT = "eyJhbGciOiJub25lIn0.eyJleHAiOjk5OTk5OTk5OTl9.test";
@@ -586,7 +586,7 @@ Deno.test("cloud gateway has no HTTP MCP callback endpoint", async () => {
   if (res.status !== 404) throw new Error(`expected 404 for /mcp, got ${res.status}: ${await res.text()}`);
 });
 
-Deno.test("cloud health advertises AgentService customTools only, not Cloud REST chat or HTTP MCP", async () => {
+Deno.test("cloud health advertises AgentService text tools, not Cloud REST chat or HTTP MCP", async () => {
   const res = await handleGatewayRequest(new Request("http://127.0.0.1/health"), {
     kv: createMemoryKv(),
     upstream: "cloud",
@@ -596,11 +596,22 @@ Deno.test("cloud health advertises AgentService customTools only, not Cloud REST
   if (!String(body?.rpc || "").includes("AgentService")) {
     throw new Error(`unexpected health: ${JSON.stringify(body)}`);
   }
-  if (!String(body?.tools || "").includes('["mcp"]') && !String(body?.tools || "").includes("customTools")) {
-    throw new Error(`health should advertise mcp-only customTools: ${JSON.stringify(body)}`);
+  const tools = String(body?.tools || "");
+  const acceptable =
+    tools.includes('["mcp"]') ||
+    tools.includes("customTools") ||
+    tools.includes("gw_tool_call") ||
+    tools.includes("text") ||
+    tools.includes("empty") ||
+    tools.includes("mcpTools");
+  if (!acceptable) {
+    throw new Error(`health should advertise MCP allowlist and/or text tool_calls: ${JSON.stringify(body)}`);
   }
-  if (String(body?.tools || "").includes("/mcp") || String(body?.rpc || "").includes("api.cursor.com/v1/agents")) {
+  if (tools.includes("/mcp") || String(body?.rpc || "").includes("api.cursor.com/v1/agents")) {
     throw new Error(`health must not advertise HTTP MCP or Cloud REST chat: ${JSON.stringify(body)}`);
+  }
+  if (/default toolset|shell\/edit\/grep\/task|builtin shell/i.test(tools) && !/no shell|not shell|shell\/edit.*off/i.test(tools)) {
+    throw new Error(`health must not advertise default shell/edit toolset: ${JSON.stringify(body)}`);
   }
 });
 
@@ -628,26 +639,30 @@ Deno.test("cloud GET /v1/models uses api.cursor.com", async () => {
   }
 });
 
-function installFakeCustomToolHost(created: string[] = []) {
+function fakeGwToolCallText(name: string, args: Record<string, unknown> = {}, preamble = "I'll look that up.") {
+  return `${preamble}\n<gw_tool_call>\n${JSON.stringify({ name, arguments: args })}\n</gw_tool_call>`;
+}
+
+function isGwToolResultsFollowUp(prompt: string): boolean {
+  return prompt.includes("<gw_tool_results>") || prompt.includes("gw_tool_results");
+}
+
+/** Fake AgentService host: emits `<gw_tool_call>` fences (no execute). Pass toolName to simulate tools turns. */
+function installFakeCustomToolHost(created: string[] = [], toolName?: string) {
   const usage = { inputTokens: 40, outputTokens: 4, cacheReadTokens: 30, cacheWriteTokens: 2 };
   setCustomToolAgentHostForTests({
-    async create({ customTools }: { customTools: SdkCustomToolMap }) {
-      const names = Object.keys(customTools);
+    async create() {
       const agentId = `local-test-agent-${created.length + 1}`;
       created.push(agentId);
       return {
         agentId,
         async send(prompt: string) {
           const wait = (async () => {
-            if (prompt.includes("executed your custom tools")) {
+            if (isGwToolResultsFollowUp(prompt)) {
               return { text: "done:22c from tool results", usage };
             }
-            const first = names[0];
-            if (!first) return { text: "no-tools", usage };
-            const result = await customTools[first]!.execute({ city: "Tokyo" }, {});
-            const rec = result as { content?: Array<{ text?: string }> };
-            const text = rec?.content?.[0]?.text || JSON.stringify(result);
-            return { text: `done:${text}`, usage };
+            if (!toolName) return { text: "no-tools", usage };
+            return { text: fakeGwToolCallText(toolName, { city: "Tokyo" }), usage };
           })();
           return { wait: () => wait };
         },
@@ -657,9 +672,9 @@ function installFakeCustomToolHost(created: string[] = []) {
   });
 }
 
-Deno.test("cloud OpenAI tools park customTools.execute and resume with client results", async () => {
+Deno.test("cloud OpenAI tools return text-parsed tool_calls and resume with client results", async () => {
   cloudClientToolsClearForTests();
-  installFakeCustomToolHost();
+  installFakeCustomToolHost([], "get_weather");
   const kv = createMemoryKv();
   const ctx = { kv, upstream: "cloud" as const };
   const tools = [{ type: "function", function: { name: "get_weather", parameters: { type: "object", properties: { city: { type: "string" } } } } }];
@@ -685,11 +700,14 @@ Deno.test("cloud OpenAI tools park customTools.execute and resume with client re
       throw new Error(`expected tool_calls, got ${JSON.stringify(chatBody)}`);
     }
     const tc = chatBody.choices[0].message.tool_calls;
-    if (Array.isArray(tc) && Number(chatBody?.usage?.prompt_tokens || 0) !== 0) {
-      throw new Error(`tool_calls response should not have turnEnded usage yet: ${JSON.stringify(chatBody.usage)}`);
+    if (chatBody?.usage?.prompt_tokens !== 40 || chatBody?.usage?.prompt_tokens_details?.cached_tokens !== 30) {
+      throw new Error(`expected turnEnded usage on tool_calls turn, got ${JSON.stringify(chatBody.usage)}`);
     }
     if (!Array.isArray(tc) || tc.length !== 1 || tc[0]?.function?.name !== "get_weather") {
       throw new Error(`expected one complete get_weather tool_call, got ${JSON.stringify(tc)}`);
+    }
+    if (String(chatBody?.choices?.[0]?.message?.content || "").includes("<gw_tool_call>")) {
+      throw new Error(`gw_tool_call fence must not leak into tool_calls message content`);
     }
     const chat2 = await handleGatewayRequest(
       new Request("http://127.0.0.1/v1/chat/completions", {
@@ -713,7 +731,7 @@ Deno.test("cloud OpenAI tools park customTools.execute and resume with client re
     if (chat2.status !== 200) throw new Error(`chat2 ${chat2.status}: ${await chat2.text()}`);
     const chat2Body = await chat2.json();
     if (!String(chat2Body?.choices?.[0]?.message?.content || "").includes("22")) {
-      throw new Error(`expected final text from customTools.execute, got ${JSON.stringify(chat2Body)}`);
+      throw new Error(`expected final text after gw_tool_results follow-up, got ${JSON.stringify(chat2Body)}`);
     }
     if (chat2Body?.usage?.prompt_tokens !== 40 || chat2Body?.usage?.prompt_tokens_details?.cached_tokens !== 30) {
       throw new Error(`expected AgentService usage on final turn, got ${JSON.stringify(chat2Body.usage)}`);
@@ -729,17 +747,17 @@ Deno.test("cloud OpenAI two tool rounds then final text (full transcript)", asyn
   const usage = { inputTokens: 40, outputTokens: 4, cacheReadTokens: 30, cacheWriteTokens: 2 };
   let sends = 0;
   setCustomToolAgentHostForTests({
-    async create({ customTools }: { customTools: SdkCustomToolMap }) {
+    async create() {
       return {
         agentId: "local-multi-round",
-        async send() {
+        async send(prompt: string) {
           const round = sends++;
           const wait = (async () => {
-            if (round >= 2) return { text: "humidity 40 after two lookups", usage };
-            const first = Object.keys(customTools)[0];
-            if (!first) return { text: "no-tools", usage };
-            await customTools[first]!.execute({ round }, {});
-            return { text: "should-not-reach", usage };
+            if (isGwToolResultsFollowUp(prompt)) {
+              if (round >= 2) return { text: "humidity 40 after two lookups", usage };
+              return { text: fakeGwToolCallText("lookup", { round }), usage };
+            }
+            return { text: fakeGwToolCallText("lookup", { round }), usage };
           })();
           return { wait: () => wait, abort() {}, release() {} };
         },
@@ -820,9 +838,9 @@ Deno.test("cloud OpenAI two tool rounds then final text (full transcript)", asyn
   }
 });
 
-Deno.test("cloud tool results continue when the parked execute() is gone", async () => {
+Deno.test("cloud tool results continue when the prior AgentService run is gone", async () => {
   cloudClientToolsClearForTests();
-  installFakeCustomToolHost();
+  installFakeCustomToolHost([], "get_weather");
   const kv = createMemoryKv();
   const ctx = { kv, upstream: "cloud" as const };
   const tools = [{ type: "function", function: { name: "get_weather", parameters: { type: "object", properties: { city: { type: "string" } } } } }];
@@ -846,7 +864,7 @@ Deno.test("cloud tool results continue when the parked execute() is gone", async
     const chatBody = await chat.json();
     const tc = chatBody.choices[0].message.tool_calls;
     cloudClientToolsClearForTests();
-    installFakeCustomToolHost();
+    installFakeCustomToolHost([], "get_weather");
     const chat2 = await handleGatewayRequest(
       new Request("http://127.0.0.1/v1/chat/completions", {
         method: "POST",
@@ -869,7 +887,7 @@ Deno.test("cloud tool results continue when the parked execute() is gone", async
     if (chat2.status !== 200) throw new Error(`chat2 ${chat2.status}: ${await chat2.text()}`);
     const chat2Body = await chat2.json();
     if (String(chat2Body?.error?.message || "").includes("expired")) {
-      throw new Error(`park miss should not expire: ${JSON.stringify(chat2Body)}`);
+      throw new Error(`tool-results follow-up should not expire: ${JSON.stringify(chat2Body)}`);
     }
     if (!String(chat2Body?.choices?.[0]?.message?.content || "").includes("22")) {
       throw new Error(`expected follow-up text from tool results, got ${JSON.stringify(chat2Body)}`);
@@ -882,7 +900,7 @@ Deno.test("cloud tool results continue when the parked execute() is gone", async
 
 Deno.test("cloud stream=true emits complete tool_calls in one delta", async () => {
   cloudClientToolsClearForTests();
-  installFakeCustomToolHost();
+  installFakeCustomToolHost([], "lookup");
   const kv = createMemoryKv();
   const ctx = { kv, upstream: "cloud" as const };
   try {
@@ -909,6 +927,9 @@ Deno.test("cloud stream=true emits complete tool_calls in one delta", async () =
     }
     if (!text.includes('"finish_reason":"tool_calls"')) throw new Error(`missing finish_reason tool_calls: ${text}`);
     if (!text.includes('"name":"lookup"')) throw new Error(text);
+    if (text.includes("<gw_tool_call>") || text.includes("</gw_tool_call>")) {
+      throw new Error(`gw_tool_call fences must not appear in streamed content: ${text.slice(0, 800)}`);
+    }
   } finally {
     setCustomToolAgentHostForTests(undefined);
     cloudClientToolsClearForTests();

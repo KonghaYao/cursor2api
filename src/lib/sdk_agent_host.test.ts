@@ -41,7 +41,7 @@ class InteractiveDuplex implements AgentDuplex {
   }
 }
 
-test("in-repo host parks customTools.execute and finishes after the tool result", async () => {
+test("in-repo host replies mcpError on mcpArgs without parking execute", async () => {
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "get_weather" } }]);
   const session = upsertClientToolSession("t", "s", tools);
   const customTools = toSdkCustomTools(session);
@@ -69,7 +69,8 @@ test("in-repo host parks customTools.execute and finishes after the tool result"
       });
       return;
     }
-    if (field(exec, "mcpResult", "mcp_result")) {
+    const mcpResult = asObject(field(exec, "mcpResult", "mcp_result"));
+    if (field(mcpResult, "error")) {
       duplex.push({ interactionUpdate: { textDelta: { text: "22c in Tokyo" } } });
       duplex.push({ interactionUpdate: { turnEnded: {} } });
     }
@@ -83,17 +84,26 @@ test("in-repo host parks customTools.execute and finishes after the tool result"
   const agent = await host.create({ apiKey: "crsr_test", model: "composer-2.5-fast", customTools });
   const run = await agent.send("weather in Tokyo?");
 
-  const parked = await waitFor(() => session.parked.find((p) => !p.offered));
-  assert.equal(parked?.name, "get_weather");
-  assert.equal(parked?.args.city, "Tokyo");
-  parked!.resolve?.({ content: [{ type: "text", text: '{"temp":22}' }] });
+  await waitFor(() =>
+    duplex.sent.find((m) => {
+      const exec = asObject(field(m, "execClientMessage", "exec_client_message"));
+      const err = asObject(field(asObject(field(exec, "mcpResult", "mcp_result")), "error"));
+      return typeof field(err, "error") === "string";
+    }),
+  );
+  assert.equal(session.parked.length, 0);
+  const errorMsg = duplex.sent
+    .map((m) => {
+      const exec = asObject(field(m, "execClientMessage", "exec_client_message"));
+      const err = asObject(field(asObject(field(exec, "mcpResult", "mcp_result")), "error"));
+      return field(err, "error");
+    })
+    .find((v) => typeof v === "string");
+  assert.match(String(errorMsg), /text-only run/);
 
   const result = await run.wait();
   assert.equal(result.error, undefined);
   assert.equal(result.text, "22c in Tokyo");
-  assert.ok(
-    duplex.sent.some((m) => field(asObject(field(m, "execClientMessage")), "mcpResult", "mcp_result")),
-  );
   await agent.close();
 });
 
@@ -356,7 +366,7 @@ test("abort sends ConversationAction.cancelAction then closes the run", async ()
   await agent.close();
 });
 
-test("release closes the run without cancelAction or mcpResult", async () => {
+test("release closes the run without cancelAction or mcpSuccess", async () => {
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "get_weather" } }]);
   const session = upsertClientToolSession("t", "s-release", tools);
   const customTools = toSdkCustomTools(session);
@@ -384,10 +394,11 @@ test("release closes the run without cancelAction or mcpResult", async () => {
   });
   const agent = await host.create({ apiKey: "crsr_test", model: "composer-2.5", customTools });
   const run = await agent.send("weather?");
-  const parked = await waitFor(() => session.parked.find((p) => !p.offered));
-  assert.ok(parked);
+  await waitFor(() =>
+    duplex.sent.some((m) => field(asObject(field(m, "execClientMessage")), "mcpResult", "mcp_result")),
+  );
+  assert.equal(session.parked.length, 0);
   run.release?.();
-  parked.resolve?.({ content: [{ type: "text", text: "should-not-reach-cursor" }], isError: true });
   const result = await run.wait();
   assert.equal(result.error, undefined);
   assert.equal(
@@ -395,7 +406,10 @@ test("release closes the run without cancelAction or mcpResult", async () => {
     false,
   );
   assert.equal(
-    duplex.sent.some((m) => field(asObject(field(m, "execClientMessage")), "mcpResult", "mcp_result")),
+    duplex.sent.some((m) => {
+      const exec = asObject(field(m, "execClientMessage", "exec_client_message"));
+      return field(asObject(field(exec, "mcpResult", "mcp_result")), "success") !== undefined;
+    }),
     false,
   );
   await agent.close();

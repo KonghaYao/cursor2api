@@ -1,10 +1,8 @@
 /**
- * Custom-tools chat path: OpenAI tools → in-process `customTools.execute`.
- * The agent loop is AgentService/Run. Client tools stay OpenAI / Anthropic
- * function tools; this gateway is not an MCP server and does not expose
- * HTTP `/mcp`. AgentService's wire allowlist still has to name the MCP
- * family or custom function tools never appear — that is Cursor's constraint,
- * not a product surface.
+ * Custom-tools chat path: OpenAI/Anthropic function tools → text `<gw_tool_call>`
+ * fences parsed after turnEnded. One HTTP request = one AgentService/Run.
+ * Client tools stay OpenAI / Anthropic function tools; upstream has empty
+ * MCP tools and no default shell/edit toolset.
  *
  * Conversation id is `tenant:agentRunFp` (model / effort / tools / system /
  * first user). Client `x-session-id` / `conversation_id` are ignored. KV
@@ -44,27 +42,31 @@ import { kvGetAgentRun, kvGetAgentRunLen, kvSetAgentRun, kvSetAgentRunLen, type 
 import { agentRunIds, resolveSessionMode } from "./session.ts";
 import { computeAgentRunFp } from "./session_fingerprint.ts";
 import {
-  clientToolsToAnthropic,
-  clientToolsToOpenAi,
+  clientToolsDisabled,
   composeToolResultPrompt,
   extractClientToolResults,
   extractLatestClientToolResults,
-  failParkedClientTools,
   lastTurnIsToolResult,
-  offerClientToolBatch,
-  toSdkCustomTools,
-  toolPolicyPrompt,
-  upsertClientToolSession,
-  waitForClientToolBatch,
-  type ClientToolSession,
   type CustomToolDef,
-  type ParkedClientTool,
 } from "./custom_tools.ts";
+import {
+  composeReplacementSystemPrompt,
+  gwToolCallsToAnthropic,
+  gwToolCallsToOpenAi,
+  splitAssistantToolText,
+} from "./text_tool_calls.ts";
 import { gatewayAgentModelSelection, promptCacheHitPercent, type AgentInlineImage, type AgentTurnUsage } from "./agent_json.ts";
 import { openaiContentToCursorParts } from "./content_parts.ts";
 import { defaultSdkAgentHost } from "./sdk_agent_host.ts";
 
-export type SdkCustomToolMap = ReturnType<typeof toSdkCustomTools>;
+export type SdkCustomToolMap = Record<
+  string,
+  {
+    description?: string;
+    inputSchema?: Record<string, unknown>;
+    execute: (args: Record<string, unknown>, ctx: { toolCallId?: string }) => Promise<unknown>;
+  }
+>;
 
 /** Public name of the only builtin capability group we allow (MCP / customTools). */
 export const SDK_CUSTOM_ONLY_BUILTIN_TOOLS = ["mcp"] as const;
@@ -213,6 +215,20 @@ export function systemPromptFromClient(body: Record<string, unknown>): string {
   return parts.join("\n\n");
 }
 
+/** Default on: Dashboard `crsr_` still rejects Connect `customSystemPrompt`. Set `GATEWAY_FOLD_SYSTEM=0` to try the SDK replacement field. */
+function gatewayFoldSystemEnabled(): boolean {
+  const raw = (readEnv("GATEWAY_FOLD_SYSTEM") || "1").trim().toLowerCase();
+  return raw !== "0" && raw !== "false" && raw !== "off";
+}
+
+function replacementSystemPrompt(body: Record<string, unknown>, tools: CustomToolDef[]): string {
+  return composeReplacementSystemPrompt({
+    clientSystem: systemPromptFromClient(body),
+    tools,
+    body,
+  });
+}
+
 export function composeCustomToolPrompt(opts: {
   body: Record<string, unknown>;
   tools: CustomToolDef[];
@@ -220,14 +236,24 @@ export function composeCustomToolPrompt(opts: {
   followUp?: boolean;
 }): string {
   const user = lastUserPrompt(opts.messages);
-  // Follow-ups: Cursor already has system, tool policy, and prior turns in
-  // conversationState. Re-folding any of that into every userMessageAction
-  // looks like a huge new prompt and fights prompt cache.
   if (opts.followUp) return user;
-  const policy = toolPolicyPrompt(opts.body, opts.tools);
-  const system = systemPromptFromClient(opts.body);
-  const wrapped = system ? `<system>\n${system}\n</system>` : "";
-  return [policy, wrapped, user].filter(Boolean).join("\n\n");
+  if (!gatewayFoldSystemEnabled()) return user;
+  const system = replacementSystemPrompt(opts.body, opts.tools);
+  if (!system.trim()) return user;
+  return `<system>\n${system}\n</system>\n\n${user}`;
+}
+
+/** Whether this turn should pass systemPrompt on agent.send (not folded into user). */
+export function shouldSendReplacementSystemPrompt(opts: {
+  hadPriorTurn: boolean;
+  toolFollowUp: boolean;
+  foldSystem: boolean;
+}): boolean {
+  if (opts.foldSystem) return false;
+  if (opts.toolFollowUp && opts.hadPriorTurn) return false;
+  if (opts.toolFollowUp && !opts.hadPriorTurn) return true;
+  if (opts.hadPriorTurn) return false;
+  return true;
 }
 
 /**
@@ -266,16 +292,19 @@ export function composeCustomToolTurnPrompt(opts: {
     });
   }
   // Cold start (no live agent, no KV): Cursor has no conversationState, so
-  // fold system + the original user question and every tool result we have.
+  // fold the original user question and every tool result we have.
   // Warm thread: only the latest round — reshipping history is a cache miss.
   const results = composeToolResultPrompt(opts.hadPriorTurn ? latest : extractClientToolResults(opts.messages));
   if (opts.hadPriorTurn) return results;
-  return [composeCustomToolPrompt({
-    body: opts.body,
-    tools: opts.tools,
-    messages: opts.messages,
-    followUp: false,
-  }), results].filter(Boolean).join("\n\n");
+  return [
+    composeCustomToolPrompt({
+      body: opts.body,
+      tools: opts.tools,
+      messages: opts.messages,
+      followUp: false,
+    }),
+    results,
+  ].filter(Boolean).join("\n\n");
 }
 
 export type CustomToolTurnResult = { text: string; thinking?: string; error?: string; usage?: AgentTurnUsage };
@@ -286,6 +315,8 @@ export type CustomToolSendOpts = {
   images?: AgentInlineImage[];
   onDelta?: (chunk: AgentStreamDelta) => void;
   signal?: AbortSignal;
+  /** First-shot replacement system prompt (SDK systemPrompt). Omit on follow-ups. */
+  systemPrompt?: string;
 };
 
 export type CustomToolAgentHandle = {
@@ -307,6 +338,8 @@ export type CustomToolAgentCreateOpts = {
   conversationId?: string;
   agentSessionId?: string;
   conversationState?: Record<string, unknown>;
+  /** Optional first-shot replacement system prompt; also passed per send(). */
+  systemPrompt?: string;
   onCheckpoint?: (state: Record<string, unknown>) => void;
 };
 
@@ -390,7 +423,6 @@ function ackLiveDeltas(live: LiveTurn, thinking?: string, text?: string): void {
 
 type LiveTurn = {
   agent: CustomToolAgentHandle;
-  session: ClientToolSession;
   wait: () => Promise<CustomToolTurnResult>;
   abort?: () => void;
   release?: () => void;
@@ -401,6 +433,7 @@ type LiveTurn = {
   error?: string;
   usage?: AgentTurnUsage;
   deltas: TextDeltaHub;
+  bufferText: boolean;
 };
 
 function attachClientAbort(signal: AbortSignal | undefined, abort: () => void): () => void {
@@ -417,11 +450,10 @@ function attachClientAbort(signal: AbortSignal | undefined, abort: () => void): 
   return () => signal.removeEventListener("abort", onAbort);
 }
 
-/** Close this HTTP request's AgentService/Run after offering tool_calls.
+/** Close this HTTP request's AgentService/Run after returning tool_calls.
  * Close-only: `cancelAction` would void the turn and break the next `role: tool`. */
-function releaseUpstreamAfterPark(live: LiveTurn, session: ClientToolSession): void {
-  (live.release ?? live.abort)?.();
-  failParkedClientTools(session, "released: request-scoped AgentService run");
+function releaseUpstreamAfterTurn(live: LiveTurn): void {
+  live.release?.();
 }
 
 const liveTurns = new Map<string, LiveTurn>();
@@ -503,36 +535,41 @@ async function resolveHost(): Promise<CustomToolAgentHost> {
   }
 }
 
-async function settleCustomTools(
-  session: ClientToolSession,
+async function settleTextTurn(
   live: LiveTurn,
-): Promise<{ kind: "tools"; batch: ParkedClientTool[] } | { kind: "text" }> {
-  // HTTP request.signal is bound to this turn's abort() (cancelAction) via
-  // attachClientAbort, not send({ signal }). Detach before returning 200 so
-  // Deno legacy abort after a successful response cannot fire cancel on a
-  // parked or later turn.
-  const gate = new AbortController();
-  const stop = () => gate.abort();
-  void live.wait().then((result) => {
-    live.done = true;
-    live.text = result.text;
-    live.thinking = result.thinking;
-    live.error = result.error;
-    live.usage = result.usage;
-    stop();
-  });
-  try {
-    while (!live.done) {
-      const batch = await waitForClientToolBatch(session, gate.signal);
-      if (batch.length) return { kind: "tools", batch };
-      if (live.done) break;
+  tools: CustomToolDef[],
+  body: Record<string, unknown>,
+): Promise<
+  | {
+      kind: "tools";
+      openAiToolCalls: ReturnType<typeof gwToolCallsToOpenAi>;
+      anthropicToolUses: ReturnType<typeof gwToolCallsToAnthropic>;
+      visibleText: string;
+      thinking?: string;
+      usage?: AgentTurnUsage;
     }
-  } catch {
-    /* gate abort when the run finishes */
+  | { kind: "text"; result: CustomToolTurnResult }
+> {
+  const result = live.done ? liveResult(live) : await live.wait();
+  live.done = true;
+  live.text = result.text;
+  live.thinking = result.thinking;
+  live.error = result.error;
+  live.usage = result.usage;
+  if (tools.length && !clientToolsDisabled(body)) {
+    const { calls, visibleText } = splitAssistantToolText(result.text, tools);
+    if (calls.length) {
+      return {
+        kind: "tools",
+        openAiToolCalls: gwToolCallsToOpenAi(calls),
+        anthropicToolUses: gwToolCallsToAnthropic(calls),
+        visibleText,
+        thinking: result.thinking,
+        usage: result.usage,
+      };
+    }
   }
-  const leftover = session.parked.filter((p) => !p.offered);
-  if (leftover.length) return { kind: "tools", batch: leftover };
-  return { kind: "text" };
+  return { kind: "text", result };
 }
 
 async function startCustomToolTurn(opts: {
@@ -542,15 +579,17 @@ async function startCustomToolTurn(opts: {
   signal?: AbortSignal;
   kv?: Kv;
   protocol?: "openai" | "anthropic";
-}): Promise<{ live: LiveTurn; session: ClientToolSession; sessionId: string; continued: boolean }> {
+}): Promise<{ live: LiveTurn; sessionId: string; continued: boolean }> {
   const tenant = await credentialFingerprint(opts.apiKey);
   if (resolveSessionMode() === "random") {
-    throw new CloudChatError("SESSION_MODE=random cannot park customTools.execute across turns.", 400);
+    throw new CloudChatError(
+      "SESSION_MODE=random breaks stable conversationId; text gw_tool_call tools need tenant:agentRunFp.",
+      400,
+    );
   }
   const protocol = opts.protocol ?? "openai";
   const sessionFp = await sessionFpForCustomTools(opts.body, protocol);
   const computedIds = agentRunIds(tenant, sessionFp);
-  const session = upsertClientToolSession(tenant, sessionFp, opts.tools);
   const messages = Array.isArray(opts.body.messages) ? opts.body.messages : [];
   const toolResults = extractLatestClientToolResults(messages);
   const toolFollowUp = lastTurnIsToolResult(messages) && toolResults.length > 0;
@@ -564,19 +603,15 @@ async function startCustomToolTurn(opts: {
 
   if (existing && !existing.done) {
     if (toolFollowUp) {
-      (existing.release ?? existing.abort)?.();
-      if (session.parked.length) failParkedClientTools(session, "released: previous AgentService run");
+      existing.release?.();
     } else {
       existing.abort?.();
-      failParkedClientTools(session, "cancelled: new user turn");
     }
     try {
       await existing.wait();
     } catch {
       /* previous AgentService/Run closed */
     }
-  } else if (session.parked.length && !toolFollowUp) {
-    failParkedClientTools(session, "cancelled: new user turn");
   }
 
   const binding = opts.kv ? await kvGetAgentRun(opts.kv, tenant, sessionFp, sessionFp) : null;
@@ -597,22 +632,25 @@ async function startCustomToolTurn(opts: {
   };
 
   const host = await resolveHost();
-  const customTools = toSdkCustomTools(session);
+  const hadPriorTurn = Boolean(existing) || Boolean(binding);
+  const foldSystem = gatewayFoldSystemEnabled();
+  const sendSystem = shouldSendReplacementSystemPrompt({ hadPriorTurn, toolFollowUp, foldSystem });
+  const systemPrompt = sendSystem ? replacementSystemPrompt(opts.body, opts.tools) : undefined;
   const agent = existing?.agent ?? (await host.create({
     apiKey: opts.apiKey,
     model: opts.body.model,
     fast: extractFastMode(opts.body),
     reasoningEffort: extractReasoningEffort(opts.body),
-    customTools,
+    customTools: {},
     conversationId: ids.conversationId,
     agentSessionId: ids.agentSessionId,
     conversationState: checkpoint.state,
+    ...(systemPrompt ? { systemPrompt } : {}),
     onCheckpoint: (state) => {
       checkpoint.state = state;
       void persistBinding(state);
     },
   }));
-  const hadPriorTurn = Boolean(existing) || Boolean(binding);
   if (toolFollowUp) {
     console.log(
       `  custom_tools follow_tool session=${sessionId.slice(0, 24)} existing=${Boolean(existing)} kv=${Boolean(binding)} — new AgentService/Run`,
@@ -631,19 +669,20 @@ async function startCustomToolTurn(opts: {
     console.log(`  custom_tools slice prior=${priorMessageCount} n=${messages.length}`);
   }
   const deltas = createTextDeltaHub();
+  const bufferText = opts.tools.length > 0 && !clientToolsDisabled(opts.body);
   const run = await agent.send(prompt, {
     ...(images.length ? { images } : {}),
+    ...(sendSystem && systemPrompt ? { systemPrompt } : {}),
     onDelta: (chunk) => deltas.push(chunk),
     // Do not pass HTTP request.signal into send(): Deno.serve aborts it after
-    // 200, which would cancelAction a parked Run. Client abort is attachClientAbort.
+    // 200, which would cancelAction a completed Run. Client abort is attachClientAbort.
   });
   await persistCommittedLength();
   const abortRun = () => run.abort?.();
-  const releaseRun = () => (run.release ?? run.abort)?.();
+  const releaseRun = () => run.release?.();
   const detachClientAbort = attachClientAbort(opts.signal, abortRun);
   const live: LiveTurn = {
     agent,
-    session,
     wait: run.wait,
     abort: abortRun,
     release: releaseRun,
@@ -651,8 +690,8 @@ async function startCustomToolTurn(opts: {
     done: false,
     text: "",
     deltas,
+    bufferText,
   };
-  session.agentId = agent.agentId;
   liveTurns.set(key, live);
   void live.wait().then((result) => {
     live.done = true;
@@ -665,7 +704,7 @@ async function startCustomToolTurn(opts: {
   });
   const origin = existing ? "follow" : binding ? "kv_hit" : "create";
   console.log(`  custom_tools ${origin} session=${sessionId.slice(0, 24)} agent=${agent.agentId.slice(0, 14)} tools=${opts.tools.length} images=${images.length}`);
-  return { live, session, sessionId, continued: false };
+  return { live, sessionId, continued: false };
 }
 
 function cursorTurnFromAgentUsage(usage?: AgentTurnUsage) {
@@ -746,7 +785,7 @@ function openAiCompletion(opts: {
   thinking?: string;
   error?: string;
   usage?: AgentTurnUsage;
-  toolCalls?: ReturnType<typeof clientToolsToOpenAi>;
+  toolCalls?: ReturnType<typeof gwToolCallsToOpenAi>;
 }) {
   const toolCalls = opts.toolCalls?.length ? opts.toolCalls : undefined;
   const err = trimAgentError(opts.error);
@@ -788,30 +827,29 @@ export async function handleCustomToolChatCompletions(opts: {
   });
   const agentId = started.live.agent.agentId;
   if (opts.body.stream) {
-    return streamCustomOpenAi({ ...started, model: opts.body.model, agentId, signal: opts.signal });
+    return streamCustomOpenAi({ ...started, model: opts.body.model, agentId, tools: opts.tools, body: opts.body, signal: opts.signal });
   }
-  const settled = await settleCustomTools(started.session, started.live);
+  const settled = await settleTextTurn(started.live, opts.tools, opts.body);
   started.live.detachClientAbort?.();
   if (settled.kind === "tools") {
-    offerClientToolBatch(started.session, settled.batch);
-    releaseUpstreamAfterPark(started.live, started.session);
-    const toolCalls = clientToolsToOpenAi(settled.batch);
-    console.log(`  custom_tools park ${toolCalls.map((c) => c.function.name).join(",")}`);
-    ackLiveDeltas(started.live, started.live.thinking, started.live.text);
+    releaseUpstreamAfterTurn(started.live);
+    const toolCalls = settled.openAiToolCalls;
+    console.log(`  custom_tools text ${toolCalls.map((c) => c.function.name).join(",")}`);
+    ackLiveDeltas(started.live, settled.thinking, settled.visibleText);
     return jsonResponse(
       200,
       openAiCompletion({
         model: opts.body.model,
         agentId,
         sessionId: started.sessionId,
-        text: started.live.text,
-        thinking: started.live.thinking,
-        usage: started.live.usage,
+        text: settled.visibleText,
+        thinking: settled.thinking,
+        usage: settled.usage,
         toolCalls,
       }),
     );
   }
-  const result = started.live.done ? liveResult(started.live) : await started.live.wait();
+  const result = settled.result;
   logAgentUsage(result.usage);
   ackLiveDeltas(started.live, result.thinking, result.text);
   return jsonResponse(
@@ -847,28 +885,35 @@ export async function handleCustomToolMessages(opts: {
   });
   const agentId = started.live.agent.agentId;
   if (opts.body.stream) {
-    return streamCustomAnthropic({ ...started, model: opts.body.model, agentId, requestId: opts.requestId, signal: opts.signal });
+    return streamCustomAnthropic({
+      ...started,
+      model: opts.body.model,
+      agentId,
+      tools: opts.tools,
+      body: opts.body,
+      requestId: opts.requestId,
+      signal: opts.signal,
+    });
   }
-  const settled = await settleCustomTools(started.session, started.live);
+  const settled = await settleTextTurn(started.live, opts.tools, opts.body);
   started.live.detachClientAbort?.();
   if (settled.kind === "tools") {
-    offerClientToolBatch(started.session, settled.batch);
-    releaseUpstreamAfterPark(started.live, started.session);
-    const toolUses = clientToolsToAnthropic(settled.batch);
-    ackLiveDeltas(started.live, started.live.thinking, started.live.text);
+    releaseUpstreamAfterTurn(started.live);
+    const toolUses = settled.anthropicToolUses;
+    ackLiveDeltas(started.live, settled.thinking, settled.visibleText);
     return jsonResponse(200, {
       id: `msg_${agentId}`,
       type: "message",
       role: "assistant",
       model: String(opts.body.model || "composer-2.5"),
-      content: anthropicContentBlocks({ thinking: started.live.thinking, text: started.live.text, toolUses }),
+      content: anthropicContentBlocks({ thinking: settled.thinking, text: settled.visibleText, toolUses }),
       stop_reason: "tool_use",
-      usage: anthropicUsageFromAgent(started.live.usage),
+      usage: anthropicUsageFromAgent(settled.usage),
       cursor_agent_id: agentId,
       conversation_id: started.sessionId,
     }, opts.requestId);
   }
-  const result = started.live.done ? liveResult(started.live) : await started.live.wait();
+  const result = settled.result;
   logAgentUsage(result.usage);
   ackLiveDeltas(started.live, result.thinking, result.text);
   const err = trimAgentError(result.error);
@@ -891,13 +936,14 @@ export async function handleCustomToolMessages(opts: {
 
 function streamCustomOpenAi(opts: {
   live: LiveTurn;
-  session: ClientToolSession;
   sessionId: string;
   model: unknown;
   agentId: string;
+  tools: CustomToolDef[];
+  body: Record<string, unknown>;
   signal?: AbortSignal;
 }): Promise<Response> {
-  const { live, session, sessionId, model, agentId } = opts;
+  const { live, sessionId, model, agentId, tools, body } = opts;
   const created = Math.floor(Date.now() / 1000);
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -914,13 +960,15 @@ function streamCustomOpenAi(opts: {
         });
       let emittedThinking = live.deltas.ackedThinking;
       let emittedText = live.deltas.ackedText;
-      const flush = () => {
+      const flushThinking = () => {
         const thinking = longerText(live.thinking, live.deltas.streamedThinking);
-        const text = longerText(live.text, live.deltas.streamedText);
         if (thinking.length > emittedThinking) {
           controller.enqueue(chunk({ reasoning_content: thinking.slice(emittedThinking) }));
           emittedThinking = thinking.length;
         }
+      };
+      const flushText = (text: string) => {
+        if (live.bufferText) return;
         if (text.length > emittedText) {
           controller.enqueue(chunk({ content: text.slice(emittedText) }));
           emittedText = text.length;
@@ -928,19 +976,27 @@ function streamCustomOpenAi(opts: {
       };
       try {
         controller.enqueue(chunk({ role: "assistant" }));
-        const unsub = live.deltas.subscribe(flush);
-        flush();
-        const settled = await settleCustomTools(session, live);
+        const unsub = live.deltas.subscribe(() => {
+          flushThinking();
+          flushText(longerText(live.text, live.deltas.streamedText));
+        });
+        flushThinking();
+        flushText(longerText(live.text, live.deltas.streamedText));
+        const settled = await settleTextTurn(live, tools, body);
         unsub();
-        flush();
+        flushThinking();
         live.deltas.ackedThinking = emittedThinking;
-        live.deltas.ackedText = emittedText;
-        const usage = openaiUsageFromAgent(live.usage);
         if (settled.kind === "tools") {
-          offerClientToolBatch(session, settled.batch);
-          releaseUpstreamAfterPark(live, session);
-          const toolCalls = clientToolsToOpenAi(settled.batch);
-          console.log(`  custom_tools park ${toolCalls.map((c) => c.function.name).join(",")}`);
+          releaseUpstreamAfterTurn(live);
+          const toolCalls = settled.openAiToolCalls;
+          console.log(`  custom_tools text ${toolCalls.map((c) => c.function.name).join(",")}`);
+          const visible = settled.visibleText;
+          if (visible.length > emittedText) {
+            controller.enqueue(chunk({ content: visible.slice(emittedText) }));
+            emittedText = visible.length;
+          }
+          live.deltas.ackedText = emittedText;
+          const usage = openaiUsageFromAgent(settled.usage);
           controller.enqueue(chunk({ tool_calls: toolCalls }));
           controller.enqueue(chunk({}, "tool_calls", { usage }));
           controller.enqueue(
@@ -956,14 +1012,18 @@ function streamCustomOpenAi(opts: {
           controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
           return;
         }
-        logAgentUsage(live.usage);
-        const err = trimAgentError(live.error);
+        const result = settled.result;
+        logAgentUsage(result.usage);
+        const visible = agentVisibleText(result.text, result.error);
+        if (visible.length > emittedText) {
+          controller.enqueue(chunk({ content: visible.slice(emittedText) }));
+          emittedText = visible.length;
+        }
+        live.deltas.ackedText = emittedText;
+        const usage = openaiUsageFromAgent(result.usage);
+        const err = trimAgentError(result.error);
         if (err) {
           logCustomToolError(err);
-          if (emittedText === 0) {
-            controller.enqueue(chunk({ content: err }));
-            emittedText = err.length;
-          }
           controller.enqueue(
             encodeSseData({
               id: agentId,
@@ -1015,14 +1075,15 @@ function streamCustomOpenAi(opts: {
 
 function streamCustomAnthropic(opts: {
   live: LiveTurn;
-  session: ClientToolSession;
   sessionId: string;
   model: unknown;
   agentId: string;
+  tools: CustomToolDef[];
+  body: Record<string, unknown>;
   requestId: string;
   signal?: AbortSignal;
 }): Promise<Response> {
-  const { live, session, model, agentId, requestId } = opts;
+  const { live, model, agentId, requestId, tools, body } = opts;
   const msgId = `msg_${agentId}`;
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -1036,9 +1097,8 @@ function streamCustomAnthropic(opts: {
         index += 1;
         open = null;
       };
-      const flush = () => {
+      const flushThinking = () => {
         const thinking = longerText(live.thinking, live.deltas.streamedThinking);
-        const text = longerText(live.text, live.deltas.streamedText);
         if (thinking.length > emittedThinking) {
           if (open !== "thinking") {
             closeOpen();
@@ -1060,6 +1120,9 @@ function streamCustomAnthropic(opts: {
           );
           emittedThinking = thinking.length;
         }
+      };
+      const flushText = (text: string) => {
+        if (live.bufferText) return;
         if (text.length > emittedText) {
           if (open !== "text") {
             closeOpen();
@@ -1096,18 +1159,41 @@ function streamCustomAnthropic(opts: {
             },
           }),
         );
-        const unsub = live.deltas.subscribe(flush);
-        flush();
-        const settled = await settleCustomTools(session, live);
+        const unsub = live.deltas.subscribe(() => {
+          flushThinking();
+          flushText(longerText(live.text, live.deltas.streamedText));
+        });
+        flushThinking();
+        flushText(longerText(live.text, live.deltas.streamedText));
+        const settled = await settleTextTurn(live, tools, body);
         unsub();
-        flush();
+        flushThinking();
         closeOpen();
         live.deltas.ackedThinking = emittedThinking;
-        live.deltas.ackedText = emittedText;
         if (settled.kind === "tools") {
-          offerClientToolBatch(session, settled.batch);
-          releaseUpstreamAfterPark(live, session);
-          for (const call of clientToolsToAnthropic(settled.batch)) {
+          releaseUpstreamAfterTurn(live);
+          const visible = settled.visibleText;
+          if (visible) {
+            controller.enqueue(
+              encodeSseEvent("content_block_start", {
+                type: "content_block_start",
+                index,
+                content_block: { type: "text", text: "" },
+              }),
+            );
+            controller.enqueue(
+              encodeSseEvent("content_block_delta", {
+                type: "content_block_delta",
+                index,
+                delta: { type: "text_delta", text: visible },
+              }),
+            );
+            controller.enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index }));
+            index += 1;
+            emittedText = visible.length;
+          }
+          live.deltas.ackedText = emittedText;
+          for (const call of settled.anthropicToolUses) {
             controller.enqueue(
               encodeSseEvent("content_block_start", {
                 type: "content_block_start",
@@ -1129,14 +1215,39 @@ function streamCustomAnthropic(opts: {
             encodeSseEvent("message_delta", {
               type: "message_delta",
               delta: { stop_reason: "tool_use" },
-              usage: anthropicUsageFromAgent(live.usage),
+              usage: anthropicUsageFromAgent(settled.usage),
             }),
           );
           controller.enqueue(encodeSseEvent("message_stop", { type: "message_stop" }));
           return;
         }
-        logAgentUsage(live.usage);
-        const err = trimAgentError(live.error);
+        const result = settled.result;
+        logAgentUsage(result.usage);
+        const err = trimAgentError(result.error);
+        const visible = agentVisibleText(result.text, err);
+        if (visible.length > emittedText) {
+          if (open !== "text") {
+            closeOpen();
+            controller.enqueue(
+              encodeSseEvent("content_block_start", {
+                type: "content_block_start",
+                index,
+                content_block: { type: "text", text: "" },
+              }),
+            );
+            open = "text";
+          }
+          controller.enqueue(
+            encodeSseEvent("content_block_delta", {
+              type: "content_block_delta",
+              index,
+              delta: { type: "text_delta", text: visible.slice(emittedText) },
+            }),
+          );
+          emittedText = visible.length;
+        }
+        closeOpen();
+        live.deltas.ackedText = emittedText;
         const hadModelOutput = emittedText > 0 || emittedThinking > 0;
         if (err) {
           logCustomToolError(err);
@@ -1165,7 +1276,7 @@ function streamCustomAnthropic(opts: {
           encodeSseEvent("message_delta", {
             type: "message_delta",
             delta: { stop_reason: "end_turn" },
-            usage: anthropicUsageFromAgent(live.usage),
+            usage: anthropicUsageFromAgent(result.usage),
           }),
         );
         controller.enqueue(encodeSseEvent("message_stop", { type: "message_stop" }));

@@ -113,13 +113,15 @@ export function buildRunRequest(opts: {
   conversationGroupId?: string;
   runId: string;
   agentSessionId: string;
+  /** Kept for call-site compat; wire catalog is always empty (text-only tools). */
   tools: CustomToolSpec[];
   conversationState?: JsonObject;
   cwd?: string;
   images?: AgentInlineImage[];
+  /** When set (SDK systemPrompt / Connect customSystemPrompt), requires account flag. */
+  systemPrompt?: string;
 }): JsonObject {
   const messageId = crypto.randomUUID();
-  const mcpTools = mcpToolDefinitions(opts.tools);
   const selection = gatewayAgentModelSelection(opts.modelId);
   const parameters = opts.modelParameters ?? selection.parameters;
   const requestedModel: JsonObject = {
@@ -150,13 +152,12 @@ export function buildRunRequest(opts: {
       },
     },
     requestedModel,
-    mcpTools: { mcpTools },
+    mcpTools: { mcpTools: [] },
     conversationId: opts.conversationId,
     conversationGroupId: opts.conversationGroupId || opts.conversationId,
-    // Do not set excludeWorkspaceContext or customSystemPrompt: Dashboard
-    // crsr_ rejects both (`Workspace context exclusion is not allowed…` /
-    // `unknown option '--system-prompt'`). Client system text is folded into
-    // the user prompt. Builtins stay off via MCP-only allowlist.
+    // Never set excludeWorkspaceContext (Dashboard crsr_ rejects it). Only set
+    // customSystemPrompt when the caller passes a non-empty systemPrompt (SDK
+    // systemPrompt equivalent; accounts without the flag still get unknown option).
     runId: opts.runId,
     agentSessionId: opts.agentSessionId,
     mcpFileSystemOptions: {
@@ -166,6 +167,8 @@ export function buildRunRequest(opts: {
   };
   // Cursor only honours SelectedImage.data when this is true.
   if (images.length) req.clientSupportsInlineImages = true;
+  const systemPrompt = typeof opts.systemPrompt === "string" ? opts.systemPrompt.trim() : "";
+  if (systemPrompt) req.customSystemPrompt = systemPrompt;
   return req;
 }
 

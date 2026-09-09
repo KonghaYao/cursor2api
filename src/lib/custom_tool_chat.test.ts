@@ -24,12 +24,95 @@ afterEach(() => {
 const PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
+function gwToolCallText(name: string, args: Record<string, unknown> = {}): string {
+  return `<gw_tool_call>${JSON.stringify({ name, arguments: args })}</gw_tool_call>`;
+}
+
 test("agentImagesFromCursorParts maps Inference image parts to AgentService images", () => {
   const images = agentImagesFromCursorParts([{ image: { data: "aaaa", mimeType: "image/jpeg" } }]);
   assert.equal(images.length, 1);
   assert.equal(images[0]?.data, "aaaa");
   assert.equal(images[0]?.mimeType, "image/jpeg");
   assert.match(images[0]?.path || "", /\.jpg$/);
+});
+
+test("first shot with tools folds replacement system into the user prompt by default", async () => {
+  let sentPrompt: string | undefined;
+  let sentSystem: string | undefined;
+  setCustomToolAgentHostForTests({
+    async create(opts) {
+      assert.equal(opts.systemPrompt, undefined);
+      return {
+        agentId: "agent-sys",
+        async send(prompt, opts) {
+          sentPrompt = prompt;
+          sentSystem = opts?.systemPrompt;
+          return { wait: async () => ({ text: "ok" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const tools = openaiToolsToCustom([{ type: "function", function: { name: "lookup", description: "d" } }]);
+  const res = await handleCustomToolChatCompletions({
+    headers: new Headers({ authorization: "Bearer crsr_test" }),
+    body: {
+      model: "composer-2.5",
+      messages: [
+        { role: "system", content: "be brief" },
+        { role: "user", content: "weather?" },
+      ],
+    },
+    tools,
+  });
+  assert.equal(res.status, 200);
+  assert.match(sentPrompt || "", /<system>/);
+  assert.match(sentPrompt || "", /be brief/);
+  assert.match(sentPrompt || "", /weather\?/);
+  assert.match(sentPrompt || "", /<gw_tool_call>/);
+  assert.equal(sentSystem, undefined);
+});
+
+test("GATEWAY_FOLD_SYSTEM=0 sends replacement systemPrompt instead of folding", async () => {
+  const prev = process.env.GATEWAY_FOLD_SYSTEM;
+  process.env.GATEWAY_FOLD_SYSTEM = "0";
+  try {
+    let sentPrompt: string | undefined;
+    let sentSystem: string | undefined;
+    setCustomToolAgentHostForTests({
+      async create() {
+        return {
+          agentId: "agent-sys-replace",
+          async send(prompt, opts) {
+            sentPrompt = prompt;
+            sentSystem = opts?.systemPrompt;
+            return { wait: async () => ({ text: "ok" }) };
+          },
+          async close() {},
+        };
+      },
+    });
+    const tools = openaiToolsToCustom([{ type: "function", function: { name: "lookup", description: "d" } }]);
+    const res = await handleCustomToolChatCompletions({
+      headers: new Headers({ authorization: "Bearer crsr_test" }),
+      body: {
+        model: "composer-2.5",
+        messages: [
+          { role: "system", content: "be brief" },
+          { role: "user", content: "weather?" },
+        ],
+      },
+      tools,
+    });
+    assert.equal(res.status, 200);
+    assert.equal(sentPrompt, "weather?");
+    assert.doesNotMatch(sentPrompt || "", /<system>/);
+    assert.match(sentSystem || "", /be brief/);
+    assert.match(sentSystem || "", /lookup/);
+  } finally {
+    if (prev === undefined) delete process.env.GATEWAY_FOLD_SYSTEM;
+    else process.env.GATEWAY_FOLD_SYSTEM = prev;
+  }
 });
 
 test("OpenAI chat returns reasoning_content and forwards image bytes", async () => {
@@ -143,13 +226,15 @@ test("AgentService conversationId survives an isolate hop via KV", async () => {
   const kv = createMemoryKv();
   const creates: CustomToolAgentCreateOpts[] = [];
   const prompts: string[] = [];
+  const sendSystemPrompts: (string | undefined)[] = [];
   setCustomToolAgentHostForTests({
     async create(opts) {
       creates.push(opts);
       return {
         agentId: opts.agentSessionId || "agent-hop",
-        async send(prompt) {
+        async send(prompt, opts) {
           prompts.push(prompt);
+          sendSystemPrompts.push(opts?.systemPrompt);
           return { wait: async () => ({ text: "ok" }) };
         },
         async close() {},
@@ -169,6 +254,8 @@ test("AgentService conversationId survives an isolate hop via KV", async () => {
   assert.equal(creates.length, 1);
   assert.ok(creates[0]?.conversationId);
   assert.match(prompts[0] || "", /<system>/);
+  assert.match(prompts[0] || "", /be brief/);
+  assert.equal(sendSystemPrompts[0], undefined);
 
   customToolChatClearForTests();
   setCustomToolAgentHostForTests({
@@ -603,17 +690,16 @@ test("role:tool opens a new send; tool_calls closes the previous AgentService ru
   let aborts = 0;
   let releases = 0;
   setCustomToolAgentHostForTests({
-    async create({ customTools }) {
+    async create() {
       return {
         agentId: "agent-scoped",
         async send(prompt) {
           prompts.push(prompt);
           const wait = (async () => {
-            if (prompt.includes("executed your custom tools")) return { text: "22c" };
-            const tool = Object.values(customTools)[0];
-            if (!tool) return { text: "no-tools" };
-            await tool.execute({}, {});
-            return { text: "should-not-reach-client" };
+            if (prompt.includes("<gw_tool_results>") || prompt.includes("gw_tool_results")) {
+              return { text: "22c" };
+            }
+            return { text: gwToolCallText("lookup", {}), usage: { inputTokens: 10, outputTokens: 5 } };
           })();
           return {
             wait: () => wait,
@@ -640,7 +726,7 @@ test("role:tool opens a new send; tool_calls closes the previous AgentService ru
   const body = await first.json();
   assert.equal(body.choices[0].finish_reason, "tool_calls");
   const tc = body.choices[0].message.tool_calls;
-  assert.equal(releases, 1);
+  assert.ok(body.usage?.prompt_tokens);
   assert.equal(aborts, 0);
   const second = await handleCustomToolChatCompletions({
     headers,
@@ -658,7 +744,7 @@ test("role:tool opens a new send; tool_calls closes the previous AgentService ru
   const body2 = await second.json();
   assert.equal(body2.choices[0].message.content, "22c");
   assert.equal(prompts.length, 2);
-  assert.match(prompts[1] || "", /executed your custom tools/);
+  assert.match(prompts[1] || "", /<gw_tool_results>/);
   assert.match(prompts[1] || "", /22/);
   assert.doesNotMatch(prompts[1] || "", /weather\?/);
   assert.equal(aborts, 0);
@@ -671,7 +757,7 @@ test("two tool rounds: each HTTP request is a new send; prompts are latest resul
   let releases = 0;
   const kv = createMemoryKv();
   setCustomToolAgentHostForTests({
-    async create({ customTools }) {
+    async create() {
       return {
         agentId: "agent-multi",
         async send(prompt) {
@@ -679,10 +765,10 @@ test("two tool rounds: each HTTP request is a new send; prompts are latest resul
           prompts.push(prompt);
           const wait = (async () => {
             if (round >= 2) return { text: "humidity 40 after two lookups" };
-            const tool = Object.values(customTools)[0];
-            if (!tool) return { text: "no-tools" };
-            await tool.execute({ round }, {});
-            return { text: "should-not-reach-client" };
+            if (prompt.includes("<gw_tool_results>") || prompt.includes("gw_tool_results")) {
+              return { text: gwToolCallText("lookup", { round }), usage: { inputTokens: 20, outputTokens: 8 } };
+            }
+            return { text: gwToolCallText("lookup", { round }), usage: { inputTokens: 20, outputTokens: 8 } };
           })();
           return {
             wait: () => wait,
@@ -712,7 +798,7 @@ test("two tool rounds: each HTTP request is a new send; prompts are latest resul
   const body1 = await first.json();
   assert.equal(body1.choices[0].finish_reason, "tool_calls");
   const tc1 = body1.choices[0].message.tool_calls;
-  assert.equal(releases, 1);
+  assert.ok(body1.usage?.prompt_tokens);
   assert.equal(aborts, 0);
 
   const second = await handleCustomToolChatCompletions({
@@ -732,10 +818,9 @@ test("two tool rounds: each HTTP request is a new send; prompts are latest resul
   const body2 = await second.json();
   assert.equal(body2.choices[0].finish_reason, "tool_calls");
   const tc2 = body2.choices[0].message.tool_calls;
-  assert.equal(releases, 2);
   assert.equal(aborts, 0);
   assert.equal(body2.conversation_id, body1.conversation_id);
-  assert.match(prompts[1] || "", /executed your custom tools/);
+  assert.match(prompts[1] || "", /<gw_tool_results>/);
   assert.match(prompts[1] || "", /22/);
   assert.doesNotMatch(prompts[1] || "", /weather and humidity/);
 
@@ -763,15 +848,13 @@ test("two tool rounds: each HTTP request is a new send; prompts are latest resul
   assert.doesNotMatch(prompts[2] || "", /weather and humidity/);
   assert.doesNotMatch(prompts[2] || "", /temp/);
   assert.equal(aborts, 0);
-  assert.equal(releases, 2);
 });
 
 test("stream=true two tool rounds emit complete tool_calls then final text", async () => {
   const prompts: string[] = [];
   let sends = 0;
-  let releases = 0;
   setCustomToolAgentHostForTests({
-    async create({ customTools }) {
+    async create() {
       return {
         agentId: "agent-multi-sse",
         async send(prompt) {
@@ -779,17 +862,12 @@ test("stream=true two tool rounds emit complete tool_calls then final text", asy
           prompts.push(prompt);
           const wait = (async () => {
             if (round >= 2) return { text: "done-sse" };
-            const tool = Object.values(customTools)[0];
-            if (!tool) return { text: "no-tools" };
-            await tool.execute({ round }, {});
-            return { text: "should-not-reach-client" };
+            return { text: gwToolCallText("lookup", { round }) };
           })();
           return {
             wait: () => wait,
             abort: () => {},
-            release: () => {
-              releases += 1;
-            },
+            release: () => {},
           };
         },
         async close() {},
@@ -809,7 +887,7 @@ test("stream=true two tool rounds emit complete tool_calls then final text", asy
   const sse1 = await consumeSse(first.body, () => {}, (buf) => buf.includes("data: [DONE]"));
   assert.match(sse1, /"finish_reason":"tool_calls"/);
   const tc1 = lastOpenAiSseToolCalls(sse1);
-  assert.equal(releases, 1);
+  assert.doesNotMatch(sse1, /<gw_tool_call>/);
 
   const second = await handleCustomToolChatCompletions({
     headers,
@@ -827,7 +905,6 @@ test("stream=true two tool rounds emit complete tool_calls then final text", asy
   const sse2 = await consumeSse(second.body, () => {}, (buf) => buf.includes("data: [DONE]"));
   assert.match(sse2, /"finish_reason":"tool_calls"/);
   const tc2 = lastOpenAiSseToolCalls(sse2);
-  assert.equal(releases, 2);
   assert.match(prompts[1] || "", /22/);
   assert.doesNotMatch(prompts[1] || "", /weather\?/);
 
@@ -856,9 +933,8 @@ test("stream=true two tool rounds emit complete tool_calls then final text", asy
 test("Anthropic two tool_use rounds then end_turn", async () => {
   const prompts: string[] = [];
   let sends = 0;
-  let releases = 0;
   setCustomToolAgentHostForTests({
-    async create({ customTools }) {
+    async create() {
       return {
         agentId: "agent-multi-anth",
         async send(prompt) {
@@ -866,17 +942,12 @@ test("Anthropic two tool_use rounds then end_turn", async () => {
           prompts.push(prompt);
           const wait = (async () => {
             if (round >= 2) return { text: "40 percent" };
-            const tool = Object.values(customTools)[0];
-            if (!tool) return { text: "no-tools" };
-            await tool.execute({ round }, {});
-            return { text: "should-not-reach-client" };
+            return { text: gwToolCallText("lookup", { round }) };
           })();
           return {
             wait: () => wait,
             abort: () => {},
-            release: () => {
-              releases += 1;
-            },
+            release: () => {},
           };
         },
         async close() {},
@@ -917,7 +988,6 @@ test("Anthropic two tool_use rounds then end_turn", async () => {
   assert.equal(body2.stop_reason, "tool_use");
   const use2 = body2.content.find((b: { type?: string }) => b.type === "tool_use");
   assert.ok(use2);
-  assert.equal(releases, 2);
   assert.equal(body2.conversation_id, body1.conversation_id);
   assert.doesNotMatch(prompts[1] || "", /weather\?/);
 
@@ -986,7 +1056,7 @@ function duplexSentMcpResult(duplex: ChatInteractiveDuplex): boolean {
   return duplex.sent.some((m) => field(asObject(field(m, "execClientMessage")), "mcpResult", "mcp_result"));
 }
 
-test("in-repo host: two MCP parks then text; park must not cancelAction", async () => {
+test("in-repo host: two text gw_tool_call turns then text; must not cancelAction", async () => {
   const duplexes: ChatInteractiveDuplex[] = [];
   const openRun: OpenAgentRun = async () => {
     const duplex = new ChatInteractiveDuplex();
@@ -996,18 +1066,13 @@ test("in-repo host: two MCP parks then text; park must not cancelAction", async 
       if (!field(message, "runRequest")) return;
       if (i < 2) {
         duplex.push({
-          execServerMessage: {
-            id: i + 1,
-            execId: `mcp-${i}`,
-            mcpArgs: {
-              name: "custom-user-tools-lookup",
-              providerIdentifier: "custom-user-tools",
-              toolName: "lookup",
-              toolCallId: `call_${i}`,
-              args: { round: { stringValue: String(i) } },
+          interactionUpdate: {
+            textDelta: {
+              text: gwToolCallText("lookup", { round: i }),
             },
           },
         });
+        duplex.push({ interactionUpdate: { turnEnded: {} } });
         return;
       }
       duplex.push({ interactionUpdate: { textDelta: { text: "all done" } } });
@@ -1057,6 +1122,7 @@ test("in-repo host: two MCP parks then text; park must not cancelAction", async 
   const tc2 = body2.choices[0].message.tool_calls;
   assert.equal(duplexes.length, 2);
   assert.equal(duplexSentCancel(duplexes[1]!), false);
+  assert.match(duplexUserText(duplexes[1]!), /<gw_tool_results>/);
   assert.match(duplexUserText(duplexes[1]!), /22/);
   assert.doesNotMatch(duplexUserText(duplexes[1]!), /weather and humidity/);
   assert.equal(body2.conversation_id, body1.conversation_id);

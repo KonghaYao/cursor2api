@@ -1,7 +1,8 @@
 /**
  * CustomToolAgentHost backed by agent.v1.AgentService/Run (no @cursor/sdk,
  * no agent binary, no Cursor-hosted Cloud Agents sandbox VM).
- * MCP family only; customTools.execute stays in-process (parked by custom_tools.ts).
+ * MCP family only on the wire allowlist; upstream mcpTools catalog is empty.
+ * Residual mcpArgs from upstream → mcpError (text-only run), not execute/park.
  */
 import { exchangeApiKey } from "./auth.ts";
 import { randomId } from "./bytes.ts";
@@ -20,22 +21,19 @@ import {
   mcpAllowlistResult,
   mcpErrorResult,
   mcpStateResult,
-  mcpSuccessResult,
   parseKvBlob,
-  parseMcpArgs,
   parseServerMessage,
   readMcpResourceNotFound,
   requestContextResult,
   type AgentInlineImage,
   type AgentTurnUsage,
-  type CustomToolSpec,
   type JsonObject,
 } from "./agent_json.ts";
 import { abortAgentDuplex, closeAgentDuplex, openAgentRun, type OpenAgentRun } from "./agent_run.ts";
-import type { CustomToolAgentHandle, CustomToolAgentHost, SdkCustomToolMap } from "./custom_tool_chat.ts";
+import type { CustomToolAgentHandle, CustomToolAgentHost } from "./custom_tool_chat.ts";
 
 const HEARTBEAT_MS = 15_000;
-/** `AbortController.abort(reason)` used when parking tool_calls — close the Run, do not cancelAction. */
+/** `AbortController.abort(reason)` used by release() — close the Run, do not cancelAction. */
 const RELEASE_REASON = "release";
 
 function isJwt(token: string): boolean {
@@ -57,14 +55,6 @@ function readEnv(name: string): string | undefined {
   return undefined;
 }
 
-function specsFromCustomTools(customTools: SdkCustomToolMap): CustomToolSpec[] {
-  return Object.entries(customTools).map(([name, tool]) => ({
-    name,
-    description: tool.description,
-    inputSchema: tool.inputSchema,
-  }));
-}
-
 async function resolveAccessToken(
   apiKey: string,
   exchange: typeof exchangeApiKey,
@@ -74,12 +64,7 @@ async function resolveAccessToken(
   return exchanged.accessToken;
 }
 
-function contentToText(result: { content?: Array<{ type?: string; text?: string }>; isError?: boolean }): string {
-  const parts = Array.isArray(result.content) ? result.content : [];
-  const text = parts.map((p) => (typeof p?.text === "string" ? p.text : "")).filter(Boolean).join("\n");
-  if (text) return text;
-  return result.isError ? "custom tool failed" : "";
-}
+const TEXT_ONLY_MCP_ERROR = "text-only run: custom tools are not registered";
 
 export function createSdkAgentHost(opts?: {
   openRun?: OpenAgentRun;
@@ -98,14 +83,13 @@ export function createSdkAgentHost(opts?: {
         reasoningEffort: createOpts.reasoningEffort,
       });
       const cwd = createOpts.cwd || readEnv("GATEWAY_AGENT_CWD") || "/tmp";
-      const tools = specsFromCustomTools(createOpts.customTools);
       const blobs = new Map<string, string>();
       let conversationState: JsonObject | undefined = createOpts.conversationState;
       let closed = false;
 
       const handle: CustomToolAgentHandle = {
         agentId,
-        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void; signal?: AbortSignal }) {
+        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void; signal?: AbortSignal; systemPrompt?: string }) {
           if (closed) throw new Error("agent is closed");
           const abort = new AbortController();
           const onClientAbort = () => abort.abort();
@@ -126,8 +110,7 @@ export function createSdkAgentHost(opts?: {
             images: sendOpts?.images,
             onDelta: sendOpts?.onDelta,
             signal: abort.signal,
-            tools,
-            customTools: createOpts.customTools,
+            systemPrompt: sendOpts?.systemPrompt,
             blobs,
             conversationState,
             onCheckpoint: (state) => {
@@ -187,8 +170,7 @@ async function runTurn(opts: {
   images?: AgentInlineImage[];
   onDelta?: (chunk: { text?: string; thinking?: string }) => void;
   signal?: AbortSignal;
-  tools: CustomToolSpec[];
-  customTools: SdkCustomToolMap;
+  systemPrompt?: string;
   blobs: Map<string, string>;
   conversationState?: JsonObject;
   onCheckpoint: (state: JsonObject) => void;
@@ -244,10 +226,11 @@ async function runTurn(opts: {
           conversationId: opts.conversationId,
           runId,
           agentSessionId: opts.agentSessionId,
-          tools: opts.tools,
+          tools: [],
           conversationState: opts.conversationState,
           cwd: opts.cwd,
           images: opts.images,
+          systemPrompt: opts.systemPrompt,
         }),
       ),
     );
@@ -305,11 +288,11 @@ async function runTurn(opts: {
         const { id, execId } = execIds(parsed.exec);
         const kind = parsed.execKind;
         if (kind === "requestContextArgs" || kind === "request_context_args") {
-          await duplex.send(requestContextResult(id, execId, { cwd: opts.cwd, tools: opts.tools }));
+          await duplex.send(requestContextResult(id, execId, { cwd: opts.cwd, tools: [] }));
           continue;
         }
         if (kind === "mcpStateExecArgs" || kind === "mcp_state_exec_args") {
-          await duplex.send(mcpStateResult(id, execId, opts.tools));
+          await duplex.send(mcpStateResult(id, execId, []));
           continue;
         }
         if (kind === "listMcpResourcesExecArgs" || kind === "list_mcp_resources_exec_args") {
@@ -325,29 +308,10 @@ async function runTurn(opts: {
           continue;
         }
         if (kind === "mcpArgs" || kind === "mcp_args") {
-          const call = parseMcpArgs(parsed.exec);
           track(
             (async () => {
-              if (!call?.toolName) {
-                await duplex!.send(mcpErrorResult(id, execId, "missing MCP tool name"));
-                return;
-              }
-              const tool = opts.customTools[call.toolName];
-              if (!tool) {
-                await duplex!.send(mcpErrorResult(id, execId, `Unknown custom tool: ${call.toolName}`));
-                return;
-              }
-              try {
-                const result = await tool.execute(call.args || {}, { toolCallId: call.toolCallId });
-                if (cancelled) return;
-                await duplex!.send(
-                  mcpSuccessResult(id, execId, contentToText(result), Boolean(result.isError)),
-                );
-              } catch (err) {
-                if (cancelled) return;
-                const message = err instanceof Error ? err.message : String(err);
-                await duplex!.send(mcpErrorResult(id, execId, message));
-              }
+              if (cancelled) return;
+              await duplex!.send(mcpErrorResult(id, execId, TEXT_ONLY_MCP_ERROR));
             })(),
           );
           continue;
@@ -375,4 +339,4 @@ export function defaultSdkAgentHost(): CustomToolAgentHost {
   return createSdkAgentHost();
 }
 
-export type { CustomToolSpec };
+export type { CustomToolSpec } from "./agent_json.ts";
