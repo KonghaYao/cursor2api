@@ -76,6 +76,21 @@ AgentService / SDK **没有** Inference 那种 `composer-2.5-fast` / `cursor-gro
 
 `GET /v1/models` 往往不列出 Luna；能否打通取决于账号额度与地区，不是网关丢了 id。详表见 `docs/models.md`。
 
+```bash
+BASE=https://cursor2api.freetavily.deno.net/v1
+KEY=crsr_your_key_here
+
+# Composer 标准档（显式 fast=false，避免被默认成 Fast）
+curl -sS "$BASE/chat/completions" -H 'content-type: application/json' \
+  -H "authorization: Bearer $KEY" \
+  -d '{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}]}'
+
+# Grok Fast + 思考强度 max → effort=xhigh
+curl -sS "$BASE/chat/completions" -H 'content-type: application/json' \
+  -H "authorization: Bearer $KEY" \
+  -d '{"model":"grok-4.6-fast","reasoning_effort":"max","messages":[{"role":"user","content":"hi"}],"max_tokens":256}'
+```
+
 ## 协议兼容性（2026-09-09 后）
 
 本表面仍是 OpenAI / Anthropic HTTP。上游是 Agent 循环，不是 Inference Chat Completions。
@@ -157,6 +172,7 @@ Anthropic `/v1/messages`：
 ## 关键更新与事故
 
 - **2026-09-09 — Inference 上游事故（L）**：Cursor 对 Dashboard `crsr_` 的 `aiserver.v1.InferenceService/Stream` 回 `ERROR_NOT_LOGGED_IN`。换票和模型列表仍可能成功，因此不能用 `/v1/models` 判断推理是否还能打。聊天已改到 `agent.v1.AgentService/Run` + 进程内 customTools（**无** `@cursor/sdk`、**无** agent 二进制、**无** Cloud sandbox VM）。本机 Deno 实机：OpenAI probe 7/7、Anthropic `system`、Grok Fast `PONG`。同日再测：无 tools `composer-2.5-fast` PONG 的 `usage` 非零（prompt 3672 / cached 3616 / completion 91）。详见 `CLAUDE.md` **INC-2026-09-09**。
+- **2026-09-09 — AgentService 模型参数**：SDK 省略 `fast` 时默认 Fast。网关显式传 `parameters.fast`（`composer-2.5` / `grok-4.6` 为 false，带 `-fast` 后缀才是 true），Grok 思考强度显式传 `parameters.effort`（默认 `high`，`reasoning_effort: max` → `xhigh`）。不因 tools 给 Grok 升 Fast。
 - **2026-09-01 — Prompt cache 事故**：上游 `conversationId` 曾被改成每请求随机值，导致长会话 Cache Read 几乎为 0。Inference 路径已恢复为 `tenant:session_fp`。AgentService 路径目前是进程内粘滞，**尚未**绑回 `session_fp`。
 - **2026-09-02 — 鉴权缓存**：`crsr_…` 换取 JWT 改为进程内 L1、KV L2，再访问 Cursor exchange；会话内容不写 KV。
 - **2026-09-03 — Thinking 与 Grok**：只输出明文 thinking；Grok 加密 signature 不泄露。Grok 带 tools 时（Inference 时代）自动升级 Fast route。
