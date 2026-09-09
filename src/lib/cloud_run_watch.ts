@@ -1,6 +1,6 @@
 /**
  * Keep one Cloud Agents SSE reader alive (models/legacy REST helpers).
- * Chat does not use this path; it goes through @cursor/sdk customTools.
+ * Chat does not use this path; it goes through AgentService/Run customTools.
  */
 import { collectCloudRunResult, iterateSse, streamCloudRun } from "./cloud_agents.ts";
 

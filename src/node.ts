@@ -130,7 +130,7 @@ listen("127.0.0.1");
 listen("::1");
 console.log(
   upstream === "cloud"
-    ? "  node  @cursor/sdk customTools only (tools:[mcp]; no Cloud REST chat)"
+    ? "  node  AgentService/Run customTools only (MCP family; no Cloud REST chat)"
     : "  node  InferenceService/Stream  (dead for Dashboard crsr_ keys)",
 );
 console.log("  GET  /health");

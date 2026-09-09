@@ -1,7 +1,7 @@
 /**
  * OpenAI/Anthropic function tools → in-process Cursor customTools.
  *
- * customTools.execute() runs in this process (SDK local agent). We park it and
+ * customTools.execute() runs in this process (AgentService MCP executor). We park it and
  * return OpenAI tool_calls so the gateway client executes the real tool.
  * This is not HTTP MCP: Cloud VMs never call us back.
  *

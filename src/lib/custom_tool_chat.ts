@@ -1,9 +1,10 @@
 /**
- * Local-agent customTools path: OpenAI tools → SDK `local.customTools`.
- * execute() is in-process (park for the gateway client). Not HTTP MCP.
+ * Custom-tools chat path: OpenAI tools → in-process `customTools.execute`.
+ * The agent loop is AgentService/Run (MCP family only). execute() is parked
+ * for the gateway client. Not HTTP MCP, not @cursor/sdk.
  *
- * Built-in SDK tools are disabled except the `mcp` capability group, which is
- * required for customTools to be offered. `tools: []` would also kill customTools.
+ * Built-in agent tools stay off except the `mcp` capability group, which is
+ * required for customTools to be offered. An empty allowlist also kills MCP.
  */
 import { encodeSseData, encodeSseEvent, jsonResponse, sseStreamResponse } from "./bytes.ts";
 import { CloudChatError } from "./cloud_errors.ts";
@@ -27,11 +28,13 @@ import {
   type CustomToolDef,
   type ParkedClientTool,
 } from "./custom_tools.ts";
+import { gatewayAgentModelId } from "./agent_json.ts";
+import { defaultSdkAgentHost } from "./sdk_agent_host.ts";
 import { resolveSessionMode } from "./session.ts";
 
 export type SdkCustomToolMap = ReturnType<typeof toSdkCustomTools>;
 
-/** Only SDK builtin: MCP family, so `local.customTools` work. Not shell/edit/grep. */
+/** Public name of the only builtin capability group we allow (MCP / customTools). */
 export const SDK_CUSTOM_ONLY_BUILTIN_TOOLS = ["mcp"] as const;
 
 export function sdkLocalAgentCreateOptions(opts: {
@@ -41,10 +44,7 @@ export function sdkLocalAgentCreateOptions(opts: {
   cwd?: string;
 }): Record<string, unknown> {
   const cwd = opts.cwd || readEnv("GATEWAY_AGENT_CWD") || "./";
-  const modelId =
-    typeof opts.model === "string" && opts.model && opts.model !== "auto"
-      ? String(opts.model).replace(/-fast$/i, "")
-      : "composer-2.5";
+  const modelId = gatewayAgentModelId(opts.model);
   return {
     apiKey: opts.apiKey,
     model: { id: modelId },
@@ -135,47 +135,7 @@ function readEnv(name: string): string | undefined {
 }
 
 async function defaultHost(): Promise<CustomToolAgentHost> {
-  const mod = (await import("@cursor/sdk")) as unknown as {
-    Agent: {
-      create: (opts: Record<string, unknown>) => Promise<{
-        agentId?: string;
-        send: (text: string) => Promise<{
-          wait: () => Promise<{ status?: string; result?: string; error?: { message?: string } }>;
-        }>;
-        close?: () => void | Promise<void>;
-        [Symbol.asyncDispose]?: () => Promise<void>;
-      }>;
-    };
-  };
-  return {
-    async create(opts) {
-      const agent = await mod.Agent.create(sdkLocalAgentCreateOptions(opts));
-      return {
-        agentId: String(agent.agentId || "local-agent"),
-        send: async (prompt: string) => {
-          const run = await agent.send(prompt);
-          let waited: Promise<{ text: string; error?: string }> | undefined;
-          return {
-            wait: () => {
-              waited ??= run.wait().then((result) => ({
-                text: String(result.result || ""),
-                error: result.error?.message,
-              }));
-              return waited;
-            },
-          };
-        },
-        close: async () => {
-          if (typeof agent.close === "function") {
-            await agent.close();
-            return;
-          }
-          const dispose = agent[Symbol.asyncDispose];
-          if (typeof dispose === "function") await dispose.call(agent);
-        },
-      };
-    },
-  };
+  return defaultSdkAgentHost();
 }
 
 async function resolveHost(): Promise<CustomToolAgentHost> {
@@ -185,7 +145,7 @@ async function resolveHost(): Promise<CustomToolAgentHost> {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new CloudChatError(
-      `In-process customTools need @cursor/sdk local Agent (${message}). HTTP MCP is not used.`,
+      `In-process customTools need AgentService/Run (${message}). HTTP MCP is not used.`,
       501,
     );
   }

@@ -4,9 +4,11 @@
 
 ---
 
-## 2026-09-09：Inference 已死；聊天一律 `@cursor/sdk` customTools
+## 2026-09-09：Inference 已死；聊天走 AgentService customTools（无 `@cursor/sdk`）
 
 Cursor Agent 作为本网关的客户端 **总会带 function `tools`**。「无 tools 走 Cloud REST」不是产品场景，不要再加回那条分流。
+
+网关 **不再依赖** npm `@cursor/sdk`（无 agent 二进制、无默认 shell/edit）。聊天实现是仓库内的 `AgentService/Run` Connect JSON 客户端：`src/lib/sdk_agent_host.ts`。协议与 SDK local Agent 同一条上游，只实现网关需要的 MCP customTools 子集。
 
 ### 上游怎么选（不要再试 Inference）
 
@@ -14,43 +16,34 @@ Cursor Agent 作为本网关的客户端 **总会带 function `tools`**。「无
 |------|----------------------|------|
 | `POST https://api2.cursor.sh/aiserver.v1.InferenceService/Stream` | **死了**：换票后 `GetUsableModels` 仍可能 200，Stream 回 `ERROR_NOT_LOGGED_IN` | **禁止**再把 chat / tools 接到这里 |
 | `https://api.cursor.com/v1/agents` Cloud REST | 能用 | **仅** `GET /v1/models`；不要用它跑对话（VM 会自带 shell/edit，且没有 OpenAI 那种 park `tool_calls`） |
-| `@cursor/sdk` local `Agent.create` | 能用（先 `exchange_user_api_key`） | **全部** `/v1/chat/completions` 与 `/v1/messages` |
+| `POST https://api2.cursor.sh/agent.v1.AgentService/Run` | 能用（先 `exchange_user_api_key`） | **全部** `/v1/chat/completions` 与 `/v1/messages` |
 
-`@cursor/sdk` **没有** Chat Completions HTTP。`local.customTools` 是合成 MCP server `custom-user-tools`（`GetMcpTools` / `CallMcpTool`），`execute()` 在网关进程内。网关把 `execute()` **park** 成 OpenAI `tool_calls`，由调用方执行后再 POST `role: tool`。这不是 HTTP `/mcp`，Cloud VM 不会回调本网关。
+AgentService **没有** Chat Completions HTTP。自定义工具走合成 MCP server `custom-user-tools`（`GetMcpTools` / `CallMcpTool` / `mcp_args`），`execute()` 在网关进程内。网关把 `execute()` **park** 成 OpenAI `tool_calls`，由调用方执行后再 POST `role: tool`。这不是 HTTP `/mcp`，Cloud VM 不会回调本网关。
 
-### 屏蔽 SDK 自带工具（只留 custom）
+### 屏蔽自带工具（只留 custom）
 
-SDK `AgentOptions.tools`：
+请求头 `x-cursor-agent-allowed-tools` 必须是 MCP 家族（SDK 公开名 `"mcp"` 的展开），**禁止**默认 toolset：
 
-- `undefined` → 默认 toolset（shell / edit / grep / …）**禁止**
-- `[]` → **没有任何**内置工具，连 MCP 家族都关掉，**`customTools` 也不会出现**
-- `["mcp"]` → 只开 MCP 能力组（含 `customTools`），关掉 shell、edit、grep、task、webSearch 等
-
-因此网关 **必须** `tools: ["mcp"]`，再把客户端的 OpenAI/Anthropic function tools 填进 `local.customTools`。不要 `tools: []`，也不要漏写 `"mcp"`。
-
-```ts
-await Agent.create({
-  apiKey,
-  model: { id: "composer-2.5" },
-  tools: ["mcp"], // 唯一允许的内置能力组；不是 HTTP MCP
-  local: {
-    cwd: GATEWAY_AGENT_CWD, // 需要一个 git 目录
-    settingSources: [],     // 不要加载用户/项目 Cursor 设置里的工具
-    customTools,            // 仅客户端声明的 function tools
-  },
-});
+```
+mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_resource_tool_call,mcp_auth_tool_call
 ```
 
-`"mcp"` 不是给模型 shell，也不是 `POST /mcp`。省略它 = customTools 全部失效。
+- 不设该头 → 默认 toolset（shell / edit / grep / …）**禁止**
+- 空头 / 不含 MCP → **`customTools` 也不会出现**
+- 只开 MCP 家族 → customTools 可用，shell/edit/grep/task/webSearch 关掉
+
+`AgentRunRequest.excludeWorkspaceContext = true`。不要把客户端 tools 挂成 HTTP MCP。
 
 ### 运行时
 
-Local Agent 要 Node ≥ 22.13、cwd、git、子进程。**Deno Deploy / Cloudflare Workers 会 501**。生产用 bun 或 Node：
+`AgentService/Run` 是 **双向 Connect 流**（exec 结果必须在同一条流上回去）。
 
-```bash
-mkdir -p /tmp/gateway-agent-cwd && git -C /tmp/gateway-agent-cwd init
-GATEWAY_AGENT_CWD=/tmp/gateway-agent-cwd bun src/node.ts
-```
+| 运行时 | 传输 |
+|--------|------|
+| **Deno**（含 Deploy） | WHATWG `fetch` + `ReadableStream` body。Deno 的 fetch 在 HTTP/1.1 / HTTP/2 上是 **全双工**（响应头可在请求体未结束时到达）。**不要**设 `duplex: "half"`（那是浏览器/undici 半双工，exec 回不去）。 |
+| **Node / Bun** | `node:http2`。undici `fetch({ duplex: "half" })` **不是**全双工，不能用来跑 AgentService/Run。 |
+
+Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。官方 SDK 的 `local.useHttp1ForAgent` 是 RunSSE + HTTP/1.1 退路，网关不走那条。
 
 `stream: true` 的 `tool_calls` 仍须 **一条完整 delta**（见 2026-08-31）。会话用稳定 `x-session-id` park `execute()`；`SESSION_MODE=random` 不行。
 
@@ -58,9 +51,11 @@ GATEWAY_AGENT_CWD=/tmp/gateway-agent-cwd bun src/node.ts
 
 - 把 tools 改回 `InferenceService/Stream`
 - 无 tools 时改走 Cloud `bc-…` REST 当「简单聊天」
-- 给 SDK 开 `shell` / `edit` / `task` 或默认 toolset
+- 给 Agent 开 `shell` / `edit` / `task` 或默认 toolset
 - 把客户端 tools 挂成 HTTP MCP 让 Cloud VM 反调
-- 用 `GetUsableModels` / `/v1/models` 判断 Inference 是否还能打（那是 AgentService，Stream 已经死）
+- 用 `GetUsableModels` / `/v1/models` 判断 Inference 是否还能打
+- 再加回 `@cursor/sdk` / 本地 agent 二进制来跑聊天
+- 指纹路径每轮 `randomId()` 当 conversationId（9/1 cache 事故）
 
 ---
 

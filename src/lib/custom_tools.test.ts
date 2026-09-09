@@ -18,6 +18,7 @@ import {
   SDK_CUSTOM_ONLY_BUILTIN_TOOLS,
   sdkLocalAgentCreateOptions,
 } from "./custom_tool_chat.ts";
+import { MCP_ALLOWED_PROTO_TOOLS } from "./agent_json.ts";
 
 afterEach(() => {
   customToolsClearForTests();
@@ -103,4 +104,11 @@ test("sdk local agent allowlists only mcp so customTools work and builtins stay 
   assert.equal(opts.cloud, undefined);
   assert.ok(!JSON.stringify(opts.tools).includes("shell"));
   assert.ok(!JSON.stringify(opts.tools).includes("edit"));
+  assert.deepEqual([...MCP_ALLOWED_PROTO_TOOLS], [
+    "mcp_tool_call",
+    "get_mcp_tools_tool_call",
+    "list_mcp_resources_tool_call",
+    "read_mcp_resource_tool_call",
+    "mcp_auth_tool_call",
+  ]);
 });

@@ -4,8 +4,8 @@
  * Local:
  *   deno task start
  *
- * Chat always uses @cursor/sdk local customTools (Node/Bun). InferenceService
- * is dead for Dashboard keys. Deno Deploy returns 501 for chat (no local Agent).
+ * Chat uses AgentService/Run + in-process customTools. Deno fetch is
+ * full-duplex (HTTP/2). InferenceService is dead for Dashboard keys.
  */
 
 import { handleGatewayRequest } from "./lib/handler.ts";
@@ -57,9 +57,9 @@ if (isDeploy) {
 }
 
 if (upstream === "cloud") {
-  console.log("  deno  chat → @cursor/sdk customTools (501 on Deploy; use bun/Node)");
+  console.log("  deno  chat → AgentService/Run customTools (fetch duplex / HTTP/2)");
   console.log("  models GET https://api.cursor.com/v1/models");
-  console.log("  tools    SDK tools:[mcp] only; client function tools as customTools");
+  console.log("  tools    MCP family only; client function tools as customTools");
 } else {
   console.log("  deno  InferenceService/Stream  (dead for Dashboard crsr_ keys)");
 }

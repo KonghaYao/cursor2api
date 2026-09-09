@@ -1,6 +1,6 @@
 /**
  * Official Cloud Agents REST client (`https://api.cursor.com/v1/*`).
- * Deno/Node compatible: fetch only, no @cursor/sdk native binaries.
+ * Deno/Node compatible: fetch only, no native agent binaries.
  *
  * Auth is the Dashboard API key as Basic `key:` (Bearer also accepted).
  * Conversation state lives on Cursor (`bc-…` agent id), not in this process.

@@ -1,7 +1,7 @@
 /**
- * OpenAI / Anthropic surface. Chat always goes through @cursor/sdk local
- * customTools (builtins off except `mcp`). Cloud REST is models-only.
- * InferenceService/Stream is dead for Dashboard keys.
+ * OpenAI / Anthropic surface. Chat always goes through in-process
+ * customTools on AgentService/Run (builtins off except MCP). Cloud REST is
+ * models-only. InferenceService/Stream is dead for Dashboard keys.
  */
 import { encodeSseData, encodeSseEvent, jsonResponse, sseStreamResponse } from "./bytes.ts";
 import { credentialFingerprint } from "./auth.ts";
@@ -318,7 +318,7 @@ function rejectRandomSession(): Response | undefined {
   if (resolveSessionMode() !== "random") return undefined;
   return jsonResponse(400, {
     error: {
-      message: "SDK customTools require a stable session id (x-session-id / conversation_id). SESSION_MODE=random cannot park execute() across turns.",
+      message: "customTools require a stable session id (x-session-id / conversation_id). SESSION_MODE=random cannot park execute() across turns.",
       type: "invalid_request_error",
       code: "session_required_for_client_tools",
     },
@@ -349,7 +349,7 @@ export async function handleCloudMessages(
       400,
       toAnthropicError(
         {
-          message: "SDK customTools require a stable session id (x-session-id / conversation_id). SESSION_MODE=random cannot park execute() across turns.",
+          message: "customTools require a stable session id (x-session-id / conversation_id). SESSION_MODE=random cannot park execute() across turns.",
           type: "invalid_request_error",
         },
         requestId,
@@ -494,10 +494,10 @@ function streamCloudAsAnthropicSse(opts: {
 export function cloudHealthBody() {
   return {
     ok: true,
-    rpc: "@cursor/sdk local Agent.create (customTools only)",
+    rpc: "agent.v1.AgentService/Run (customTools only)",
     modes: ["/v1/chat/completions", "/v1/messages"],
     auth: "Authorization Bearer Cursor API key",
-    tools: 'SDK tools: ["mcp"] only — OpenAI/Anthropic function tools as customTools.execute (parked); no shell/edit/grep; not HTTP MCP; not InferenceService',
+    tools: 'AgentService tools: ["mcp"] only — OpenAI/Anthropic function tools as customTools.execute (parked); no shell/edit/grep; not HTTP MCP; not InferenceService; not @cursor/sdk',
     models: "GET https://api.cursor.com/v1/models",
     session: "stable x-session-id parks customTools.execute across turns",
   };

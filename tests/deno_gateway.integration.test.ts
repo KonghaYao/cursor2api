@@ -586,14 +586,14 @@ Deno.test("cloud gateway has no HTTP MCP callback endpoint", async () => {
   if (res.status !== 404) throw new Error(`expected 404 for /mcp, got ${res.status}: ${await res.text()}`);
 });
 
-Deno.test("cloud health advertises SDK customTools only, not Cloud REST chat or HTTP MCP", async () => {
+Deno.test("cloud health advertises AgentService customTools only, not Cloud REST chat or HTTP MCP", async () => {
   const res = await handleGatewayRequest(new Request("http://127.0.0.1/health"), {
     kv: createMemoryKv(),
     upstream: "cloud",
   });
   if (res.status !== 200) throw new Error(`expected 200, got ${res.status}`);
   const body = await res.json();
-  if (!String(body?.rpc || "").includes("@cursor/sdk")) {
+  if (!String(body?.rpc || "").includes("AgentService")) {
     throw new Error(`unexpected health: ${JSON.stringify(body)}`);
   }
   if (!String(body?.tools || "").includes('["mcp"]') && !String(body?.tools || "").includes("customTools")) {
@@ -752,7 +752,7 @@ Deno.test("cloud stream=true emits complete tool_calls in one delta", async () =
   }
 });
 
-Deno.test("cloud chat always uses SDK customTools, never Cloud REST agents", async () => {
+Deno.test("cloud chat always uses customTools, never Cloud REST agents", async () => {
   cloudClientToolsClearForTests();
   const created: string[] = [];
   installFakeCustomToolHost(created);
