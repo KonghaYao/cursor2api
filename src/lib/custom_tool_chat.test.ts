@@ -403,3 +403,63 @@ test("park_miss with a full transcript only forwards the latest tool round", asy
   assert.doesNotMatch(prompts[1] || "", /call_1/);
   assert.doesNotMatch(prompts[1] || "", /weather in tokyo/);
 });
+
+test("KV message length cursor forwards every new user after an isolate hop", async () => {
+  const kv = createMemoryKv();
+  const prompts: string[] = [];
+  setCustomToolAgentHostForTests({
+    async create() {
+      return {
+        agentId: "agent-len",
+        async send(prompt) {
+          prompts.push(prompt);
+          return { wait: async () => ({ text: "ok" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const headers = new Headers({ authorization: "Bearer crsr_test" });
+  const first = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [{ role: "user", content: "one" }] },
+    tools: [],
+    kv,
+  });
+  assert.equal(first.status, 200);
+
+  customToolChatClearForTests();
+  setCustomToolAgentHostForTests({
+    async create() {
+      return {
+        agentId: "agent-len-2",
+        async send(prompt) {
+          prompts.push(prompt);
+          return { wait: async () => ({ text: "ok2" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const second = await handleCustomToolChatCompletions({
+    headers,
+    body: {
+      model: "composer-2.5",
+      messages: [
+        { role: "user", content: "one" },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "two" },
+        { role: "user", content: "three" },
+      ],
+    },
+    tools: [],
+    kv,
+  });
+  assert.equal(second.status, 200);
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1] || "", /two/);
+  assert.match(prompts[1] || "", /three/);
+  assert.doesNotMatch(prompts[1] || "", /<system>/);
+  assert.doesNotMatch(prompts[1] || "", /^one$/m);
+  assert.doesNotMatch(prompts[1] || "", /^ok$/m);
+});

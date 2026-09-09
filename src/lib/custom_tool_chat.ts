@@ -9,8 +9,10 @@
  *
  * Conversation id is `tenant:agentRunFp` (model / effort / tools / system /
  * first user). Client `x-session-id` / `conversation_id` are ignored. KV
- * `agent-run:` can restore the same ids after a Deno isolate hop. `liveTurns`
- * only parks in-process `execute()`; it is not a serverless session store.
+ * `agent-run:` restores ids after a Deno isolate hop (TTL 24h). KV
+ * `agent-run-len:` stores the last successful `messages.length` (TTL 5 min)
+ * so the next request can slice only the new suffix. `liveTurns` only parks
+ * in-process `execute()`; it is not a serverless session store.
  *
  * Client contract (the normal path, not an edge case): every request carries
  * the full OpenAI/Anthropic transcript, and the client keeps that prefix
@@ -33,7 +35,7 @@ import {
   toOpenAIUsage,
   normalizeCursorUsage,
 } from "./inference.ts";
-import { kvGetAgentRun, kvSetAgentRun, type Kv } from "./kv.ts";
+import { kvGetAgentRun, kvGetAgentRunLen, kvSetAgentRun, kvSetAgentRunLen, type Kv } from "./kv.ts";
 import { agentRunIds, resolveSessionMode } from "./session.ts";
 import { computeAgentRunFp } from "./session_fingerprint.ts";
 import {
@@ -91,19 +93,40 @@ export function sdkLocalAgentCreateOptions(opts: {
   };
 }
 
-function lastUserPrompt(messages: unknown[]): string {
-  const content = lastUserContent(messages);
-  if (content == null) return "(empty)";
+function promptFromUserContent(content: unknown): string {
+  if (content == null) return "";
   if (typeof content === "string" && content.trim()) return content;
   if (Array.isArray(content)) {
     const text = content
       .map((p) => (p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string" ? String((p as { text: string }).text) : ""))
       .filter(Boolean)
       .join("\n");
-    if (text) return text;
-    return "";
+    return text;
   }
-  return "(empty)";
+  return "";
+}
+
+function lastUserPrompt(messages: unknown[]): string {
+  const content = lastUserContent(messages);
+  if (content == null) return "(empty)";
+  return promptFromUserContent(content) || (typeof content === "string" ? "(empty)" : "");
+}
+
+function isToolResultUser(rec: Record<string, unknown>): boolean {
+  return Array.isArray(rec.content) && rec.content.some((b) => b && typeof b === "object" && String((b as Record<string, unknown>).type || "") === "tool_result");
+}
+
+/** User texts in `messages`, skipping assistant echoes and Anthropic tool_result users. */
+export function joinUserPrompts(messages: unknown[]): string {
+  const parts: string[] = [];
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    const rec = m as Record<string, unknown>;
+    if (rec.role !== "user" || isToolResultUser(rec)) continue;
+    const text = promptFromUserContent(rec.content);
+    if (text) parts.push(text);
+  }
+  return parts.join("\n\n");
 }
 
 function lastUserContent(messages: unknown[]): unknown {
@@ -112,9 +135,7 @@ function lastUserContent(messages: unknown[]): unknown {
     if (!m || typeof m !== "object") continue;
     const rec = m as Record<string, unknown>;
     if (rec.role !== "user") continue;
-    if (Array.isArray(rec.content) && rec.content.some((b) => b && typeof b === "object" && String((b as Record<string, unknown>).type || "") === "tool_result")) {
-      continue;
-    }
+    if (isToolResultUser(rec)) continue;
     return rec.content;
   }
   return undefined;
@@ -209,13 +230,27 @@ export function composeCustomToolPrompt(opts: {
  * Prompt for one AgentService userMessageAction.
  * Clients send the full OpenAI/Anthropic transcript every time; only the
  * delta belongs on the wire. Older tool rounds stay in conversationState.
+ *
+ * `priorMessageCount` is the last successful `messages.length` (KV, 5 min).
+ * Slice from there so one request can carry multiple new user turns.
  */
 export function composeCustomToolTurnPrompt(opts: {
   body: Record<string, unknown>;
   tools: CustomToolDef[];
   messages: unknown[];
   hadPriorTurn: boolean;
+  priorMessageCount?: number;
 }): string {
+  const prior = opts.priorMessageCount;
+  const canSlice = prior != null && Number.isInteger(prior) && prior > 0 && opts.messages.length > prior;
+  if (canSlice) {
+    const slice = opts.messages.slice(prior);
+    const latest = extractLatestClientToolResults(slice);
+    const toolFollowUp = lastTurnIsToolResult(opts.messages) && latest.length > 0;
+    if (toolFollowUp) return composeToolResultPrompt(latest);
+    const users = joinUserPrompts(slice);
+    if (users) return users;
+  }
   const latest = extractLatestClientToolResults(opts.messages);
   const toolFollowUp = lastTurnIsToolResult(opts.messages) && latest.length > 0;
   if (!toolFollowUp) {
@@ -413,16 +448,23 @@ async function startCustomToolTurn(opts: {
     !existing!.done &&
     session.parked.some((p) => p.resolve);
 
+  const persistCommittedLength = async () => {
+    if (!opts.kv) return;
+    await kvSetAgentRunLen(opts.kv, tenant, sessionFp, messages.length);
+  };
+
   if (lastTurnIsToolResult(messages) && toolResults.length && canResumePark) {
     const n = resolveClientToolResults(session, toolResults);
     if (!n) throw new CloudChatError("tool results did not match a parked custom tool call", 400);
     console.log(`  custom_tools resume session=${computedIds.conversationId.slice(0, 24)} agent=${existing!.agent.agentId.slice(0, 14)}`);
+    await persistCommittedLength();
     return { live: existing!, session, sessionId: computedIds.conversationId, continued: true };
   }
 
   if (session.parked.length) failParkedClientTools(session, "cancelled: new user turn");
 
   const binding = opts.kv ? await kvGetAgentRun(opts.kv, tenant, sessionFp, sessionFp) : null;
+  const priorMessageCount = opts.kv ? await kvGetAgentRunLen(opts.kv, tenant, sessionFp) : null;
   const ids = binding
     ? { conversationId: binding.conversationId, agentSessionId: binding.agentSessionId }
     : computedIds;
@@ -466,10 +508,15 @@ async function startCustomToolTurn(opts: {
     tools: opts.tools,
     messages,
     hadPriorTurn,
+    priorMessageCount: priorMessageCount ?? undefined,
   });
   const images = toolFollowUp ? [] : await lastUserAgentImages(messages);
   if (!existing) await persistBinding(checkpoint.state);
+  if (priorMessageCount && messages.length > priorMessageCount) {
+    console.log(`  custom_tools slice prior=${priorMessageCount} n=${messages.length}`);
+  }
   const run = await agent.send(prompt, images.length ? { images } : undefined);
+  await persistCommittedLength();
   const live: LiveTurn = {
     agent,
     session,

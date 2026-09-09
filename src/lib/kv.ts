@@ -30,6 +30,11 @@ export const CLOUD_AGENT_KV_TTL_SECONDS = 7 * 24 * 60 * 60;
 export const AGENT_RUN_KV_TTL_SECONDS = 24 * 60 * 60;
 /** Keep the KV value small: ids always; conversationState only under this cap. */
 export const AGENT_RUN_STATE_MAX_BYTES = 24 * 1024;
+/**
+ * Last successfully handled `messages.length` for slicing the next delta.
+ * Separate key from `agent-run:` so this 5-minute cursor cannot expire the 24h ids.
+ */
+export const AGENT_RUN_LEN_KV_TTL_SECONDS = KV_TTL_SECONDS;
 
 /** Seconds to store in KV; capped at `cap` (default {@link KV_TTL_SECONDS}). */
 export function kvEntryTtlSeconds(preferred?: number, cap = KV_TTL_SECONDS): number {
@@ -112,6 +117,28 @@ export async function kvSetAgentRun(kv: Kv, tenant: string, sessionId: string, r
   await kv.setItem(agentRunKvKey(tenant, sessionId), compactAgentRunBinding(row), {
     ttl: AGENT_RUN_KV_TTL_SECONDS,
     cap: AGENT_RUN_KV_TTL_SECONDS,
+  });
+}
+
+export type AgentRunLenBinding = { n: number };
+
+export function agentRunLenKvKey(tenant: string, sessionId: string): string {
+  return `agent-run-len:${tenant}:${sessionId}`;
+}
+
+export async function kvGetAgentRunLen(kv: Kv, tenant: string, sessionId: string): Promise<number | null> {
+  const row = await kv.getItem<AgentRunLenBinding>(agentRunLenKvKey(tenant, sessionId));
+  const n = row?.n;
+  if (typeof n !== "number" || !Number.isInteger(n) || n <= 0) return null;
+  return n;
+}
+
+/** Store committed transcript length. Refreshes the 5-minute TTL on every success. */
+export async function kvSetAgentRunLen(kv: Kv, tenant: string, sessionId: string, n: number): Promise<void> {
+  if (!Number.isInteger(n) || n <= 0) return;
+  await kv.setItem(agentRunLenKvKey(tenant, sessionId), { n } satisfies AgentRunLenBinding, {
+    ttl: AGENT_RUN_LEN_KV_TTL_SECONDS,
+    cap: AGENT_RUN_LEN_KV_TTL_SECONDS,
   });
 }
 

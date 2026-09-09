@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  AGENT_RUN_LEN_KV_TTL_SECONDS,
   AGENT_RUN_STATE_MAX_BYTES,
   CLOUD_AGENT_KV_TTL_SECONDS,
   KV_TTL_SECONDS,
@@ -9,8 +10,10 @@ import {
   createMemoryKv,
   kvEntryTtlSeconds,
   kvGetAgentRun,
+  kvGetAgentRunLen,
   kvGetCloudAgent,
   kvSetAgentRun,
+  kvSetAgentRunLen,
   kvSetCloudAgent,
 } from "./kv.ts";
 
@@ -48,6 +51,17 @@ test("agent-run KV binding round-trips and ignores fp mismatch", async () => {
   assert.equal(hit?.conversationId, "t1:abc");
   assert.deepEqual(hit?.conversationState, { cursor: 1 });
   assert.equal(await kvGetAgentRun(kv, "t1", "sess-a", "fp-other"), null);
+});
+
+test("agent-run-len stores a 5-minute message cursor, not the transcript", async () => {
+  assert.equal(AGENT_RUN_LEN_KV_TTL_SECONDS, 300);
+  const kv = createMemoryKv();
+  assert.equal(await kvGetAgentRunLen(kv, "t1", "fp-1"), null);
+  await kvSetAgentRunLen(kv, "t1", "fp-1", 3);
+  assert.equal(await kvGetAgentRunLen(kv, "t1", "fp-1"), 3);
+  await kvSetAgentRunLen(kv, "t1", "fp-1", 0);
+  assert.equal(await kvGetAgentRunLen(kv, "t1", "fp-1"), 3);
+  assert.equal(await kvGetAgentRunLen(kv, "t1", "fp-other"), null);
 });
 
 test("compactAgentRunBinding drops oversized conversationState", () => {

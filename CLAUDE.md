@@ -66,7 +66,7 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 | 本轮 | 送给 AgentService 的 `userMessageAction` |
 |------|------------------------------------------|
 | 首轮 | 工具政策 + `<system>` + 第一条 user |
-| 跟进 user | **只有**最新一条 user 文本（不要 system / 历史 / 工具政策） |
+| 跟进 user | 上次成功 `messages.length` 之后的新 user（可多条拼成一条 delta）；长度 KV 未命中则回退最新一条 user。不要 system / 历史 / 工具政策 |
 | 同进程 `role: tool` | park resume，`execute()` 只匹配**最近一轮** tool id |
 | park_miss（有 KV/会话） | **只有**最近一轮 tool 结果；不要重发首条 user，也不要 dump 全部历史 tool |
 | park_miss（无会话） | 冷启动：首条 user + 全部 tool 结果 |
@@ -92,7 +92,7 @@ Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。不要为了半
 
 Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里的 legacy abort）。**不要**把这个 signal 接到 AgentService 双工或 `settleCustomTools` 上，否则第一枪 `tool_calls` 返回后 park 被掐掉，第二枪 `role: tool` 会 409。`deno.json` 开 `--unstable-no-legacy-abort`。若 isolate / 流已经没了，跟进改为把 tool results 写成新 user prompt，而不是 409。
 
-**会话 id（Deno isolate / serverless）：** `conversationId` = `tenant:agentRunFp`。`agentRunFp` = model / effort / flags / tools / system / **第一条 user**（不含后续轮次；AgentService 只送最新 user，上文在 Cursor `conversationState`）。客户端 `x-session-id` / `conversation_id` **忽略**。`liveTurns` 只 park `execute()`（键 `tenant:fp`）。KV `agent-run:${tenant}:${fp}` 只存 `{fp, conversationId, agentSessionId, conversationState?}`，TTL 24h，checkpoint 超 `AGENT_RUN_STATE_MAX_BYTES`（24KiB）则丢掉 state 只留 ids。**不要**把 messages / canon 写进 KV。换 isolate 后 `role: tool` 仍走 park_miss flatten。
+**会话 id（Deno isolate / serverless）：** `conversationId` = `tenant:agentRunFp`。`agentRunFp` = model / effort / flags / tools / system / **第一条 user**（不含后续轮次；AgentService 只送最新 delta，上文在 Cursor `conversationState`）。客户端 `x-session-id` / `conversation_id` **忽略**。`liveTurns` 只 park `execute()`（键 `tenant:fp`）。KV `agent-run:${tenant}:${fp}` 只存 `{fp, conversationId, agentSessionId, conversationState?}`，TTL 24h，checkpoint 超 `AGENT_RUN_STATE_MAX_BYTES`（24KiB）则丢掉 state 只留 ids。KV `agent-run-len:` 只存上次成功处理的 `messages.length`，TTL **5 分钟**，用来 `slice` 增量；**不要**并进 24h 的 `agent-run`，也**不要**把 messages / canon 写进 KV。换 isolate 后 `role: tool` 仍走 park_miss flatten。
 
 ### 不要做的
 
@@ -114,7 +114,7 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 - 给 AgentService 的 Grok 只剥 `-fast`、不传 `parameters.effort`（思考强度会掉回上游默认，而不是客户端的 `reasoning_effort` / id 里的 `low|medium|high|xhigh`）
 - 给 AgentService 每轮 `randomId()` 当 conversationId（isolate 一跳就丢 cache；用 `tenant:agentRunFp`，fp **不要**混进整段 pending transcript，只锚第一条 user）
 - 再用客户端 `x-session-id` / `conversation_id` 当会话键（已废弃；session 完全内部计算）
-- 把 messages / canon / 整段 transcript 写进 `agent-run:` KV（只允许 ids + 可选小 checkpoint）
+- 把 messages / canon / 整段 transcript 写进 KV（`agent-run:` 只允许 ids + 可选小 checkpoint；`agent-run-len:` 只允许整数长度，TTL 5min，不要并进 24h 绑定）
 
 ---
 

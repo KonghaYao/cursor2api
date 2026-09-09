@@ -20,6 +20,7 @@ import {
   SDK_CUSTOM_ONLY_BUILTIN_TOOLS,
   composeCustomToolPrompt,
   composeCustomToolTurnPrompt,
+  joinUserPrompts,
   sdkLocalAgentCreateOptions,
   systemPromptFromClient,
 } from "./custom_tool_chat.ts";
@@ -216,6 +217,37 @@ test("composeCustomToolTurnPrompt does not reship full tool history on a warm th
     hadPriorTurn: true,
   });
   assert.equal(nextUser, "and osaka?");
+});
+
+test("composeCustomToolTurnPrompt slices multiple new users after priorMessageCount", () => {
+  const tools = openaiToolsToCustom([{ type: "function", function: { name: "lookup" } }]);
+  const messages = [
+    { role: "system", content: "be brief" },
+    { role: "user", content: "first" },
+    { role: "assistant", content: "ok" },
+    { role: "user", content: "second" },
+    { role: "user", content: "third" },
+  ];
+  const sliced = composeCustomToolTurnPrompt({
+    body: { messages },
+    tools,
+    messages,
+    hadPriorTurn: true,
+    priorMessageCount: 2,
+  });
+  assert.equal(sliced, "second\n\nthird");
+  assert.doesNotMatch(sliced, /first/);
+  assert.doesNotMatch(sliced, /<system>/);
+  assert.equal(joinUserPrompts(messages.slice(2)), "second\n\nthird");
+
+  const sameLen = composeCustomToolTurnPrompt({
+    body: { messages: messages.slice(0, 2) },
+    tools,
+    messages: messages.slice(0, 2),
+    hadPriorTurn: true,
+    priorMessageCount: 2,
+  });
+  assert.equal(sameLen, "first");
 });
 
 test("composeToolResultPrompt lists client tool output", () => {
