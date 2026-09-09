@@ -162,7 +162,6 @@ export function buildRunRequest(opts: {
     agentSessionId: opts.agentSessionId,
     mcpFileSystemOptions: {
       enabled: false,
-      workspaceProjectDir: opts.cwd || "/tmp",
     },
   };
   // Cursor only honours SelectedImage.data when this is true.
@@ -199,56 +198,35 @@ export function execIds(exec: JsonObject): { id: unknown; execId: unknown } {
   };
 }
 
-export function mcpStateResult(id: unknown, execId: unknown, tools: CustomToolSpec[]): JsonObject {
-  const defs = mcpToolDefinitions(tools);
+/** Empty MCP inventory. Do not advertise `custom-user-tools` — that is how models end up listing MCP instead of emitting `<gw_tool_call>`. */
+export function mcpStateResult(id: unknown, execId: unknown, _tools: CustomToolSpec[] = []): JsonObject {
   return execReply(id, execId, {
-    mcpStateExecResult: {
-      success: {
-        servers: [
-          {
-            serverName: CUSTOM_USER_TOOLS_SERVER,
-            serverIdentifier: CUSTOM_USER_TOOLS_SERVER,
-            status: "ready",
-            tools: defs,
-            instructions: [
-              {
-                serverName: CUSTOM_USER_TOOLS_SERVER,
-                serverIdentifier: CUSTOM_USER_TOOLS_SERVER,
-                instructions: "In-process OpenAI/Anthropic function tools offered through GetMcpTools / CallMcpTool.",
-              },
-            ],
-          },
-        ],
-      },
-    },
+    mcpStateExecResult: { success: { servers: [] } },
   });
 }
 
-export function requestContextResult(id: unknown, execId: unknown, opts: { cwd: string; tools: CustomToolSpec[] }): JsonObject {
-  const defs = mcpToolDefinitions(opts.tools);
-  const cwd = opts.cwd || "/tmp";
+/** No fake darwin/zsh/`/tmp` workspace and no MCP server instructions. */
+export function requestContextResult(
+  id: unknown,
+  execId: unknown,
+  _opts?: { cwd?: string; tools?: CustomToolSpec[] },
+): JsonObject {
   return execReply(id, execId, {
     requestContextResult: {
       success: {
         requestContext: {
           env: {
-            osVersion: "darwin",
-            workspacePaths: [cwd],
-            shell: "/bin/zsh",
+            osVersion: "unknown",
+            workspacePaths: [],
+            shell: "",
             sandboxEnabled: false,
             timeZone: "UTC",
-            projectFolder: cwd,
-            processWorkingDirectory: cwd,
+            projectFolder: "",
+            processWorkingDirectory: "",
             envInfoComplete: true,
           },
-          tools: defs,
-          mcpInstructions: [
-            {
-              serverName: CUSTOM_USER_TOOLS_SERVER,
-              serverIdentifier: CUSTOM_USER_TOOLS_SERVER,
-              instructions: "Call listed custom tools via MCP.",
-            },
-          ],
+          tools: [],
+          mcpInstructions: [],
           webSearchEnabled: false,
           webFetchEnabled: false,
           supportsMcpAuth: false,

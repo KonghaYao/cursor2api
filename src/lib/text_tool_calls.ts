@@ -11,6 +11,19 @@ export const GW_TOOL_RESULTS_OPEN = "<gw_tool_results>";
 export const GW_TOOL_RESULTS_CLOSE = "</gw_tool_results>";
 export const MAX_GW_TOOL_CALL_BLOCK_BYTES = 256 * 1024;
 
+/**
+ * Native AgentService MCP list/read still exist because the allowlist cannot
+ * be cleared (that turns default shell/edit back on). Tell the model those
+ * calls are leftover affordances, not the client catalog.
+ */
+export const MCP_NATIVE_REDIRECT =
+  "Do not call ListMcpResources, FetchMcpResource, GetMcpTools, CallMcpTool, or mcp_auth. " +
+  "An empty MCP list is expected. Shell/Read/Grep/Glob/Bash returning Tool not found is expected. " +
+  "When the user says to try other tools, emit <gw_tool_call> for a catalog name. " +
+  "Never say a listed catalog tool is unavailable.";
+
+export const TEXT_ONLY_MCP_ERROR = `text-only run: ${MCP_NATIVE_REDIRECT}`;
+
 export type GwToolCatalogItem = {
   name: string;
   openaiName: string;
@@ -109,44 +122,123 @@ function asArgs(value: unknown): Record<string, unknown> | undefined {
   return undefined;
 }
 
-export function parseGwToolCalls(text: string, catalog: GwToolCatalogItem[]): ParsedGwToolCall[] {
+function callFromRecord(
+  rec: Record<string, unknown>,
+  allowed: Map<string, GwToolCatalogItem>,
+  requireArgsKey = false,
+): ParsedGwToolCall | undefined {
+  const name = String(rec.name || "").trim();
+  if (!name) return undefined;
+  const def = allowed.get(name);
+  if (!def) return undefined;
+  if (requireArgsKey && rec.arguments === undefined && rec.input === undefined) return undefined;
+  const args = asArgs(
+    rec.arguments ?? rec.input ?? (requireArgsKey ? undefined : rec.parameters),
+  );
+  if (!args) return undefined;
+  return { name: def.openaiName, internalName: def.name, arguments: args };
+}
+
+function callFromJson(
+  raw: string,
+  allowed: Map<string, GwToolCatalogItem>,
+  requireArgsKey = false,
+): ParsedGwToolCall | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  return callFromRecord(parsed as Record<string, unknown>, allowed, requireArgsKey);
+}
+
+function locateMarkdownJsonBlocks(text: string): LocatedBlock[] {
+  const out: LocatedBlock[] = [];
+  const openRe = /```(?:json)?[ \t]*\r?\n?/gi;
+  let m: RegExpExecArray | null;
+  while ((m = openRe.exec(text))) {
+    const innerStart = m.index + m[0].length;
+    const close = text.indexOf("```", innerStart);
+    const innerEnd = close < 0 ? text.length : close;
+    const extracted = extractJsonObject(text, innerStart);
+    if (extracted && extracted.end <= innerEnd + 1) {
+      out.push({
+        open: m.index,
+        closeEnd: close < 0 ? extracted.end : close + 3,
+        json: extracted.raw,
+      });
+    }
+    openRe.lastIndex = close < 0 ? innerStart + 1 : close + 3;
+  }
+  return out;
+}
+
+function locateBareCatalogObjects(text: string, allowed: Map<string, GwToolCatalogItem>): LocatedBlock[] {
+  const out: LocatedBlock[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const brace = text.indexOf("{", i);
+    if (brace < 0) break;
+    const extracted = extractJsonObject(text, brace);
+    if (!extracted) {
+      i = brace + 1;
+      continue;
+    }
+    i = extracted.end;
+    if (callFromJson(extracted.raw, allowed, true)) {
+      out.push({ open: brace, closeEnd: extracted.end, json: extracted.raw });
+    }
+  }
+  return out;
+}
+
+function allowedMap(catalog: GwToolCatalogItem[]): Map<string, GwToolCatalogItem> {
   const allowed = new Map<string, GwToolCatalogItem>();
   for (const item of catalog) {
     if (item.openaiName) allowed.set(item.openaiName, item);
     if (item.name) allowed.set(item.name, item);
   }
+  return allowed;
+}
+
+function locateCatalogCallBlocks(text: string, catalog: GwToolCatalogItem[]): LocatedBlock[] {
+  const allowed = allowedMap(catalog);
+  const xml = locateGwToolCallBlocks(text).filter((b) => callFromJson(b.json, allowed));
+  if (xml.length) return xml;
+  const md = locateMarkdownJsonBlocks(text).filter((b) => callFromJson(b.json, allowed, true));
+  if (md.length) return md;
+  return locateBareCatalogObjects(text, allowed);
+}
+
+export function parseGwToolCalls(text: string, catalog: GwToolCatalogItem[]): ParsedGwToolCall[] {
+  const allowed = allowedMap(catalog);
   const out: ParsedGwToolCall[] = [];
-  for (const block of locateGwToolCallBlocks(text)) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(block.json);
-    } catch {
-      continue;
-    }
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
-    const rec = parsed as Record<string, unknown>;
-    const name = String(rec.name || "").trim();
-    if (!name) continue;
-    const def = allowed.get(name);
-    if (!def) continue;
-    const args = asArgs(rec.arguments ?? rec.parameters ?? rec.input);
-    if (!args) continue;
-    out.push({ name: def.openaiName, internalName: def.name, arguments: args });
+  for (const block of locateCatalogCallBlocks(text, catalog)) {
+    const call = callFromJson(block.json, allowed);
+    if (call) out.push(call);
   }
   return out;
 }
 
-export function stripGwToolCallFences(text: string): string {
-  const blocks = locateGwToolCallBlocks(text);
-  if (!blocks.length) return text;
-  let out = "";
-  let cursor = 0;
-  for (const block of blocks) {
-    out += text.slice(cursor, block.open);
-    cursor = block.closeEnd;
+function stripXmlGwToolCallTags(text: string): string {
+  return text.replace(/<gw_tool_call>[\s\S]*?<\/gw_tool_call>/g, "");
+}
+
+export function stripGwToolCallFences(text: string, catalog: GwToolCatalogItem[] = []): string {
+  const blocks = catalog.length ? locateCatalogCallBlocks(text, catalog) : locateGwToolCallBlocks(text);
+  let out = text;
+  if (blocks.length) {
+    out = "";
+    let cursor = 0;
+    for (const block of blocks) {
+      out += text.slice(cursor, block.open);
+      cursor = block.closeEnd;
+    }
+    out += text.slice(cursor);
   }
-  out += text.slice(cursor);
-  return out.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  return stripXmlGwToolCallTags(out).replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 export function splitAssistantToolText(
@@ -154,7 +246,7 @@ export function splitAssistantToolText(
   catalog: GwToolCatalogItem[],
 ): { calls: ParsedGwToolCall[]; visibleText: string } {
   const calls = parseGwToolCalls(text, catalog);
-  return { calls, visibleText: stripGwToolCallFences(text) };
+  return { calls, visibleText: stripGwToolCallFences(text, catalog) };
 }
 
 export function gwToolCallsToOpenAi(calls: ParsedGwToolCall[]) {
@@ -219,8 +311,8 @@ export function composeReplacementSystemPrompt(opts: {
   const policy = toolChoicePolicy(opts.body || {}, opts.tools);
   const appendix = [
     "You have no Cursor builtin tools (no shell / edit / grep / MCP).",
-    "MCP list/read resource tools may appear in the session; they cannot run client functions and cannot look up catalog facts.",
-    "The catalog below IS available. Never say a listed tool is unavailable. Do not call MCP for these functions.",
+    MCP_NATIVE_REDIRECT,
+    "The catalog below IS available. Do not write a table of unavailable MCP or shell tools.",
     "If you need a client function, write one or more of the following blocks in your reply and then stop.",
     "You may write one or two sentences before the blocks. Do not put calls in thinking.",
     "",

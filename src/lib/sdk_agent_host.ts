@@ -31,6 +31,7 @@ import {
 } from "./agent_json.ts";
 import { abortAgentDuplex, closeAgentDuplex, openAgentRun, type OpenAgentRun } from "./agent_run.ts";
 import type { CustomToolAgentHandle, CustomToolAgentHost } from "./custom_tool_chat.ts";
+import { GW_TOOL_CALL_OPEN, MCP_NATIVE_REDIRECT, TEXT_ONLY_MCP_ERROR } from "./text_tool_calls.ts";
 
 const HEARTBEAT_MS = 15_000;
 /** `AbortController.abort(reason)` used by release() — close the Run, do not cancelAction. */
@@ -64,7 +65,12 @@ async function resolveAccessToken(
   return exchanged.accessToken;
 }
 
-const TEXT_ONLY_MCP_ERROR = "text-only run: custom tools are not registered";
+function assistantLooksLikeTextToolCall(text: string): boolean {
+  if (text.includes(GW_TOOL_CALL_OPEN)) return true;
+  if (/```(?:json)?[\s\S]{0,800}"name"\s*:\s*"[^"]+"\s*,\s*"arguments"/i.test(text)) return true;
+  if (/"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:/.test(text)) return true;
+  return false;
+}
 
 export function createSdkAgentHost(opts?: {
   openRun?: OpenAgentRun;
@@ -191,6 +197,9 @@ async function runTurn(opts: {
   let thinking = "";
   let error: string | undefined;
   let usage: AgentTurnUsage | undefined;
+  let conversationState = opts.conversationState;
+  let nudgedForTextTools = false;
+  const wantsTextTools = opts.prompt.includes(GW_TOOL_CALL_OPEN);
   const inflight = new Set<Promise<void>>();
   let heartbeat: ReturnType<typeof setInterval> | undefined;
 
@@ -255,6 +264,7 @@ async function runTurn(opts: {
         continue;
       }
       if (parsed.kind === "checkpoint") {
+        conversationState = parsed.state;
         opts.onCheckpoint(parsed.state);
         continue;
       }
@@ -264,6 +274,35 @@ async function runTurn(opts: {
       }
       if (parsed.kind === "turnEnded") {
         usage = mergeAgentTurnUsage(usage, parsed.usage);
+        if (
+          wantsTextTools &&
+          !nudgedForTextTools &&
+          !cancelled &&
+          !error &&
+          !assistantLooksLikeTextToolCall(text)
+        ) {
+          nudgedForTextTools = true;
+          await duplex.send(
+            clientRunMessage(
+              buildRunRequest({
+                prompt: [
+                  MCP_NATIVE_REDIRECT,
+                  "Your last reply had no <gw_tool_call> block. Native Shell/MCP/lookup calls will not work.",
+                  "Write one catalog <gw_tool_call> now and stop. Do not write a table of unavailable tools.",
+                ].join(" "),
+                modelId: opts.modelId,
+                modelParameters: opts.modelParameters,
+                conversationId: opts.conversationId,
+                runId: randomId(),
+                agentSessionId: opts.agentSessionId,
+                tools: [],
+                conversationState,
+                cwd: opts.cwd,
+              }),
+            ),
+          );
+          continue;
+        }
         break;
       }
       if (parsed.kind === "abort") {

@@ -54,6 +54,7 @@ import {
   gwToolCallsToAnthropic,
   gwToolCallsToOpenAi,
   splitAssistantToolText,
+  stripGwToolCallFences,
 } from "./text_tool_calls.ts";
 import { gatewayAgentModelSelection, promptCacheHitPercent, type AgentInlineImage, type AgentTurnUsage } from "./agent_json.ts";
 import { openaiContentToCursorParts } from "./content_parts.ts";
@@ -564,7 +565,7 @@ async function settleTextTurn(
         openAiToolCalls: gwToolCallsToOpenAi(calls),
         anthropicToolUses: gwToolCallsToAnthropic(calls),
         visibleText,
-        thinking: result.thinking,
+        thinking: result.thinking ? stripGwToolCallFences(result.thinking, tools) : result.thinking,
         usage: result.usage,
       };
     }
@@ -961,6 +962,7 @@ function streamCustomOpenAi(opts: {
       let emittedThinking = live.deltas.ackedThinking;
       let emittedText = live.deltas.ackedText;
       const flushThinking = () => {
+        if (live.bufferText) return;
         const thinking = longerText(live.thinking, live.deltas.streamedThinking);
         if (thinking.length > emittedThinking) {
           controller.enqueue(chunk({ reasoning_content: thinking.slice(emittedThinking) }));
@@ -990,6 +992,12 @@ function streamCustomOpenAi(opts: {
           releaseUpstreamAfterTurn(live);
           const toolCalls = settled.openAiToolCalls;
           console.log(`  custom_tools text ${toolCalls.map((c) => c.function.name).join(",")}`);
+          const thinking = stripGwToolCallFences(settled.thinking || "", tools);
+          if (thinking.length > emittedThinking) {
+            controller.enqueue(chunk({ reasoning_content: thinking.slice(emittedThinking) }));
+            emittedThinking = thinking.length;
+          }
+          live.deltas.ackedThinking = emittedThinking;
           const visible = settled.visibleText;
           if (visible.length > emittedText) {
             controller.enqueue(chunk({ content: visible.slice(emittedText) }));
@@ -1014,6 +1022,12 @@ function streamCustomOpenAi(opts: {
         }
         const result = settled.result;
         logAgentUsage(result.usage);
+        const thinking = stripGwToolCallFences(result.thinking || "", tools);
+        if (thinking.length > emittedThinking) {
+          controller.enqueue(chunk({ reasoning_content: thinking.slice(emittedThinking) }));
+          emittedThinking = thinking.length;
+        }
+        live.deltas.ackedThinking = emittedThinking;
         const visible = agentVisibleText(result.text, result.error);
         if (visible.length > emittedText) {
           controller.enqueue(chunk({ content: visible.slice(emittedText) }));
@@ -1098,6 +1112,7 @@ function streamCustomAnthropic(opts: {
         open = null;
       };
       const flushThinking = () => {
+        if (live.bufferText) return;
         const thinking = longerText(live.thinking, live.deltas.streamedThinking);
         if (thinking.length > emittedThinking) {
           if (open !== "thinking") {
@@ -1167,8 +1182,35 @@ function streamCustomAnthropic(opts: {
         flushText(longerText(live.text, live.deltas.streamedText));
         const settled = await settleTextTurn(live, tools, body);
         unsub();
-        flushThinking();
+        const settledThinking = settled.kind === "tools" ? settled.thinking : settled.result.thinking;
+        if (live.bufferText) {
+          const thinking = stripGwToolCallFences(settledThinking || "", tools);
+          if (thinking.length > emittedThinking) {
+            if (open !== "thinking") {
+              closeOpen();
+              controller.enqueue(
+                encodeSseEvent("content_block_start", {
+                  type: "content_block_start",
+                  index,
+                  content_block: { type: "thinking", thinking: "" },
+                }),
+              );
+              open = "thinking";
+            }
+            controller.enqueue(
+              encodeSseEvent("content_block_delta", {
+                type: "content_block_delta",
+                index,
+                delta: { type: "thinking_delta", thinking: thinking.slice(emittedThinking) },
+              }),
+            );
+            emittedThinking = thinking.length;
+          }
+        } else {
+          flushThinking();
+        }
         closeOpen();
+        open = null;
         live.deltas.ackedThinking = emittedThinking;
         if (settled.kind === "tools") {
           releaseUpstreamAfterTurn(live);

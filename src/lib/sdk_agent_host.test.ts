@@ -5,6 +5,7 @@ import { createSdkAgentHost } from "./sdk_agent_host.ts";
 import type { AgentDuplex, OpenAgentRun } from "./agent_run.ts";
 import type { JsonObject } from "./agent_json.ts";
 import { asObject, field } from "./agent_json.ts";
+import { GW_TOOL_CALL_CLOSE, GW_TOOL_CALL_OPEN } from "./text_tool_calls.ts";
 
 afterEachClear();
 
@@ -100,10 +101,84 @@ test("in-repo host replies mcpError on mcpArgs without parking execute", async (
     })
     .find((v) => typeof v === "string");
   assert.match(String(errorMsg), /text-only run/);
+  assert.match(String(errorMsg), /ListMcpResources/);
+  assert.match(String(errorMsg), /<gw_tool_call>/);
+  assert.doesNotMatch(String(errorMsg), /not registered/);
 
   const result = await run.wait();
   assert.equal(result.error, undefined);
   assert.equal(result.text, "22c in Tokyo");
+  await agent.close();
+});
+
+test("in-repo host requestContext/mcpState/listMcp advertise no custom-user-tools server", async () => {
+  const duplex = new InteractiveDuplex();
+  duplex.onSend = (message) => {
+    if (field(message, "runRequest", "run_request")) {
+      duplex.push({ execServerMessage: { id: 1, execId: "ctx", requestContextArgs: {} } });
+      return;
+    }
+    const exec = asObject(field(message, "execClientMessage", "exec_client_message"));
+    if (field(exec, "requestContextResult", "request_context_result")) {
+      duplex.push({ execServerMessage: { id: 2, execId: "state", mcpStateExecArgs: {} } });
+      return;
+    }
+    if (field(exec, "mcpStateExecResult", "mcp_state_exec_result")) {
+      duplex.push({ execServerMessage: { id: 3, execId: "list", listMcpResourcesExecArgs: {} } });
+      return;
+    }
+    if (field(exec, "listMcpResourcesExecResult", "list_mcp_resources_exec_result")) {
+      duplex.push({ interactionUpdate: { textDelta: { text: "ok" } } });
+      duplex.push({ interactionUpdate: { turnEnded: {} } });
+    }
+  };
+  const host = createSdkAgentHost({
+    openRun: async () => duplex,
+    exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+  });
+  const agent = await host.create({ apiKey: "crsr_test", model: "composer-2.5", customTools: {} });
+  const result = await (await agent.send("try other tools")).wait();
+  assert.equal(result.text, "ok");
+  const blob = JSON.stringify(duplex.sent);
+  assert.doesNotMatch(blob, /custom-user-tools/);
+  assert.doesNotMatch(blob, /\/bin\/zsh/);
+  assert.doesNotMatch(blob, /Call listed custom tools via MCP/);
+  assert.match(blob, /"servers":\[\]/);
+  assert.match(blob, /"resources":\[\]/);
+  await agent.close();
+});
+
+test("in-repo host nudges once when catalog prompt yields no gw_tool_call", async () => {
+  const duplex = new InteractiveDuplex();
+  let runs = 0;
+  duplex.onSend = (message) => {
+    if (!field(message, "runRequest", "run_request")) return;
+    runs += 1;
+    if (runs === 1) {
+      duplex.push({ interactionUpdate: { textDelta: { text: "I only have MCP" } } });
+      duplex.push({ interactionUpdate: { turnEnded: {} } });
+      return;
+    }
+    duplex.push({
+      interactionUpdate: {
+        textDelta: {
+          text: `${GW_TOOL_CALL_OPEN}{"name":"lookup","arguments":{"q":"tokyo_temp"}}${GW_TOOL_CALL_CLOSE}`,
+        },
+      },
+    });
+    duplex.push({ interactionUpdate: { turnEnded: {} } });
+  };
+  const host = createSdkAgentHost({
+    openRun: async () => duplex,
+    exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+  });
+  const agent = await host.create({ apiKey: "crsr_test", model: "composer-2.5", customTools: {} });
+  const catalog = `${GW_TOOL_CALL_OPEN}\n{"name":"lookup","arguments":{}}\n${GW_TOOL_CALL_CLOSE}`;
+  const result = await (await agent.send(`look up tokyo\n${catalog}`)).wait();
+  assert.equal(runs, 2);
+  assert.match(result.text, /I only have MCP/);
+  assert.match(result.text, /tokyo_temp/);
+  assert.match(result.text, /<gw_tool_call>/);
   await agent.close();
 });
 

@@ -48,6 +48,8 @@ AgentService **没有** Chat Completions HTTP。客户端 function tools **不�
 </gw_tool_call>
 ```
 
+Composer 在 `tool_choice=auto` /「再尝试其他工具」时常常写成 markdown ` ```json {"name","arguments"} ` 而不是 XML。网关把这两种都解析成 `tool_calls`；**不要**把 JSON Schema 目录对象（只有 `parameters`、没有 `arguments`/`input`）当成调用。
+
 客户端 `role: tool` 跟进时，网关只送最近一轮结果：
 
 ```
@@ -69,6 +71,8 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 - 不设该头 → 默认 toolset（shell / edit / grep / …）会回来 — **禁止**
 - 只开 MCP 家族 → 压掉 shell/edit/grep/task/webSearch；Connect body 仍送 `mcpTools: []`
 - 客户端 tools **默认**折进首轮 user `<system>…</system>`（client `system` + 工具目录 + `<gw_tool_call>` 语法）；**跟进轮次不再送**（cache）。`GATEWAY_FOLD_SYSTEM` 默认视为 `1`；设 `0` / `false` / `off` 才改走 Connect `customSystemPrompt`。
+- **不要**在 `requestContext` / `mcpState` 里再挂 `custom-user-tools`、假 `darwin`/`zsh`/`/tmp` workspace。allowlist 仍会露出 `ListMcpResources`，但空 `servers` + 空 resources 必须被模型当成「MCP 不可用」，不是「我只有 MCP」。MCP `mcpArgs` 错误文案导向 `<gw_tool_call>`，禁止写 `not registered`。首轮若带了 fence 说明却没有写出 `<gw_tool_call>`，同一条 Run 上 **nudges 一次**。探针必须覆盖 `tool_choice=auto` +「再尝试其他工具」（不要只测 forced `lookup`）。
+- **跨轮次工具**：单测 / 探针至少要有「客户端定义 `get_weather` + `lookup` → 第一枪 `tool_calls` → 全量 transcript 带回 `role: tool` → 再打第二个 catalog 工具 → 终轮文本」；`conversation_id` 不变；跟进 `userMessageAction` 只带最近一轮 `<gw_tool_results>`。改第一条 user = 新对话。不要用「只发最后一条」当产品场景。
 
 **不要**设 `AgentRunRequest.excludeWorkspaceContext = true`（`Workspace context exclusion is not allowed…`）。无 workspace 靠 MCP allowlist + `mcpFileSystemOptions.enabled = false`。首轮 `userMessageAction` 默认带折进的 `<system>` + 第一条 user；跟进只送最新 user 或 `<gw_tool_results>` delta，上文靠 Cursor `conversationState`。不要把客户端 tools 挂成 HTTP MCP。
 
@@ -131,6 +135,7 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 - 指纹路径每轮 `randomId()` 当 conversationId（9/1 cache 事故）
 - 设 `excludeWorkspaceContext = true`（Dashboard `crsr_` 会 invalid_argument）
 - 给 Dashboard `crsr_` 发 `customSystemPrompt`（会 `unknown option '--system-prompt'`；保持默认 fold，不要设 `GATEWAY_FOLD_SYSTEM=0`）
+- 在 `requestContext` / `mcpState` 里挂 `custom-user-tools` 或假 `/tmp`+`zsh` workspace（模型会去 `ListMcpResources` / `FetchMcpResource`，然后写「我只能用 MCP」）
 - 只把最后一条 user 丢给 AgentService（OpenAI `system` 必须折进 user 文本）
 - 把「客户端只发增量 messages」当成产品场景。常态是 **每轮全量 + 前缀稳定**；网关从全量抽 delta，禁止把整段 history 再叠进 `userMessageAction`
 - 跟进轮次再把 system / 工具目录 / 整段 history / 历史 tool results 叠进 `userMessageAction`（Cursor `conversationState` 里已经有上文，会打坏 cache）。warm follow-up 只送**最近一轮** `<gw_tool_results>`；没有 live/KV 的冷启动才把全部结果和首条 user 折进去。

@@ -13,6 +13,8 @@ import {
   parseMcpArgs,
   parseServerMessage,
   mergeAgentTurnUsage,
+  mcpStateResult,
+  requestContextResult,
   promptCacheHitPercent,
   aggregatePromptCacheHitPercent,
 } from "./agent_json.ts";
@@ -127,6 +129,19 @@ test("mcp tool definitions use custom-user-tools wire names", () => {
   assert.match(String(defs[0]?.inputSchemaJson), /object/);
 });
 
+test("requestContext and mcpState do not advertise custom-user-tools or a fake shell workspace", () => {
+  const ctx = JSON.stringify(requestContextResult(1, "ctx", { cwd: "/tmp", tools: [{ name: "lookup" }] }));
+  assert.doesNotMatch(ctx, /custom-user-tools/);
+  assert.doesNotMatch(ctx, /\/bin\/zsh/);
+  assert.doesNotMatch(ctx, /darwin/);
+  assert.doesNotMatch(ctx, /Call listed custom tools via MCP/);
+  assert.match(ctx, /"workspacePaths":\[\]/);
+  assert.match(ctx, /"mcpInstructions":\[\]/);
+  const state = JSON.stringify(mcpStateResult(2, "mcp-state", [{ name: "lookup" }]));
+  assert.doesNotMatch(state, /custom-user-tools/);
+  assert.match(state, /"servers":\[\]/);
+});
+
 test("buildRunRequest omits excludeWorkspaceContext and sends empty mcpTools", () => {
   const req = buildRunRequest({
     prompt: "hi",
@@ -138,6 +153,7 @@ test("buildRunRequest omits excludeWorkspaceContext and sends empty mcpTools", (
   });
   assert.equal(req.excludeWorkspaceContext, undefined);
   assert.equal((req.mcpFileSystemOptions as { enabled: boolean }).enabled, false);
+  assert.equal((req.mcpFileSystemOptions as { workspaceProjectDir?: string }).workspaceProjectDir, undefined);
   const rm = req.requestedModel as { modelId: string; parameters?: Array<{ id: string; value: string }> };
   assert.equal(rm.modelId, "composer-2.5");
   assert.deepEqual(rm.parameters, [{ id: "fast", value: "false" }]);

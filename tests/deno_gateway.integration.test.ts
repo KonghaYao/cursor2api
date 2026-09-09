@@ -838,6 +838,106 @@ Deno.test("cloud OpenAI two tool rounds then final text (full transcript)", asyn
   }
 });
 
+Deno.test("cloud OpenAI get_weather then lookup keeps conversation_id (full transcript)", async () => {
+  cloudClientToolsClearForTests();
+  const usage = { inputTokens: 40, outputTokens: 4, cacheReadTokens: 30, cacheWriteTokens: 2 };
+  const prompts: string[] = [];
+  let sends = 0;
+  setCustomToolAgentHostForTests({
+    async create() {
+      return {
+        agentId: "local-catalog-round",
+        async send(prompt: string) {
+          prompts.push(prompt);
+          const i = sends++;
+          const wait = (async () => {
+            if (i === 0) return { text: fakeGwToolCallText("get_weather", { city: "Tokyo" }), usage };
+            if (i === 1) return { text: fakeGwToolCallText("lookup", { q: "tokyo_humidity" }), usage };
+            return { text: "Tokyo is 22°C with 40% humidity.", usage };
+          })();
+          return { wait: () => wait, abort() {}, release() {} };
+        },
+        async close() {},
+      };
+    },
+  });
+  const kv = createMemoryKv();
+  const ctx = { kv, upstream: "cloud" as const };
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "get_weather",
+        parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "lookup",
+        parameters: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
+      },
+    },
+  ];
+  const user = { role: "user", content: "Tokyo weather then humidity. One catalog tool per turn." };
+  const post = (messages: unknown[]) =>
+    handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer crsr_test", "content-type": "application/json" },
+        body: JSON.stringify({ model: "composer-2.5", tool_choice: "auto", messages, tools }),
+      }),
+      ctx,
+    );
+  try {
+    const chat = await post([user]);
+    if (chat.status !== 200) throw new Error(`chat ${chat.status}: ${await chat.text()}`);
+    const body1 = await chat.json();
+    const tc1 = body1.choices[0].message.tool_calls;
+    if (body1?.choices?.[0]?.finish_reason !== "tool_calls" || tc1?.[0]?.function?.name !== "get_weather") {
+      throw new Error(`expected get_weather, got ${JSON.stringify(body1)}`);
+    }
+    const chat2 = await post([
+      user,
+      { role: "assistant", content: null, tool_calls: tc1 },
+      { role: "tool", tool_call_id: tc1[0].id, content: JSON.stringify({ city: "Tokyo", temp_c: 22 }) },
+    ]);
+    if (chat2.status !== 200) throw new Error(`chat2 ${chat2.status}: ${await chat2.text()}`);
+    const body2 = await chat2.json();
+    const tc2 = body2.choices[0].message.tool_calls;
+    if (body2?.choices?.[0]?.finish_reason !== "tool_calls" || tc2?.[0]?.function?.name !== "lookup") {
+      throw new Error(`expected lookup, got ${JSON.stringify(body2)}`);
+    }
+    if (body2.conversation_id !== body1.conversation_id) {
+      throw new Error(`conversation_id changed: ${body1.conversation_id} -> ${body2.conversation_id}`);
+    }
+    if (!prompts[1]?.includes("<gw_tool_results>") || prompts[1].includes("Tokyo weather then humidity")) {
+      throw new Error(`follow-up must be latest gw_tool_results only, got ${prompts[1]}`);
+    }
+    const chat3 = await post([
+      user,
+      { role: "assistant", content: null, tool_calls: tc1 },
+      { role: "tool", tool_call_id: tc1[0].id, content: JSON.stringify({ city: "Tokyo", temp_c: 22 }) },
+      { role: "assistant", content: null, tool_calls: tc2 },
+      { role: "tool", tool_call_id: tc2[0].id, content: JSON.stringify({ q: "tokyo_humidity", humidity: 40 }) },
+    ]);
+    if (chat3.status !== 200) throw new Error(`chat3 ${chat3.status}: ${await chat3.text()}`);
+    const body3 = await chat3.json();
+    if (!String(body3?.choices?.[0]?.message?.content || "").includes("22")) {
+      throw new Error(`expected final text, got ${JSON.stringify(body3)}`);
+    }
+    if (body3.conversation_id !== body1.conversation_id) {
+      throw new Error(`final conversation_id changed`);
+    }
+    if (!prompts[2]?.includes("humidity") || prompts[2].includes("temp_c")) {
+      throw new Error(`third send must be latest results only, got ${prompts[2]}`);
+    }
+  } finally {
+    setCustomToolAgentHostForTests(undefined);
+    cloudClientToolsClearForTests();
+  }
+});
+
 Deno.test("cloud tool results continue when the prior AgentService run is gone", async () => {
   cloudClientToolsClearForTests();
   installFakeCustomToolHost([], "get_weather");

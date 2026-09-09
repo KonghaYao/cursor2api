@@ -49,6 +49,19 @@ function toolCallsOf(json: ChatJson): ToolCall[] {
   return json.choices?.[0]?.message?.tool_calls || [];
 }
 
+const GET_WEATHER = {
+  type: "function",
+  function: {
+    name: "get_weather",
+    description: "Current temperature in Celsius for a city.",
+    parameters: {
+      type: "object",
+      properties: { city: { type: "string" } },
+      required: ["city"],
+    },
+  },
+};
+
 const LOOKUP = {
   type: "function",
   function: {
@@ -61,6 +74,15 @@ const LOOKUP = {
     },
   },
 };
+
+function argsOf(call: ToolCall | undefined): Record<string, unknown> {
+  try {
+    const v = JSON.parse(String(call?.function?.arguments || "{}"));
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
 
 async function chat(key: string, body: Record<string, unknown>): Promise<{
   status: number;
@@ -152,34 +174,37 @@ async function main(): Promise<void> {
     },
   });
 
-  const user = {
+  const catalogUser = {
     role: "user",
     content:
-      `You must look up two facts with the lookup tool, one call per turn, in this order: ` +
-      `first q=tokyo_temp then q=tokyo_humidity. Do not invent numbers. nonce=${nonce}`,
+      `Use the catalog tools I defined. Call get_weather with city=Tokyo now. ` +
+      `After I return that result, call lookup with q=tokyo_humidity. ` +
+      `One catalog tool per turn. Do not invent numbers. Do not call MCP/Shell. nonce=${nonce}`,
   };
-  const tools = [LOOKUP];
-  const toolBody = {
+  const catalogTools = [GET_WEATHER, LOOKUP];
+  const catalogBody = {
     model: MODEL,
     max_tokens: 512,
     parallel_tool_calls: false,
-    tool_choice: { type: "function", function: { name: "lookup" } },
-    tools,
+    tool_choice: "auto",
+    tools: catalogTools,
   };
 
-  console.log(">> tool round 1");
-  const r1 = await chatRetry(key, { ...toolBody, messages: [user] });
+  console.log(">> catalog round 1 (get_weather)");
+  const r1 = await chatRetry(key, { ...catalogBody, messages: [catalogUser] });
   const tc1 = toolCallsOf(r1.json);
   const r1Content = contentOf(r1.json);
+  const r1Args = argsOf(tc1[0]);
   const r1Ok =
     r1.status === 200 &&
     !errOf(r1.json) &&
     r1.json.choices?.[0]?.finish_reason === "tool_calls" &&
-    tc1.length >= 1 &&
-    tc1[0]?.function?.name === "lookup" &&
+    tc1.length === 1 &&
+    tc1[0]?.function?.name === "get_weather" &&
+    String(r1Args.city || "").toLowerCase().includes("tokyo") &&
     !r1Content.includes("<gw_tool_call>");
   record({
-    name: "tool_round_1",
+    name: "catalog_round_1_get_weather",
     pass: r1Ok,
     detail: {
       status: r1.status,
@@ -187,7 +212,6 @@ async function main(): Promise<void> {
       finish: r1.json.choices?.[0]?.finish_reason,
       conversation_id: r1.json.conversation_id,
       usage: r1.json.usage,
-      prompt_tokens: r1.json.usage?.prompt_tokens,
       content: r1Content.slice(0, 160),
       n_calls: tc1.length,
       tool_calls: tc1.map((c) => ({
@@ -203,28 +227,30 @@ async function main(): Promise<void> {
   if (!r1Ok) console.log("round1_raw_head", r1.raw.slice(0, 800));
 
   if (r1Ok && tc1[0]) {
-    console.log(">> tool round 2 (role=tool, full transcript)");
+    console.log(">> catalog round 2 (lookup, full transcript)");
     await new Promise((r) => setTimeout(r, 1500));
     const r2 = await chatRetry(key, {
-      ...toolBody,
+      ...catalogBody,
       messages: [
-        user,
+        catalogUser,
         { role: "assistant", content: r1Content || null, tool_calls: tc1 },
-        { role: "tool", tool_call_id: tc1[0].id, content: JSON.stringify({ q: "tokyo_temp", temp_c: 22 }) },
+        { role: "tool", tool_call_id: tc1[0].id, content: JSON.stringify({ city: "Tokyo", temp_c: 22 }) },
       ],
     });
     const tc2 = toolCallsOf(r2.json);
     const r2Content = contentOf(r2.json);
-    const r2Tool = r2.json.choices?.[0]?.finish_reason === "tool_calls" && tc2.length >= 1 && tc2[0]?.function?.name === "lookup";
-    const r2Final = r2.json.choices?.[0]?.finish_reason !== "tool_calls" && /22/.test(r2Content);
+    const r2Args = argsOf(tc2[0]);
     const r2Ok =
       r2.status === 200 &&
       !errOf(r2.json) &&
+      r2.json.choices?.[0]?.finish_reason === "tool_calls" &&
       r2.json.conversation_id === r1.json.conversation_id &&
-      !r2Content.includes("<gw_tool_call>") &&
-      (r2Tool || r2Final);
+      tc2.length === 1 &&
+      tc2[0]?.function?.name === "lookup" &&
+      String(r2Args.q || "").includes("tokyo_humidity") &&
+      !r2Content.includes("<gw_tool_call>");
     record({
-      name: "tool_round_2",
+      name: "catalog_round_2_lookup",
       pass: r2Ok,
       detail: {
         status: r2.status,
@@ -246,20 +272,19 @@ async function main(): Promise<void> {
     });
     if (!r2Ok) console.log("round2_raw_head", r2.raw.slice(0, 800));
 
-    if (r2Ok && r2Tool && tc2[0]) {
-      console.log(">> final text after two tool rounds");
+    if (r2Ok && tc2[0]) {
+      console.log(">> catalog final text after two defined tools");
       await new Promise((r) => setTimeout(r, 1500));
       const r3 = await chatRetry(key, {
-        model: MODEL,
+        ...catalogBody,
         max_tokens: 256,
         messages: [
-          user,
+          catalogUser,
           { role: "assistant", content: r1Content || null, tool_calls: tc1 },
-          { role: "tool", tool_call_id: tc1[0].id, content: JSON.stringify({ q: "tokyo_temp", temp_c: 22 }) },
+          { role: "tool", tool_call_id: tc1[0].id, content: JSON.stringify({ city: "Tokyo", temp_c: 22 }) },
           { role: "assistant", content: r2Content || null, tool_calls: tc2 },
           { role: "tool", tool_call_id: tc2[0].id, content: JSON.stringify({ q: "tokyo_humidity", humidity: 40 }) },
         ],
-        tools,
       });
       const r3Text = contentOf(r3.json);
       const r3Ok =
@@ -270,7 +295,7 @@ async function main(): Promise<void> {
         /22/.test(r3Text) &&
         /40/.test(r3Text);
       record({
-        name: "tool_final_text",
+        name: "catalog_final_text",
         pass: r3Ok,
         detail: {
           status: r3.status,
@@ -287,10 +312,57 @@ async function main(): Promise<void> {
     }
   }
 
+  console.log(">> try other tools (tool_choice auto, after fake bash 127)");
+  const tryUser = {
+    role: "user",
+    content:
+      `I ran bash and got "command not found" (exit 127). Try other tools. ` +
+      `Look up tokyo_temp. Do not invent the number. Do not write a table about MCP or Shell. nonce=${nonce}-auto`,
+  };
+  const auto = await chatRetry(key, {
+    model: MODEL,
+    max_tokens: 512,
+    tools: [LOOKUP],
+    messages: [tryUser],
+  });
+  const autoTc = toolCallsOf(auto.json);
+  const autoContent = contentOf(auto.json);
+  const autoEssay =
+    /listmcpresources|only mcp|tool not found|custom-user-tools/i.test(autoContent) &&
+    auto.json.choices?.[0]?.finish_reason !== "tool_calls";
+  const autoOk =
+    auto.status === 200 &&
+    !errOf(auto.json) &&
+    auto.json.choices?.[0]?.finish_reason === "tool_calls" &&
+    autoTc.some((c) => c.function?.name === "lookup") &&
+    !autoContent.includes("<gw_tool_call>") &&
+    !autoEssay;
+  record({
+    name: "try_other_tools_auto",
+    pass: autoOk,
+    detail: {
+      status: auto.status,
+      ms: auto.ms,
+      finish: auto.json.choices?.[0]?.finish_reason,
+      usage: auto.json.usage,
+      content: autoContent.slice(0, 240),
+      n_calls: autoTc.length,
+      tool_calls: autoTc.map((c) => ({
+        id: String(c.id || "").slice(0, 28),
+        name: c.function?.name,
+        arguments: String(c.function?.arguments || "").slice(0, 160),
+      })),
+      error: errOf(auto.json),
+      mcp_essay: autoEssay,
+      fence_leaked: autoContent.includes("<gw_tool_call>"),
+    },
+  });
+  if (!autoOk) console.log("try_other_tools_raw_head", auto.raw.slice(0, 800));
+
   console.log(">> stream tool_calls");
   const stream = await chatStream(key, {
-    ...toolBody,
-    messages: [{ role: "user", content: `Call lookup with q=osaka_temp now. Do not invent the number. nonce=${nonce}` }],
+    ...catalogBody,
+    messages: [{ role: "user", content: `Call get_weather with city=Osaka now. Do not invent the number. nonce=${nonce}-sse` }],
   });
   const toolCallDeltas = stream.text.split("\n").filter((line) => line.includes('"tool_calls":['));
   record({
@@ -299,7 +371,7 @@ async function main(): Promise<void> {
       stream.status === 200 &&
       toolCallDeltas.length === 1 &&
       stream.text.includes('"finish_reason":"tool_calls"') &&
-      stream.text.includes("lookup") &&
+      stream.text.includes("get_weather") &&
       !stream.text.includes("<gw_tool_call>"),
     detail: {
       status: stream.status,
