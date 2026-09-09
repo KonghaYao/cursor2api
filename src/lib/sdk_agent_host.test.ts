@@ -182,6 +182,32 @@ test("AgentService requestedModel sends explicit fast for composer standard vs f
   ]);
 });
 
+test("in-repo host merges cumulative usage snapshots without doubling cache", async () => {
+  const duplex = new InteractiveDuplex();
+  duplex.onSend = (message) => {
+    if (field(message, "runRequest")) {
+      duplex.push({ interactionUpdate: { textDelta: { text: "PONG" } } });
+      const snap = { inputTokens: 40, outputTokens: 4, cacheReadTokens: 30, cacheWriteTokens: 2 };
+      duplex.push({ interactionUpdate: { usage: snap } });
+      duplex.push({ interactionUpdate: { usage: snap } });
+      duplex.push({ interactionUpdate: { turnEnded: snap } });
+    }
+  };
+  const host = createSdkAgentHost({
+    openRun: async () => duplex,
+    exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+  });
+  const agent = await host.create({ apiKey: "crsr_test", model: "composer-2.5", customTools: {} });
+  const result = await (await agent.send("ping")).wait();
+  assert.deepEqual(result.usage, {
+    inputTokens: 40,
+    outputTokens: 4,
+    cacheReadTokens: 30,
+    cacheWriteTokens: 2,
+    reasoningTokens: undefined,
+  });
+  await agent.close();
+});
 test("in-repo host returns turnEnded usage to wait()", async () => {
   const duplex = new InteractiveDuplex();
   duplex.onSend = (message) => {

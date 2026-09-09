@@ -47,15 +47,13 @@ test("fingerprint session_fp is stable after first tool via resolveSessionForReq
   assert.ok(r2.canon_len > r1.canon_len);
 });
 
-test("agentRunConversationId is stable per tenant+session+fp and splits clients", async () => {
-  const a = await agentRunConversationId("tenant-a", "sess-1", "fp-1");
-  const b = await agentRunConversationId("tenant-a", "sess-1", "fp-1");
-  const otherSess = await agentRunConversationId("tenant-a", "sess-2", "fp-1");
-  const otherFp = await agentRunConversationId("tenant-a", "sess-1", "fp-2");
-  const otherTenant = await agentRunConversationId("tenant-b", "sess-1", "fp-1");
+test("agentRunConversationId is tenant:fp and splits tenants", () => {
+  const a = agentRunConversationId("tenant-a", "fp-1");
+  const b = agentRunConversationId("tenant-a", "fp-1");
+  const otherFp = agentRunConversationId("tenant-a", "fp-2");
+  const otherTenant = agentRunConversationId("tenant-b", "fp-1");
   assert.equal(a, b);
-  assert.match(a, /^tenant-a:[0-9a-f]{64}$/);
-  assert.notEqual(a, otherSess);
+  assert.equal(a, "tenant-a:fp-1");
   assert.notEqual(a, otherFp);
   assert.notEqual(a, otherTenant);
 });

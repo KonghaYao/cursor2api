@@ -460,6 +460,50 @@ export function addAgentTurnUsage(a?: AgentTurnUsage, b?: AgentTurnUsage): Agent
   };
 }
 
+/** AgentService may emit cumulative usage snapshots or per-segment deltas. */
+export function mergeAgentTurnUsage(prev?: AgentTurnUsage, next?: AgentTurnUsage): AgentTurnUsage | undefined {
+  if (!next) return prev;
+  if (!prev) return next;
+  const prevCr = prev.cacheReadTokens ?? 0;
+  const nextCr = next.cacheReadTokens ?? 0;
+  const cumulative =
+    next.inputTokens >= prev.inputTokens &&
+    next.outputTokens >= prev.outputTokens &&
+    nextCr >= prevCr &&
+    (next.cacheWriteTokens ?? 0) >= (prev.cacheWriteTokens ?? 0);
+  if (cumulative) return next;
+  return addAgentTurnUsage(prev, next);
+}
+
+/** Team Usage aligned: CR / (CR + input w/o cache write). inputTokens is total prompt from AgentService. */
+export function promptCacheHitPercent(usage?: AgentTurnUsage): number | undefined {
+  if (!usage) return undefined;
+  const cr = usage.cacheReadTokens ?? 0;
+  const cw = usage.cacheWriteTokens ?? 0;
+  const totalIn = usage.inputTokens;
+  if (totalIn <= 0 && cr <= 0) return undefined;
+  const inwo = Math.max(0, totalIn - cr - cw);
+  const den = cr + inwo;
+  if (den <= 0) return cr > 0 ? 100 : 0;
+  return Math.min(100, Math.round((cr / den) * 10000) / 100);
+}
+
+/** Sum multiple billing rows (e.g. one agent round with several HTTP completions) without inflating hit rate. */
+export function aggregatePromptCacheHitPercent(usages: AgentTurnUsage[]): number | undefined {
+  if (!usages.length) return undefined;
+  let crSum = 0;
+  let inwoSum = 0;
+  for (const u of usages) {
+    const cr = u.cacheReadTokens ?? 0;
+    const cw = u.cacheWriteTokens ?? 0;
+    crSum += cr;
+    inwoSum += Math.max(0, u.inputTokens - cr - cw);
+  }
+  const den = crSum + inwoSum;
+  if (den <= 0) return undefined;
+  return Math.min(100, Math.round((crSum / den) * 10000) / 100);
+}
+
 export type ServerCase =
   | { kind: "textDelta"; text: string }
   | { kind: "thinkingDelta"; text: string }

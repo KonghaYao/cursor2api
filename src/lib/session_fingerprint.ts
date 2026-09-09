@@ -117,12 +117,33 @@ export async function computeSessionFp(
   return sha256Hex(payload);
 }
 
+function isToolResultUser(rec: Record<string, unknown>): boolean {
+  if (!Array.isArray(rec.content)) return false;
+  return rec.content.some(
+    (block) => block && typeof block === "object" && String((block as Record<string, unknown>).type || "") === "tool_result",
+  );
+}
+
 /**
- * AgentService thread identity (model / effort / flags / tools / system).
- * Does **not** hash the message prefix: AgentService only sends the latest
- * user turn and Cursor holds the rest in conversationState. Including the
- * pending transcript would mint a new conversationId on every user message
- * (and close the in-process agent) before the first tool call.
+ * First OpenAI/Anthropic user text. Follow-ups keep this prefix so AgentService
+ * conversationId stays put without a client `x-session-id`.
+ */
+export function firstUserCursorPrefix(rawMessages?: unknown[]): CursorMessage[] {
+  for (const msg of rawMessages || []) {
+    if (!msg || typeof msg !== "object") continue;
+    const rec = msg as Record<string, unknown>;
+    const role = String(rec.role || "").toLowerCase();
+    if (role !== "user") continue;
+    if (isToolResultUser(rec)) continue;
+    return [{ role: ROLE.user, text: flattenContent(rec.content) }];
+  }
+  return [];
+}
+
+/**
+ * AgentService thread identity: model / effort / flags / tools / system / first user.
+ * Does **not** hash later turns (Cursor keeps those in conversationState). Client
+ * `x-session-id` / `conversation_id` are ignored — this hash *is* the session id.
  */
 export async function computeAgentRunFp(
   body: Record<string, unknown>,
@@ -130,7 +151,7 @@ export async function computeAgentRunFp(
   opts: { rawMessages?: unknown[]; foldSystem?: string } = {},
 ): Promise<string> {
   return computeSessionFp(body, tools, {
-    pipelined: [],
+    pipelined: firstUserCursorPrefix(opts.rawMessages),
     rawMessages: opts.rawMessages,
     foldSystem: opts.foldSystem,
   });

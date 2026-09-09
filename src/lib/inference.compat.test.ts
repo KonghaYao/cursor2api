@@ -262,7 +262,7 @@ test("normalizeCursorUsage reads AgentService inputTokens/outputTokens", () => {
     prompt_tokens: 40,
     completion_tokens: 4,
     total_tokens: 44,
-    prompt_tokens_details: { cached_tokens: 30 },
+    prompt_tokens_details: { cached_tokens: 30, prompt_cache_hit_percent: 78.95 },
     cache_write_tokens: 2,
   });
 });
@@ -291,6 +291,7 @@ test("toAnthropicMessage exposes cache usage and maps errors", () => {
     output_tokens: 3,
     cache_creation_input_tokens: 5,
     cache_read_input_tokens: 12,
+    prompt_cache_hit_percent: 80,
   });
   assert.equal(message.stop_reason, "max_tokens");
   assert.equal(message.stop_sequence, null);
@@ -325,6 +326,7 @@ test("toAnthropicMessage clamps uncached input when Cursor cache buckets exceed 
     output_tokens: 1,
     cache_creation_input_tokens: 5,
     cache_read_input_tokens: 8,
+    prompt_cache_hit_percent: 100,
   });
 });
 

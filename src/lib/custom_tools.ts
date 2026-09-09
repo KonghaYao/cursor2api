@@ -253,6 +253,31 @@ export function extractClientToolResults(messages: unknown[]): ClientToolResult[
   return out;
 }
 
+function assistantHasToolCalls(message: unknown): boolean {
+  if (!message || typeof message !== "object") return false;
+  const rec = message as Record<string, unknown>;
+  if (String(rec.role || "").toLowerCase() !== "assistant") return false;
+  if (Array.isArray(rec.tool_calls) && rec.tool_calls.length) return true;
+  if (!Array.isArray(rec.content)) return false;
+  return rec.content.some((block) => {
+    if (!block || typeof block !== "object") return false;
+    return String((block as Record<string, unknown>).type || "") === "tool_use";
+  });
+}
+
+/**
+ * Clients (Cursor Agent) resend the full transcript every turn.
+ * Only the tool results after the latest assistant tool_calls / tool_use
+ * belong to the current park; older rounds already live in conversationState.
+ */
+export function extractLatestClientToolResults(messages: unknown[]): ClientToolResult[] {
+  let from = 0;
+  for (let i = 0; i < messages.length; i++) {
+    if (assistantHasToolCalls(messages[i])) from = i + 1;
+  }
+  return extractClientToolResults(messages.slice(from));
+}
+
 export function lastTurnIsToolResult(messages: unknown[]): boolean {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];

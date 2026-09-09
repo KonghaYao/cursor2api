@@ -11,8 +11,41 @@ import {
   mcpToolDefinitions,
   parseMcpArgs,
   parseServerMessage,
+  mergeAgentTurnUsage,
+  promptCacheHitPercent,
+  aggregatePromptCacheHitPercent,
 } from "./agent_json.ts";
 
+test("promptCacheHitPercent matches Team Usage CR/(CR+in_wo)", () => {
+  assert.equal(promptCacheHitPercent({ inputTokens: 3672, outputTokens: 91, cacheReadTokens: 3616 }), 98.47);
+  assert.equal(promptCacheHitPercent({ inputTokens: 1000, outputTokens: 1, cacheReadTokens: 0 }), 0);
+});
+
+test("aggregatePromptCacheHitPercent avoids cache_read/input_tokens session bug", () => {
+  const row = { inputTokens: 1600, outputTokens: 10, cacheReadTokens: 1200 };
+  const wrong = (1200 * 3) / (400 * 3);
+  assert.ok(wrong > 2.9, "naive sum(cr)/sum(in_wo) can exceed 100%");
+  assert.equal(aggregatePromptCacheHitPercent([row, row, row]), 75);
+});
+
+test("mergeAgentTurnUsage replaces cumulative snapshots", () => {
+  const a = { inputTokens: 40, outputTokens: 4, cacheReadTokens: 30 };
+  const b = { inputTokens: 40, outputTokens: 4, cacheReadTokens: 30 };
+  assert.deepEqual(mergeAgentTurnUsage(a, b), b);
+  assert.deepEqual(mergeAgentTurnUsage(a, b)?.cacheReadTokens, 30);
+});
+
+test("mergeAgentTurnUsage adds segment deltas", () => {
+  const a = { inputTokens: 100, outputTokens: 5, cacheReadTokens: 0 };
+  const b = { inputTokens: 50, outputTokens: 3, cacheReadTokens: 40 };
+  assert.deepEqual(mergeAgentTurnUsage(a, b), {
+    inputTokens: 150,
+    outputTokens: 8,
+    cacheReadTokens: 40,
+    cacheWriteTokens: undefined,
+    reasoningTokens: undefined,
+  });
+});
 test("gatewayAgentModelId strips trailing -fast and defaults composer-2.5", () => {
   assert.equal(gatewayAgentModelId("composer-2.5-fast"), "composer-2.5");
   assert.equal(gatewayAgentModelId("grok-4.6-high-fast"), "grok-4.6");

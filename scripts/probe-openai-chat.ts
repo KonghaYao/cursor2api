@@ -10,7 +10,8 @@
  * Inference (usage.cached_tokens):
  *   GATEWAY_UPSTREAM=inference bun src/node.ts
  *
- * Cloud Agents (Dashboard crsr_ keys; sticky x-session-id):
+ * Cloud Agents (Dashboard crsr_ keys). Session id is computed internally
+ * from model / tools / system / first user — do not send x-session-id.
  *   bun src/node.ts
  *
  *   CURSOR_API_KEY=crsr_… BASE=http://127.0.0.1:8789 \
@@ -72,7 +73,10 @@ function contentOf(json: ChatJson): string {
 function cacheStats(json: ChatJson) {
   const prompt = Number(json.usage?.prompt_tokens || 0);
   const cached = Number(json.usage?.prompt_tokens_details?.cached_tokens || 0);
-  const hit = prompt > 0 ? cached / prompt : 0;
+  const cacheWrite = Number((json.usage as { cache_write_tokens?: number } | undefined)?.cache_write_tokens || 0);
+  const inwo = Math.max(0, prompt - cached - cacheWrite);
+  const den = cached + inwo;
+  const hit = den > 0 ? cached / den : 0;
   return { prompt, cached, hit: Number(hit.toFixed(4)), model: json.model, id: json.id };
 }
 
@@ -207,7 +211,6 @@ async function main() {
         { role: "user", content: "hi" },
       ],
     },
-    { "x-session-id": `sys-${nonce}` },
   );
   const sysText = contentOf(systemTurn.json);
   record(results, {
@@ -226,7 +229,7 @@ async function main() {
     { role: "system", content: `${pad}\nYou are a cache probe. Keep replies to one short sentence.` },
     { role: "user", content: `Round 1 ${nonce}: reply with exactly CACHE_R1_${nonce}` },
   ];
-  const cacheHeaders = { "x-session-id": `cache-${nonce}` };
+  const cacheHeaders = {};
   console.log(">> cache turn 1");
   const cache1 = await chat(key, { model: MODEL, max_tokens: 64, messages: cacheMessages }, cacheHeaders);
   const a1 = contentOf(cache1.json);
@@ -259,8 +262,8 @@ async function main() {
       turn3: { ...s3, text: contentOf(cache3.json).slice(0, 80), ms: cache3.ms, status: cache3.status, err: cache3.err },
       warm_min: WARM_HIT_MIN,
       note: inference
-        ? "hit = cached_tokens / prompt_tokens; turn1 should be cold, later turns warm if conversationId is stable"
-        : "cloud path has no Inference cache usage; pass = same agent id reused across x-session-id turns",
+        ? "hit = cached / (cached + prompt_tokens - cached - cache_write); same as Team Usage CR/(CR+in_wo)"
+        : "session is internal agentRunFp; pass = follow-up keeps first user and reuses conversation_id",
     },
   });
   } else {
@@ -270,7 +273,7 @@ async function main() {
   const skipTools = process.env.PROBE_SKIP_TOOLS === "1";
   if (!skipTools) {
   const toolUser = `What is the weather in Tokyo? You MUST call get_weather. nonce=${nonce}`;
-  const toolHeaders = { "x-session-id": `tools-${nonce}` };
+  const toolHeaders = {};
   console.log(">> tool park");
   const tool1 = await chat(
     key,
@@ -346,7 +349,6 @@ async function main() {
       messages: [{ role: "user", content: `Weather in Osaka? MUST call get_weather. nonce=${nonce}` }],
       tools: [weatherTool],
     },
-    { "x-session-id": `stream-tools-${nonce}` },
   );
   const toolCallDeltas = stream.text.split("\n").filter((line) => line.includes('"tool_calls":['));
   record(results, {
@@ -384,7 +386,6 @@ async function main() {
         { role: "user", content: ask },
       ],
     },
-    { "x-session-id": `iso-a-${nonce}` },
   );
   console.log(">> isolation B");
   const isoB = await chat(
@@ -397,7 +398,6 @@ async function main() {
         { role: "user", content: ask },
       ],
     },
-    { "x-session-id": `iso-b-${nonce}` },
   );
   console.log(">> isolation C");
   const isoC = await chat(
@@ -407,7 +407,6 @@ async function main() {
       max_tokens: 64,
       messages: [{ role: "user", content: `${ask} (no system secret was given in this thread; say NONE)` }],
     },
-    { "x-session-id": `iso-c-${nonce}` },
   );
   const textA = contentOf(isoA.json);
   const textB = contentOf(isoB.json);

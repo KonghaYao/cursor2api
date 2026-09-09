@@ -6,7 +6,7 @@
 import { exchangeApiKey } from "./auth.ts";
 import { randomId } from "./bytes.ts";
 import {
-  addAgentTurnUsage,
+  mergeAgentTurnUsage,
   buildRunRequest,
   clientHeartbeatMessage,
   clientRunMessage,
@@ -212,11 +212,11 @@ async function runTurn(opts: {
         continue;
       }
       if (parsed.kind === "usage") {
-        usage = addAgentTurnUsage(usage, parsed.usage);
+        usage = mergeAgentTurnUsage(usage, parsed.usage);
         continue;
       }
       if (parsed.kind === "turnEnded") {
-        usage = addAgentTurnUsage(usage, parsed.usage);
+        usage = mergeAgentTurnUsage(usage, parsed.usage);
         break;
       }
       if (parsed.kind === "abort") {

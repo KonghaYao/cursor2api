@@ -18,6 +18,7 @@ import {
   userMessageFromParts,
   type MediaResolveOpts,
 } from "./content_parts.ts";
+import { promptCacheHitPercent } from "./agent_json.ts";
 
 export {
   ImageInputError,
@@ -1250,7 +1251,18 @@ export function toOpenAIUsage(u: ReturnType<typeof normalizeCursorUsage>) {
     completion_tokens: u.completionTokens ?? 0,
     total_tokens: u.totalTokens ?? 0,
   };
-  if (u.cacheReadTokens != null) out.prompt_tokens_details = { cached_tokens: u.cacheReadTokens };
+  const hit = promptCacheHitPercent({
+    inputTokens: u.promptTokens ?? 0,
+    outputTokens: u.completionTokens ?? 0,
+    cacheReadTokens: u.cacheReadTokens,
+    cacheWriteTokens: u.cacheWriteTokens,
+  });
+  if (u.cacheReadTokens != null || hit != null) {
+    out.prompt_tokens_details = {
+      ...(u.cacheReadTokens != null ? { cached_tokens: u.cacheReadTokens } : {}),
+      ...(hit != null ? { prompt_cache_hit_percent: hit } : {}),
+    };
+  }
   if (u.reasoningTokens != null) out.completion_tokens_details = { reasoning_tokens: u.reasoningTokens };
   if (u.cacheWriteTokens != null) out.cache_write_tokens = u.cacheWriteTokens;
   return out;
@@ -1338,6 +1350,12 @@ export function toAnthropicUsage(turn: { usage?: unknown; extendedUsage?: unknow
   const normalized = normalizeCursorUsage(turn);
   const cacheCreationInputTokens = normalized.cacheWriteTokens ?? 0;
   const cacheReadInputTokens = normalized.cacheReadTokens ?? 0;
+  const hit = promptCacheHitPercent({
+    inputTokens: normalized.promptTokens,
+    outputTokens: normalized.completionTokens,
+    cacheReadTokens: normalized.cacheReadTokens,
+    cacheWriteTokens: normalized.cacheWriteTokens,
+  });
   return {
     // Cursor/OpenAI promptTokens is the total prompt count. Anthropic reports
     // mutually exclusive uncached, cache-creation, and cache-read input buckets.
@@ -1345,6 +1363,7 @@ export function toAnthropicUsage(turn: { usage?: unknown; extendedUsage?: unknow
     output_tokens: normalized.completionTokens,
     cache_creation_input_tokens: cacheCreationInputTokens,
     cache_read_input_tokens: cacheReadInputTokens,
+    ...(hit != null ? { prompt_cache_hit_percent: hit } : {}),
   };
 }
 

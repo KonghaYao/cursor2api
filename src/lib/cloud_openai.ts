@@ -317,7 +317,7 @@ function rejectRandomSession(): Response | undefined {
   if (resolveSessionMode() !== "random") return undefined;
   return jsonResponse(400, {
     error: {
-      message: "customTools require a stable session id (x-session-id / conversation_id). SESSION_MODE=random cannot park execute() across turns.",
+      message: "SESSION_MODE=random cannot park customTools.execute across turns.",
       type: "invalid_request_error",
       code: "session_required_for_client_tools",
     },
@@ -348,7 +348,7 @@ export async function handleCloudMessages(
       400,
       toAnthropicError(
         {
-          message: "customTools require a stable session id (x-session-id / conversation_id). SESSION_MODE=random cannot park execute() across turns.",
+          message: "SESSION_MODE=random cannot park customTools.execute across turns.",
           type: "invalid_request_error",
         },
         requestId,
@@ -498,6 +498,6 @@ export function cloudHealthBody() {
     auth: "Authorization Bearer Cursor API key",
     tools: 'AgentService tools: ["mcp"] only — OpenAI/Anthropic function tools as customTools.execute (parked); no shell/edit/grep; not HTTP MCP; not InferenceService; not @cursor/sdk; not SDK/agent binaries; not Cloud Agents sandbox VM',
     models: "GET https://api.cursor.com/v1/models",
-    session: "stable x-session-id parks customTools.execute across turns",
+    session: "conversationId = tenant:agentRunFp (model/tools/system/first user); client x-session-id ignored",
   };
 }

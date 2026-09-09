@@ -52,6 +52,27 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 
 **不要**设 `AgentRunRequest.excludeWorkspaceContext = true`（`Workspace context exclusion is not allowed…`），也**不要**设 `customSystemPrompt`（会被当成 CLI `--system-prompt` 打回 `unknown option`）。无 workspace 靠 MCP allowlist + `mcpFileSystemOptions.enabled = false`。客户端 `system` **只在首轮**折进 user 文本（`<system>…</system>`）；跟进只送最新 user，上文靠 Cursor `conversationState`。不要把客户端 tools 挂成 HTTP MCP。
 
+### 客户端合约（常态）：全量 `messages` + 前缀稳定
+
+这是产品路径，不是边角。Cursor Agent（以及按 OpenAI/Anthropic 标准写的客户端）**每一枪都带完整 transcript**，并自己维持前缀：
+
+| 客户端保证 | 含义 |
+|------------|------|
+| **全量传递** | 每轮 `messages` = 从第一条 user 到当前的全部 user / assistant / `tool_calls` / `role: tool`（Anthropic 则是 `tool_use` / `tool_result`）。**不要**假设客户端只发 delta。 |
+| **前缀稳定** | 只 append。不改第一条 user、不改已出现的 assistant/tool 前缀、不改 `system` / tools catalog。改了 = 新对话（`agentRunFp` 变）。 |
+
+网关职责是 **从全量里抽出本轮 delta** 再打 AgentService（Cursor 上文在 `conversationState`）：
+
+| 本轮 | 送给 AgentService 的 `userMessageAction` |
+|------|------------------------------------------|
+| 首轮 | 工具政策 + `<system>` + 第一条 user |
+| 跟进 user | **只有**最新一条 user 文本（不要 system / 历史 / 工具政策） |
+| 同进程 `role: tool` | park resume，`execute()` 只匹配**最近一轮** tool id |
+| park_miss（有 KV/会话） | **只有**最近一轮 tool 结果；不要重发首条 user，也不要 dump 全部历史 tool |
+| park_miss（无会话） | 冷启动：首条 user + 全部 tool 结果 |
+
+`agentRunFp` 锚 **第一条 user** 成立，正是因为客户端保证这条前缀不变。单测多轮必须用**全量 transcript** 复现，不要用「只发最后一条」当产品场景。
+
 ### 运行时
 
 `AgentService/Run` 是 **双向 Connect 流**（exec 结果必须在同一条流上回去）。
@@ -63,7 +84,7 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 
 Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。不要为了半双工去装 `@cursor/sdk` 或走官方 `local.useHttp1ForAgent`（那是 SDK 的 RunSSE / HTTP/1.1 退路，带二进制）。
 
-`stream: true` 的 `tool_calls` 仍须 **一条完整 delta**（见 2026-08-31）。会话用稳定 `x-session-id` park `execute()`；`SESSION_MODE=random` 不行。
+`stream: true` 的 `tool_calls` 仍须 **一条完整 delta**（见 2026-08-31）。会话 id 由网关内部计算（`tenant:agentRunFp`），**不要**再靠客户端 `x-session-id`；`SESSION_MODE=random` 不行。
 
 客户端 `usage`：从 `interactionUpdate.turnEnded` 读 token 字段（proto JSON 的 `inputTokens` 等，uint64 可能是字符串），映射成 OpenAI `prompt_tokens` / `cached_tokens` 与 Anthropic `input_tokens` / `cache_read_input_tokens`。同一 `send()` 内多段 turnEnded 相加。park 成 `tool_calls` 时 turn 还没结束，那一枪 usage 为 0。不要为了 usage 去调 Cloud `getUsage` 或装 SDK。
 
@@ -71,7 +92,7 @@ Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。不要为了半
 
 Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里的 legacy abort）。**不要**把这个 signal 接到 AgentService 双工或 `settleCustomTools` 上，否则第一枪 `tool_calls` 返回后 park 被掐掉，第二枪 `role: tool` 会 409。`deno.json` 开 `--unstable-no-legacy-abort`。若 isolate / 流已经没了，跟进改为把 tool results 写成新 user prompt，而不是 409。
 
-**会话 id（Deno isolate / serverless）：** `conversationId` = `tenant:sha256(clientSessionId ⟂ agentRunFp)`。`agentRunFp` = model / effort / flags / tools / system（**不含** messages 前缀；AgentService 只送最新 user，上文在 Cursor `conversationState`）。`liveTurns` 只 park `execute()`（键 `tenant:sessionId:fp`）。KV `agent-run:${tenant}:${sessionId}` 只存 `{fp, conversationId, agentSessionId, conversationState?}`，TTL 24h，checkpoint 超 `AGENT_RUN_STATE_MAX_BYTES`（24KiB）则丢掉 state 只留 ids。**不要**把 messages / canon 写进 KV。换 isolate 后 `role: tool` 仍走 park_miss flatten。
+**会话 id（Deno isolate / serverless）：** `conversationId` = `tenant:agentRunFp`。`agentRunFp` = model / effort / flags / tools / system / **第一条 user**（不含后续轮次；AgentService 只送最新 user，上文在 Cursor `conversationState`）。客户端 `x-session-id` / `conversation_id` **忽略**。`liveTurns` 只 park `execute()`（键 `tenant:fp`）。KV `agent-run:${tenant}:${fp}` 只存 `{fp, conversationId, agentSessionId, conversationState?}`，TTL 24h，checkpoint 超 `AGENT_RUN_STATE_MAX_BYTES`（24KiB）则丢掉 state 只留 ids。**不要**把 messages / canon 写进 KV。换 isolate 后 `role: tool` 仍走 park_miss flatten。
 
 ### 不要做的
 
@@ -86,11 +107,13 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 - 设 `excludeWorkspaceContext = true`（Dashboard `crsr_` 会 invalid_argument）
 - 设 `customSystemPrompt`（上游当成 `--system-prompt` 拒掉）
 - 只把最后一条 user 丢给 AgentService（OpenAI `system` 必须折进 user 文本）
-- 跟进轮次再把 system / 整段 history 叠进 `userMessageAction`（Cursor `conversationState` 里已经有上文，会打坏 cache）
+- 把「客户端只发增量 messages」当成产品场景。常态是 **每轮全量 + 前缀稳定**；网关从全量抽 delta，禁止把整段 history 再叠进 `userMessageAction`
+- 跟进轮次再把 system / 整段 history / 历史 tool results 叠进 `userMessageAction`（Cursor `conversationState` 里已经有上文，会打坏 cache）。park_miss 只送**最近一轮** tool 结果；没有 live/KV 的冷启动才把全部 tool 结果和首条 user 折进去。
 - 把 HTTP `request.signal` 绑到 parked AgentService/Run 上（Deno.serve 成功响应会 abort，第二枪 `role: tool` 变 409）
 - 给 AgentService 只送 `modelId: composer-2.5` 而不带 `parameters.fast=false`（上游默认 Fast，Team Usage 记成 `composer-2.5-fast`）
 - 给 AgentService 的 Grok 只剥 `-fast`、不传 `parameters.effort`（思考强度会掉回上游默认，而不是客户端的 `reasoning_effort` / id 里的 `low|medium|high|xhigh`）
-- 给 AgentService 每轮 `randomId()` 当 conversationId（isolate 一跳就丢 cache；用 `tenant:sha256(sessionId ⟂ agentRunFp)`，fp **不要**混进 pending transcript）
+- 给 AgentService 每轮 `randomId()` 当 conversationId（isolate 一跳就丢 cache；用 `tenant:agentRunFp`，fp **不要**混进整段 pending transcript，只锚第一条 user）
+- 再用客户端 `x-session-id` / `conversation_id` 当会话键（已废弃；session 完全内部计算）
 - 把 messages / canon / 整段 transcript 写进 `agent-run:` KV（只允许 ids + 可选小 checkpoint）
 
 ---
@@ -328,7 +351,7 @@ python3 scripts/analyze_team_usage.py team-usage-events-*.csv -o reports/usage-<
 | 证据 | 本机探针 Stream 信封 `ERROR_NOT_LOGGED_IN`；同 key `GET https://api.cursor.com/v1/models` 200；`AgentService/Run` 可聊 |
 | 根因结论 | **Cursor 上游**：Inference 这条 RPC 对 Dashboard API key 不再当已登录会话。不是网关把 model id / session_fp 弄丢。 |
 | 状态 | **mitigated**：聊天改 `agent.v1.AgentService/Run` + 进程内 customTools（`684da64` / `454122d`）。Inference 仍死，禁止加回。 |
-| 续记 | 2026-09-09：实机 Deno `8789` OpenAI probe 7/7、Anthropic `system`、`grok-4.6-fast` PONG。上游另拒 `excludeWorkspaceContext` 与 `customSystemPrompt`（`--system-prompt`）。AgentService `conversationId` = `tenant:sha256(x-session-id ⟂ agentRunFp)`（env fp，不含 messages 前缀），KV `agent-run:` 只绑 ids（可带小 checkpoint）；`execute()` park 仍必须同 isolate。Team Usage Cache Read 尚未用 CSV 验证。 |
+| 续记 | 2026-09-09：实机 Deno `8789` OpenAI probe 7/7、Anthropic `system`、`grok-4.6-fast` PONG。上游另拒 `excludeWorkspaceContext` 与 `customSystemPrompt`（`--system-prompt`）。同日稍后：废弃客户端 `x-session-id`，`conversationId` = `tenant:agentRunFp`（model/tools/system/第一条 user）；KV `agent-run:` 按 fp 绑 ids。`execute()` park 仍必须同 isolate。Team Usage Cache Read 尚未用 CSV 验证。 |
 
 ### 成本归因（简表）
 

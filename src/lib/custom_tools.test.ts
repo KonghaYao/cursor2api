@@ -6,6 +6,7 @@ import {
   clientToolsToOpenAi,
   customToolsClearForTests,
   extractClientToolResults,
+  extractLatestClientToolResults,
   lastTurnIsToolResult,
   sanitizeCustomToolName,
   openaiToolsToCustom,
@@ -18,6 +19,7 @@ import {
 import {
   SDK_CUSTOM_ONLY_BUILTIN_TOOLS,
   composeCustomToolPrompt,
+  composeCustomToolTurnPrompt,
   sdkLocalAgentCreateOptions,
   systemPromptFromClient,
 } from "./custom_tool_chat.ts";
@@ -72,6 +74,35 @@ test("lastTurnIsToolResult and extractClientToolResults", () => {
   assert.deepEqual(
     rows.map((r) => r.id),
     ["call_1", "call_2"],
+  );
+});
+
+test("extractLatestClientToolResults keeps only the last assistant tool round", () => {
+  const full = [
+    { role: "user", content: "weather in tokyo?" },
+    { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "call_1", content: '{"temp":22}' },
+    { role: "assistant", content: null, tool_calls: [{ id: "call_2", type: "function", function: { name: "lookup", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "call_2", content: '{"humidity":40}' },
+  ];
+  assert.deepEqual(
+    extractLatestClientToolResults(full).map((r) => r.id),
+    ["call_2"],
+  );
+  assert.deepEqual(
+    extractClientToolResults(full).map((r) => r.id),
+    ["call_1", "call_2"],
+  );
+  const anthropic = [
+    { role: "user", content: "q" },
+    { role: "assistant", content: [{ type: "tool_use", id: "u1", name: "lookup", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "u1", content: "old" }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "u2", name: "lookup", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "u2", content: "new" }] },
+  ];
+  assert.deepEqual(
+    extractLatestClientToolResults(anthropic).map((r) => ({ id: r.id, content: r.content })),
+    [{ id: "u2", content: "new" }],
   );
 });
 
@@ -132,6 +163,59 @@ test("system and Anthropic body.system are folded into the user prompt", () => {
   assert.equal(follow, "second");
   assert.equal(follow.includes("secret ALPHA"), false);
   assert.equal(follow.includes("first"), false);
+  const followWithTools = composeCustomToolPrompt({
+    body: { messages: [{ role: "user", content: "second" }] },
+    tools: openaiToolsToCustom([{ type: "function", function: { name: "lookup" } }]),
+    messages: [
+      { role: "user", content: "first" },
+      { role: "assistant", content: "ok" },
+      { role: "user", content: "second" },
+    ],
+    followUp: true,
+  });
+  assert.equal(followWithTools, "second");
+});
+
+test("composeCustomToolTurnPrompt does not reship full tool history on a warm thread", () => {
+  const tools = openaiToolsToCustom([{ type: "function", function: { name: "lookup" } }]);
+  const messages = [
+    { role: "system", content: "be brief" },
+    { role: "user", content: "weather in tokyo?" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } }],
+    },
+    { role: "tool", tool_call_id: "call_1", content: '{"temp":22}' },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "call_2", type: "function", function: { name: "lookup", arguments: "{}" } }],
+    },
+    { role: "tool", tool_call_id: "call_2", content: '{"humidity":40}' },
+  ];
+  const body = { model: "composer-2.5", messages };
+  const warm = composeCustomToolTurnPrompt({ body, tools, messages, hadPriorTurn: true });
+  assert.match(warm, /call_2/);
+  assert.match(warm, /humidity/);
+  assert.doesNotMatch(warm, /call_1/);
+  assert.doesNotMatch(warm, /weather in tokyo/);
+  assert.doesNotMatch(warm, /<system>/);
+  assert.doesNotMatch(warm, /You may call these custom tools/);
+
+  const cold = composeCustomToolTurnPrompt({ body, tools, messages, hadPriorTurn: false });
+  assert.match(cold, /call_1/);
+  assert.match(cold, /call_2/);
+  assert.match(cold, /weather in tokyo/);
+  assert.match(cold, /<system>/);
+
+  const nextUser = composeCustomToolTurnPrompt({
+    body,
+    tools,
+    messages: [...messages, { role: "assistant", content: "22c 40%" }, { role: "user", content: "and osaka?" }],
+    hadPriorTurn: true,
+  });
+  assert.equal(nextUser, "and osaka?");
 });
 
 test("composeToolResultPrompt lists client tool output", () => {

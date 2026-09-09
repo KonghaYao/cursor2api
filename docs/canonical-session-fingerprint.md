@@ -69,3 +69,23 @@ session_mode=fingerprint session_fp=… canon_len=N
 ```
 
 `crsr_…` 换票可走进程 L1 + KV L2；**客户端 JWT 不存储**。`SESSION_MODE=random` 不算 fp。
+
+---
+
+## AgentService 聊天路径
+
+产品聊天不走 Inference。会话 id **完全内部计算**，忽略客户端 `x-session-id` / `conversation_id`。
+
+**客户端合约（常态）：** 每轮 POST 都带 **全量** `messages`；客户端维持前缀稳定（只 append，不改第一条 user / 已有 assistant-tool 前缀 / system / tools）。网关从全量里抽出本轮 delta，**不要**把整段再送给 AgentService。
+
+```
+agentRunFp = SHA256_hex( join(RS, [
+  modelId, effort, flags, catalog, system, serialize([{ role: user, text: firstUser }])
+]) )
+
+conversationId = tenant + ":" + agentRunFp
+```
+
+`firstUser` = messages 里第一条 `role=user`（跳过 `tool_result`）。这条锚能跨轮不变，是因为客户端保证前缀稳定，不是因为网关存了 transcript。park `execute()` 和跟进不必带客户端 session header，但跟进必须仍带上**同一条第一条 user**（完整 history）。
+
+换 model / tools / system / 第一条 user → 新 thread。

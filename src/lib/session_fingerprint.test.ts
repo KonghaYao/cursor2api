@@ -135,3 +135,19 @@ test("agent-run fp stays put when user text grows and moves on model/tools/syste
   assert.notEqual(env1, otherTools);
   assert.notEqual(env1, otherSystem);
 });
+
+test("agent-run fp splits on first user and ignores client session fields", async () => {
+  const a = await computeAgentRunFp(
+    { model: "composer-2.5-fast", conversation_id: "sess-a" },
+    tools,
+    { rawMessages: [{ role: "user", content: "alpha" }] },
+  );
+  const b = await computeAgentRunFp(
+    { model: "composer-2.5-fast", conversation_id: "sess-b" },
+    tools,
+    { rawMessages: [{ role: "user", content: "alpha" }] },
+  );
+  const c = await computeAgentRunFp(body, tools, { rawMessages: [{ role: "user", content: "beta" }] });
+  assert.equal(a, b);
+  assert.notEqual(a, c);
+});

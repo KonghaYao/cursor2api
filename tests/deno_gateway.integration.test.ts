@@ -670,7 +670,6 @@ Deno.test("cloud OpenAI tools park customTools.execute and resume with client re
         headers: {
           authorization: "Bearer crsr_test",
           "content-type": "application/json",
-          "x-session-id": "sess-tools",
         },
         body: JSON.stringify({
           model: "composer-2.5",
@@ -698,7 +697,6 @@ Deno.test("cloud OpenAI tools park customTools.execute and resume with client re
         headers: {
           authorization: "Bearer crsr_test",
           "content-type": "application/json",
-          "x-session-id": "sess-tools",
         },
         body: JSON.stringify({
           model: "composer-2.5",
@@ -739,7 +737,6 @@ Deno.test("cloud tool results continue when the parked execute() is gone", async
         headers: {
           authorization: "Bearer crsr_test",
           "content-type": "application/json",
-          "x-session-id": "sess-park-miss",
         },
         body: JSON.stringify({
           model: "composer-2.5",
@@ -760,7 +757,6 @@ Deno.test("cloud tool results continue when the parked execute() is gone", async
         headers: {
           authorization: "Bearer crsr_test",
           "content-type": "application/json",
-          "x-session-id": "sess-park-miss",
         },
         body: JSON.stringify({
           model: "composer-2.5",
@@ -800,7 +796,6 @@ Deno.test("cloud stream=true emits complete tool_calls in one delta", async () =
         headers: {
           authorization: "Bearer crsr_test",
           "content-type": "application/json",
-          "x-session-id": "sess-stream-tools",
         },
         body: JSON.stringify({
           model: "composer-2.5",
@@ -835,21 +830,20 @@ Deno.test("cloud chat always uses customTools, never Cloud REST agents", async (
     urls.push(`${init?.method || "GET"} ${String(input)}`);
     return original(input, init);
   };
-  const chat = (session: string, text: string) =>
+  const chat = (messages: unknown[]) =>
     handleGatewayRequest(
       new Request("http://127.0.0.1/v1/chat/completions", {
         method: "POST",
         headers: {
           authorization: "Bearer crsr_test",
           "content-type": "application/json",
-          "x-session-id": session,
         },
-        body: JSON.stringify({ model: "composer-2.5", messages: [{ role: "user", content: text }] }),
+        body: JSON.stringify({ model: "composer-2.5", messages }),
       }),
       { kv, upstream: "cloud" },
     );
   try {
-    const first = await chat("sess-1", "hello");
+    const first = await chat([{ role: "user", content: "hello" }]);
     if (first.status !== 200) throw new Error(`first ${first.status}: ${await first.text()}`);
     const firstBody = await first.json();
     if (!String(firstBody?.choices?.[0]?.message?.content || "").includes("no-tools")) {
@@ -858,9 +852,13 @@ Deno.test("cloud chat always uses customTools, never Cloud REST agents", async (
     if (firstBody?.usage?.prompt_tokens !== 40 || firstBody?.usage?.completion_tokens !== 4) {
       throw new Error(`expected usage on no-tools chat, got ${JSON.stringify(firstBody.usage)}`);
     }
-    const second = await chat("sess-1", "again");
+    const second = await chat([
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "no-tools" },
+      { role: "user", content: "again" },
+    ]);
     if (second.status !== 200) throw new Error(`second ${second.status}: ${await second.text()}`);
-    const switched = await chat("sess-2", "new thread");
+    const switched = await chat([{ role: "user", content: "new thread" }]);
     if (switched.status !== 200) throw new Error(`switch ${switched.status}: ${await switched.text()}`);
     if (created.length !== 2) throw new Error(`expected 2 SDK agents, got ${created.join(",")}`);
     if (urls.some((u) => u.includes("api.cursor.com/v1/agents"))) {

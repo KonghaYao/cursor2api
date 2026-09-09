@@ -7,9 +7,16 @@
  * Built-in agent tools stay off except the `mcp` capability group, which is
  * required for customTools to be offered. An empty allowlist also kills MCP.
  *
- * Conversation id is `tenant:sha256(x-session-id ⟂ agentRunFp)` and can be
- * restored from KV (`agent-run:`) after a Deno isolate hop. `liveTurns` only
- * parks in-process `execute()`; it is not a serverless session store.
+ * Conversation id is `tenant:agentRunFp` (model / effort / tools / system /
+ * first user). Client `x-session-id` / `conversation_id` are ignored. KV
+ * `agent-run:` can restore the same ids after a Deno isolate hop. `liveTurns`
+ * only parks in-process `execute()`; it is not a serverless session store.
+ *
+ * Client contract (the normal path, not an edge case): every request carries
+ * the full OpenAI/Anthropic transcript, and the client keeps that prefix
+ * stable (append-only). The gateway must slice the delta off that full list
+ * — never assume the client sent only the latest turn, and never reship the
+ * whole history into AgentService `userMessageAction`.
  */
 import { encodeSseData, encodeSseEvent, jsonResponse, sseStreamResponse } from "./bytes.ts";
 import { CloudChatError } from "./cloud_errors.ts";
@@ -26,7 +33,6 @@ import {
   toOpenAIUsage,
   normalizeCursorUsage,
 } from "./inference.ts";
-import { resolveSessionKvId } from "./cloud_session.ts";
 import { kvGetAgentRun, kvSetAgentRun, type Kv } from "./kv.ts";
 import { agentRunIds, resolveSessionMode } from "./session.ts";
 import { computeAgentRunFp } from "./session_fingerprint.ts";
@@ -35,6 +41,7 @@ import {
   clientToolsToOpenAi,
   composeToolResultPrompt,
   extractClientToolResults,
+  extractLatestClientToolResults,
   failParkedClientTools,
   lastTurnIsToolResult,
   offerClientToolBatch,
@@ -47,7 +54,7 @@ import {
   type CustomToolDef,
   type ParkedClientTool,
 } from "./custom_tools.ts";
-import { gatewayAgentModelSelection, type AgentInlineImage, type AgentTurnUsage } from "./agent_json.ts";
+import { gatewayAgentModelSelection, promptCacheHitPercent, type AgentInlineImage, type AgentTurnUsage } from "./agent_json.ts";
 import { openaiContentToCursorParts } from "./content_parts.ts";
 import { defaultSdkAgentHost } from "./sdk_agent_host.ts";
 
@@ -187,15 +194,49 @@ export function composeCustomToolPrompt(opts: {
   messages: unknown[];
   followUp?: boolean;
 }): string {
-  const policy = toolPolicyPrompt(opts.body, opts.tools);
   const user = lastUserPrompt(opts.messages);
-  // Follow-ups: Cursor already has system + prior turns in conversationState.
-  // Re-folding system into every userMessageAction looks like a huge new prompt
-  // and fights prompt cache. Only the latest user text is the delta.
-  if (opts.followUp) return [policy, user].filter(Boolean).join("\n\n");
+  // Follow-ups: Cursor already has system, tool policy, and prior turns in
+  // conversationState. Re-folding any of that into every userMessageAction
+  // looks like a huge new prompt and fights prompt cache.
+  if (opts.followUp) return user;
+  const policy = toolPolicyPrompt(opts.body, opts.tools);
   const system = systemPromptFromClient(opts.body);
   const wrapped = system ? `<system>\n${system}\n</system>` : "";
   return [policy, wrapped, user].filter(Boolean).join("\n\n");
+}
+
+/**
+ * Prompt for one AgentService userMessageAction.
+ * Clients send the full OpenAI/Anthropic transcript every time; only the
+ * delta belongs on the wire. Older tool rounds stay in conversationState.
+ */
+export function composeCustomToolTurnPrompt(opts: {
+  body: Record<string, unknown>;
+  tools: CustomToolDef[];
+  messages: unknown[];
+  hadPriorTurn: boolean;
+}): string {
+  const latest = extractLatestClientToolResults(opts.messages);
+  const toolFollowUp = lastTurnIsToolResult(opts.messages) && latest.length > 0;
+  if (!toolFollowUp) {
+    return composeCustomToolPrompt({
+      body: opts.body,
+      tools: opts.tools,
+      messages: opts.messages,
+      followUp: opts.hadPriorTurn,
+    });
+  }
+  // Cold start (no live agent, no KV): Cursor has no conversationState, so
+  // fold system + the original user question and every tool result we have.
+  // Warm thread: only the latest round — reshipping history is a cache miss.
+  const results = composeToolResultPrompt(opts.hadPriorTurn ? latest : extractClientToolResults(opts.messages));
+  if (opts.hadPriorTurn) return results;
+  return [composeCustomToolPrompt({
+    body: opts.body,
+    tools: opts.tools,
+    messages: opts.messages,
+    followUp: false,
+  }), results].filter(Boolean).join("\n\n");
 }
 
 export type CustomToolTurnResult = { text: string; thinking?: string; error?: string; usage?: AgentTurnUsage };
@@ -249,17 +290,8 @@ export function customToolChatClearForTests(): void {
   liveTurns.clear();
 }
 
-function liveKey(tenant: string, sessionId: string, sessionFp: string): string {
-  return `${tenant}:${sessionId}:${sessionFp}`;
-}
-
-function closeStaleLiveTurns(tenant: string, sessionId: string, keepKey: string): void {
-  const prefix = `${tenant}:${sessionId}:`;
-  for (const [key, live] of [...liveTurns.entries()]) {
-    if (!key.startsWith(prefix) || key === keepKey) continue;
-    void live.agent.close();
-    liveTurns.delete(key);
-  }
+function liveKey(tenant: string, sessionFp: string): string {
+  return `${tenant}:${sessionFp}`;
 }
 
 /** Anthropic `thinking.budget_tokens` → fingerprint `reasoning_effort` (same bands as /v1/messages). */
@@ -282,13 +314,14 @@ async function sessionFpForCustomTools(
   body: Record<string, unknown>,
   protocol: "openai" | "anthropic",
 ): Promise<string> {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
   if (protocol === "anthropic") {
     foldAnthropicReasoningEffort(body);
     return computeAgentRunFp(body, anthropicToolsToCursor(body.tools), {
       foldSystem: flattenContent(body.system),
+      rawMessages: messages,
     });
   }
-  const messages = Array.isArray(body.messages) ? body.messages : [];
   return computeAgentRunFp(body, openaiToolsToCursor(body.tools), { rawMessages: messages });
 }
 
@@ -358,25 +391,22 @@ async function settleCustomTools(
 async function startCustomToolTurn(opts: {
   apiKey: string;
   body: Record<string, unknown>;
-  headers: Headers;
   tools: CustomToolDef[];
   signal?: AbortSignal;
   kv?: Kv;
   protocol?: "openai" | "anthropic";
 }): Promise<{ live: LiveTurn; session: ClientToolSession; sessionId: string; continued: boolean }> {
   const tenant = await credentialFingerprint(opts.apiKey);
-  const resolved = await resolveSessionKvId(opts.body, opts.headers);
-  if ("ephemeral" in resolved || resolveSessionMode() === "random") {
-    throw new CloudChatError("Client custom tools require a stable x-session-id / conversation_id (not SESSION_MODE=random).", 400);
+  if (resolveSessionMode() === "random") {
+    throw new CloudChatError("SESSION_MODE=random cannot park customTools.execute across turns.", 400);
   }
-  const sessionId = resolved.sessionId;
   const protocol = opts.protocol ?? "openai";
   const sessionFp = await sessionFpForCustomTools(opts.body, protocol);
-  const session = upsertClientToolSession(tenant, sessionId, opts.tools);
+  const computedIds = agentRunIds(tenant, sessionFp);
+  const session = upsertClientToolSession(tenant, sessionFp, opts.tools);
   const messages = Array.isArray(opts.body.messages) ? opts.body.messages : [];
-  const toolResults = extractClientToolResults(messages);
-  const key = liveKey(tenant, sessionId, sessionFp);
-  closeStaleLiveTurns(tenant, sessionId, key);
+  const toolResults = extractLatestClientToolResults(messages);
+  const key = liveKey(tenant, sessionFp);
   const existing = liveTurns.get(key);
   const canResumePark =
     Boolean(existing) &&
@@ -386,20 +416,21 @@ async function startCustomToolTurn(opts: {
   if (lastTurnIsToolResult(messages) && toolResults.length && canResumePark) {
     const n = resolveClientToolResults(session, toolResults);
     if (!n) throw new CloudChatError("tool results did not match a parked custom tool call", 400);
-    console.log(`  custom_tools resume session=${sessionId.slice(0, 24)} agent=${existing!.agent.agentId.slice(0, 14)}`);
-    return { live: existing!, session, sessionId, continued: true };
+    console.log(`  custom_tools resume session=${computedIds.conversationId.slice(0, 24)} agent=${existing!.agent.agentId.slice(0, 14)}`);
+    return { live: existing!, session, sessionId: computedIds.conversationId, continued: true };
   }
 
   if (session.parked.length) failParkedClientTools(session, "cancelled: new user turn");
 
-  const binding = opts.kv ? await kvGetAgentRun(opts.kv, tenant, sessionId, sessionFp) : null;
+  const binding = opts.kv ? await kvGetAgentRun(opts.kv, tenant, sessionFp, sessionFp) : null;
   const ids = binding
     ? { conversationId: binding.conversationId, agentSessionId: binding.agentSessionId }
-    : await agentRunIds(tenant, sessionId, sessionFp);
+    : computedIds;
+  const sessionId = ids.conversationId;
   const checkpoint: { state?: Record<string, unknown> } = { state: binding?.conversationState };
   const persistBinding = async (state?: Record<string, unknown>) => {
     if (!opts.kv) return;
-    await kvSetAgentRun(opts.kv, tenant, sessionId, {
+    await kvSetAgentRun(opts.kv, tenant, sessionFp, {
       fp: sessionFp,
       conversationId: ids.conversationId,
       agentSessionId: ids.agentSessionId,
@@ -430,26 +461,12 @@ async function startCustomToolTurn(opts: {
       `  custom_tools park_miss session=${sessionId.slice(0, 24)} existing=${Boolean(existing)} kv=${Boolean(binding)} done=${Boolean(existing?.done)} — continuing as follow-up prompt`,
     );
   }
-  const prompt = toolFollowUp
-    ? [
-        existing
-          ? [toolPolicyPrompt(opts.body, opts.tools), lastUserPrompt(messages)].filter(Boolean).join("\n\n")
-          : composeCustomToolPrompt({
-              body: opts.body,
-              tools: opts.tools,
-              messages,
-              followUp: hadPriorTurn,
-            }),
-        composeToolResultPrompt(toolResults),
-      ]
-        .filter(Boolean)
-        .join("\n\n")
-    : composeCustomToolPrompt({
-        body: opts.body,
-        tools: opts.tools,
-        messages,
-        followUp: hadPriorTurn,
-      });
+  const prompt = composeCustomToolTurnPrompt({
+    body: opts.body,
+    tools: opts.tools,
+    messages,
+    hadPriorTurn,
+  });
   const images = toolFollowUp ? [] : await lastUserAgentImages(messages);
   if (!existing) await persistBinding(checkpoint.state);
   const run = await agent.send(prompt, images.length ? { images } : undefined);
@@ -505,8 +522,10 @@ function anthropicUsageFromAgent(usage?: AgentTurnUsage) {
 
 function logAgentUsage(usage?: AgentTurnUsage) {
   if (!usage) return;
+  const hit = promptCacheHitPercent(usage);
+  const hitPart = hit == null ? "" : ` hit=${hit}%`;
   console.log(
-    `  custom_tools usage in=${usage.inputTokens} out=${usage.outputTokens} cache_read=${usage.cacheReadTokens ?? 0} cache_write=${usage.cacheWriteTokens ?? 0}`,
+    `  custom_tools usage in=${usage.inputTokens} out=${usage.outputTokens} cache_read=${usage.cacheReadTokens ?? 0} cache_write=${usage.cacheWriteTokens ?? 0}${hitPart}`,
   );
 }
 
@@ -563,7 +582,6 @@ export async function handleCustomToolChatCompletions(opts: {
   const started = await startCustomToolTurn({
     apiKey,
     body: opts.body,
-    headers: opts.headers,
     tools: opts.tools,
     signal: opts.signal,
     kv: opts.kv,
@@ -619,7 +637,6 @@ export async function handleCustomToolMessages(opts: {
   const started = await startCustomToolTurn({
     apiKey,
     body: opts.body,
-    headers: opts.headers,
     tools: opts.tools,
     signal: opts.signal,
     kv: opts.kv,

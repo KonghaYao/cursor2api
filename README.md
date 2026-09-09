@@ -26,7 +26,7 @@ model   = composer-2.5
 
 请求里带 `Authorization: Bearer …` 或 `x-api-key` 都行。不要把换好的 JWT 写进配置。
 
-如果要用工具调用（function tools），每次请求带上同一个 `x-session-id`（或 `conversation_id`）。网关不会替你跑工具：模型给出 `tool_calls` 后，你在本地执行，再把结果用 `role: tool` 发回来。
+网关自己根据模型 / 工具 / 系统提示 / **第一条 user** 计算会话，不必传 `x-session-id`。网关不会替你跑工具：模型给出 `tool_calls` 后，你在本地执行，再把结果用 `role: tool` 发回来。每一枪都请带上**完整** `messages`（从第一条 user 起只往后追加、不要改前面的内容）；网关会从这份全量记录里取出本轮要发给模型的部分。
 
 ```bash
 curl -sS https://cursor2api.freetavily.deno.net/v1/chat/completions \
@@ -45,8 +45,8 @@ curl -sS https://cursor2api.freetavily.deno.net/v1/chat/completions \
 | 流式 `stream: true` | 可用，但不逐字推 | 能收到 SSE；正文往往等这一轮结束后一次性出来。工具调用仍是一整块，不会拆碎 |
 | 工具调用 | 可用 | 和 OpenAI / Anthropic 一样：先拿到 `tool_calls` / `tool_use`，本地执行后再回传结果 |
 | `system` 提示 | 可用 | 同一会话里，系统提示只在第一轮生效 |
-| 上下文缓存 | 部分可用 | 同一 `x-session-id`（或 `conversation_id`）且模型 / 工具 / 系统提示不变时，多轮会复用 Cursor 会话。Deno Deploy 用 KV 只记会话 id（不存聊天正文），换实例也能续上。工具执行（`tool_calls` 到回传 `role: tool`）必须在**同一进程**里完成；换实例后会把工具结果折进新的 user 消息继续 |
-| `usage` 用量 | 可用 | 响应里有 token 数。OpenAI 看 `prompt_tokens`、`completion_tokens`、`prompt_tokens_details.cached_tokens`；Anthropic 看 `input_tokens`、`output_tokens`、`cache_read_input_tokens`。模型正在等你跑工具时，这一枪的 usage 经常是 0，最终回复那一枪才带上整轮 |
+| 上下文缓存 | 部分可用 | 同一条对话（第一条 user + 模型 / 工具 / 系统提示不变）会复用 Cursor 会话。不必传 `x-session-id`。Deno Deploy 用 KV 只记会话 id（不存聊天正文），换实例也能续上。工具执行（`tool_calls` 到回传 `role: tool`）必须在**同一进程**里完成；换实例后会把工具结果折进新的 user 消息继续 |
+| `usage` 用量 | 可用 | 响应里有 token 数。OpenAI 看 `prompt_tokens`、`completion_tokens`、`prompt_tokens_details.cached_tokens`；Anthropic 看 `input_tokens`、`output_tokens`、`cache_read_input_tokens`。模型正在等你跑工具时，这一枪的 usage 经常是 0，最终回复那一枪才带上整轮。**缓存命中率**请用 `CR/(CR+未命中 input)`（与 Team Usage 一致）；不要用 `cache_read_input_tokens / input_tokens`（Anthropic 的 `input_tokens` 只是未缓存部分，会算成 300%+）。多枪 usage 汇总用 `aggregatePromptCacheHitPercent`（`agent_json.ts`） |
 | Fast 档 | 可用 | 模型名带 `-fast`，或请求体写 `"fast": true`。`composer-2.5`、`grok-4.6` 默认是标准档，不是 Fast |
 | 思考强度 effort | 可用（仅 Grok） | 用 `reasoning_effort`（`low` / `medium` / `high` / `max`）。不写则按 `high`。Composer 没有这个档位 |
 | Composer Max | 不可用 | 请求里的 `max` / `max_mode` 目前不会生效 |
