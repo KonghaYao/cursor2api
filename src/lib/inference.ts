@@ -1198,8 +1198,24 @@ export function normalizeCursorUsage(turn: { usage?: unknown; extendedUsage?: un
   const usage = (turn?.usage || {}) as Record<string, unknown>;
   const ext = (turn?.extendedUsage || {}) as Record<string, unknown>;
   const meta = metadataBag(turn?.providerMetadata);
-  const promptTokens = pickNum(usage.promptTokens, usage.prompt_tokens, ext.inputTokens, ext.input_tokens) ?? 0;
-  const completionTokens = pickNum(usage.completionTokens, usage.completion_tokens, ext.outputTokens, ext.output_tokens) ?? 0;
+  const promptTokens =
+    pickNum(
+      usage.promptTokens,
+      usage.prompt_tokens,
+      usage.inputTokens,
+      usage.input_tokens,
+      ext.inputTokens,
+      ext.input_tokens,
+    ) ?? 0;
+  const completionTokens =
+    pickNum(
+      usage.completionTokens,
+      usage.completion_tokens,
+      usage.outputTokens,
+      usage.output_tokens,
+      ext.outputTokens,
+      ext.output_tokens,
+    ) ?? 0;
   const cacheReadTokens = pickNum(ext.cacheReadTokens, ext.cache_read_tokens, usage.cacheReadTokens, meta.cacheReadTokens);
   const cacheWriteTokens = pickNum(ext.cacheWriteTokens, ext.cache_write_tokens, usage.cacheWriteTokens);
   const reasoningTokens = pickNum(usage.reasoningTokens, usage.reasoning_tokens, ext.reasoningTokens, ext.reasoning_tokens);
@@ -1304,7 +1320,7 @@ export function toAnthropicError(
   };
 }
 
-function anthropicUsage(turn: { usage?: unknown; extendedUsage?: unknown; providerMetadata?: unknown }) {
+export function toAnthropicUsage(turn: { usage?: unknown; extendedUsage?: unknown; providerMetadata?: unknown }) {
   const normalized = normalizeCursorUsage(turn);
   const cacheCreationInputTokens = normalized.cacheWriteTokens ?? 0;
   const cacheReadInputTokens = normalized.cacheReadTokens ?? 0;
@@ -1350,7 +1366,7 @@ export function toAnthropicMessage({
       input: coerceJsonBySchema(parseArgs(c.args), schemaForTool(tools, c.name)),
     });
   }
-  const usage = anthropicUsage(turn);
+  const usage = toAnthropicUsage(turn);
   const max = Number(maxTokens);
   return {
     id: `msg_${randomId().replace(/-/g, "")}`,
@@ -1918,7 +1934,7 @@ function enqueueAnthropicSseFinish(
     );
     enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index }));
   }
-  const usage = anthropicUsage({
+  const usage = toAnthropicUsage({
     usage: state.usage,
     extendedUsage: state.extendedUsage,
     providerMetadata: state.providerMetadata,

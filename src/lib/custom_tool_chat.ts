@@ -1,7 +1,8 @@
 /**
  * Custom-tools chat path: OpenAI tools → in-process `customTools.execute`.
  * The agent loop is AgentService/Run (MCP family only). execute() is parked
- * for the gateway client. Not HTTP MCP, not @cursor/sdk.
+ * for the gateway client. Not HTTP MCP, not @cursor/sdk, not SDK/agent
+ * binaries, not a Cursor-hosted Cloud Agents sandbox VM.
  *
  * Built-in agent tools stay off except the `mcp` capability group, which is
  * required for customTools to be offered. An empty allowlist also kills MCP.
@@ -10,7 +11,7 @@ import { encodeSseData, encodeSseEvent, jsonResponse, sseStreamResponse } from "
 import { CloudChatError } from "./cloud_errors.ts";
 import { cloudApiKeyFromHeaders } from "./cloud_agents.ts";
 import { credentialFingerprint } from "./auth.ts";
-import { toAnthropicError } from "./inference.ts";
+import { extractFastMode, toAnthropicError, toAnthropicUsage, toOpenAIUsage, normalizeCursorUsage } from "./inference.ts";
 import { resolveSessionKvId } from "./cloud_session.ts";
 import {
   clientToolsToAnthropic,
@@ -29,7 +30,7 @@ import {
   type CustomToolDef,
   type ParkedClientTool,
 } from "./custom_tools.ts";
-import { gatewayAgentModelId } from "./agent_json.ts";
+import { gatewayAgentModelSelection, type AgentTurnUsage } from "./agent_json.ts";
 import { defaultSdkAgentHost } from "./sdk_agent_host.ts";
 import { resolveSessionMode } from "./session.ts";
 
@@ -38,17 +39,24 @@ export type SdkCustomToolMap = ReturnType<typeof toSdkCustomTools>;
 /** Public name of the only builtin capability group we allow (MCP / customTools). */
 export const SDK_CUSTOM_ONLY_BUILTIN_TOOLS = ["mcp"] as const;
 
+/** Test/docs shape of MCP-only allowlist. Runtime never calls Agent.create({ local }). */
 export function sdkLocalAgentCreateOptions(opts: {
   apiKey: string;
   model: unknown;
+  fast?: boolean;
   customTools: SdkCustomToolMap;
   cwd?: string;
 }): Record<string, unknown> {
   const cwd = opts.cwd || readEnv("GATEWAY_AGENT_CWD") || "/tmp";
-  const modelId = gatewayAgentModelId(opts.model);
+  const selection = gatewayAgentModelSelection(opts.model, {
+    fast: opts.fast,
+    hasClientTools: Object.keys(opts.customTools).length > 0,
+  });
   return {
     apiKey: opts.apiKey,
-    model: { id: modelId },
+    model: selection.parameters?.length
+      ? { id: selection.modelId, params: selection.parameters }
+      : { id: selection.modelId },
     tools: [...SDK_CUSTOM_ONLY_BUILTIN_TOOLS],
     local: {
       cwd,
@@ -134,7 +142,7 @@ export function composeCustomToolPrompt(opts: {
 
 export type CustomToolAgentHandle = {
   agentId: string;
-  send: (prompt: string) => Promise<{ wait: () => Promise<{ text: string; error?: string }> }>;
+  send: (prompt: string) => Promise<{ wait: () => Promise<{ text: string; error?: string; usage?: AgentTurnUsage }> }>;
   close: () => Promise<void>;
 };
 
@@ -142,6 +150,7 @@ export type CustomToolAgentHost = {
   create: (opts: {
     apiKey: string;
     model: unknown;
+    fast?: boolean;
     customTools: SdkCustomToolMap;
     cwd?: string;
   }) => Promise<CustomToolAgentHandle>;
@@ -150,10 +159,11 @@ export type CustomToolAgentHost = {
 type LiveTurn = {
   agent: CustomToolAgentHandle;
   session: ClientToolSession;
-  wait: () => Promise<{ text: string; error?: string }>;
+  wait: () => Promise<{ text: string; error?: string; usage?: AgentTurnUsage }>;
   done: boolean;
   text: string;
   error?: string;
+  usage?: AgentTurnUsage;
 };
 
 const liveTurns = new Map<string, LiveTurn>();
@@ -217,6 +227,7 @@ async function settleCustomTools(
     live.done = true;
     live.text = result.text;
     live.error = result.error;
+    live.usage = result.usage;
     stop();
   });
   try {
@@ -267,7 +278,12 @@ async function startCustomToolTurn(opts: {
 
   const host = await resolveHost();
   const customTools = toSdkCustomTools(session);
-  const agent = existing?.agent ?? (await host.create({ apiKey: opts.apiKey, model: opts.body.model, customTools }));
+  const agent = existing?.agent ?? (await host.create({
+    apiKey: opts.apiKey,
+    model: opts.body.model,
+    fast: extractFastMode(opts.body),
+    customTools,
+  }));
   const toolFollowUp = lastTurnIsToolResult(messages) && toolResults.length > 0;
   if (toolFollowUp) {
     console.log(
@@ -308,9 +324,49 @@ async function startCustomToolTurn(opts: {
     live.done = true;
     live.text = result.text;
     live.error = result.error;
+    live.usage = result.usage;
   });
   console.log(`  custom_tools ${existing ? "follow" : "create"} session=${sessionId.slice(0, 24)} agent=${agent.agentId.slice(0, 14)} tools=${opts.tools.length}`);
   return { live, session, sessionId, continued: false };
+}
+
+function cursorTurnFromAgentUsage(usage?: AgentTurnUsage) {
+  if (!usage) return {};
+  return {
+    usage: {
+      promptTokens: usage.inputTokens,
+      completionTokens: usage.outputTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheWriteTokens: usage.cacheWriteTokens,
+      reasoningTokens: usage.reasoningTokens,
+    },
+    extendedUsage: {
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheWriteTokens: usage.cacheWriteTokens,
+      reasoningTokens: usage.reasoningTokens,
+    },
+  };
+}
+
+function openaiUsageFromAgent(usage?: AgentTurnUsage) {
+  return toOpenAIUsage(normalizeCursorUsage(cursorTurnFromAgentUsage(usage)));
+}
+
+function anthropicUsageFromAgent(usage?: AgentTurnUsage) {
+  return toAnthropicUsage(cursorTurnFromAgentUsage(usage));
+}
+
+function logAgentUsage(usage?: AgentTurnUsage) {
+  if (!usage) return;
+  console.log(
+    `  custom_tools usage in=${usage.inputTokens} out=${usage.outputTokens} cache_read=${usage.cacheReadTokens ?? 0} cache_write=${usage.cacheWriteTokens ?? 0}`,
+  );
+}
+
+function liveResult(live: LiveTurn): { text: string; error?: string; usage?: AgentTurnUsage } {
+  return { text: live.text, error: live.error, usage: live.usage };
 }
 
 function openAiCompletion(opts: {
@@ -319,6 +375,7 @@ function openAiCompletion(opts: {
   sessionId: string;
   text: string;
   error?: string;
+  usage?: AgentTurnUsage;
   toolCalls?: ReturnType<typeof clientToolsToOpenAi>;
 }) {
   const toolCalls = opts.toolCalls?.length ? opts.toolCalls : undefined;
@@ -333,6 +390,7 @@ function openAiCompletion(opts: {
     created: Math.floor(Date.now() / 1000),
     model: String(opts.model || "composer-2.5"),
     choices: [{ index: 0, message, finish_reason: opts.error ? "stop" : toolCalls ? "tool_calls" : "stop" }],
+    usage: openaiUsageFromAgent(opts.usage),
     cursor_agent_id: opts.agentId,
     conversation_id: opts.sessionId,
     error: opts.error ? { message: opts.error, type: "api_error" } : undefined,
@@ -363,11 +421,13 @@ export async function handleCustomToolChatCompletions(opts: {
         agentId,
         sessionId: started.sessionId,
         text: started.live.text,
+        usage: started.live.usage,
         toolCalls,
       }),
     );
   }
-  const result = started.live.done ? { text: started.live.text, error: started.live.error } : await started.live.wait();
+  const result = started.live.done ? liveResult(started.live) : await started.live.wait();
+  logAgentUsage(result.usage);
   return jsonResponse(
     200,
     openAiCompletion({
@@ -376,6 +436,7 @@ export async function handleCustomToolChatCompletions(opts: {
       sessionId: started.sessionId,
       text: result.text,
       error: result.error,
+      usage: result.usage,
     }),
   );
 }
@@ -407,12 +468,13 @@ export async function handleCustomToolMessages(opts: {
       model: String(opts.body.model || "composer-2.5"),
       content,
       stop_reason: "tool_use",
-      usage: { input_tokens: 0, output_tokens: 0 },
+      usage: anthropicUsageFromAgent(started.live.usage),
       cursor_agent_id: agentId,
       conversation_id: started.sessionId,
     }, opts.requestId);
   }
-  const result = started.live.done ? { text: started.live.text, error: started.live.error } : await started.live.wait();
+  const result = started.live.done ? liveResult(started.live) : await started.live.wait();
+  logAgentUsage(result.usage);
   return jsonResponse(200, {
     id: `msg_${agentId}`,
     type: "message",
@@ -420,7 +482,7 @@ export async function handleCustomToolMessages(opts: {
     model: String(opts.body.model || "composer-2.5"),
     content: [{ type: "text", text: result.text || result.error || "" }],
     stop_reason: "end_turn",
-    usage: { input_tokens: 0, output_tokens: 0 },
+    usage: anthropicUsageFromAgent(result.usage),
     cursor_agent_id: agentId,
     conversation_id: started.sessionId,
   }, opts.requestId);
@@ -438,7 +500,7 @@ function streamCustomOpenAi(opts: {
   const created = Math.floor(Date.now() / 1000);
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const chunk = (delta: Record<string, unknown>, finish: string | null = null) =>
+      const chunk = (delta: Record<string, unknown>, finish: string | null = null, extra: Record<string, unknown> = {}) =>
         encodeSseData({
           id: agentId,
           object: "chat.completion.chunk",
@@ -447,19 +509,32 @@ function streamCustomOpenAi(opts: {
           choices: [{ index: 0, delta, finish_reason: finish }],
           cursor_agent_id: agentId,
           conversation_id: sessionId,
+          ...extra,
         });
       try {
         controller.enqueue(chunk({ role: "assistant" }));
         const settled = await settleCustomTools(session, live);
         if (live.text) controller.enqueue(chunk({ content: live.text }));
+        const usage = openaiUsageFromAgent(live.usage);
         if (settled.kind === "tools") {
           offerClientToolBatch(session, settled.batch);
           const toolCalls = clientToolsToOpenAi(settled.batch);
           controller.enqueue(chunk({ tool_calls: toolCalls }));
-          controller.enqueue(chunk({}, "tool_calls"));
+          controller.enqueue(chunk({}, "tool_calls", { usage }));
+          controller.enqueue(
+            encodeSseData({
+              id: agentId,
+              object: "chat.completion.chunk",
+              created,
+              model: String(model || "composer-2.5"),
+              choices: [],
+              usage,
+            }),
+          );
           controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
           return;
         }
+        logAgentUsage(live.usage);
         if (live.error) {
           controller.enqueue(
             encodeSseData({
@@ -472,7 +547,17 @@ function streamCustomOpenAi(opts: {
             }),
           );
         }
-        controller.enqueue(chunk({}, "stop"));
+        controller.enqueue(chunk({}, "stop", { usage }));
+        controller.enqueue(
+          encodeSseData({
+            id: agentId,
+            object: "chat.completion.chunk",
+            created,
+            model: String(model || "composer-2.5"),
+            choices: [],
+            usage,
+          }),
+        );
         controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -512,7 +597,14 @@ function streamCustomAnthropic(opts: {
         controller.enqueue(
           encodeSseEvent("message_start", {
             type: "message_start",
-            message: { id: msgId, type: "message", role: "assistant", model: String(model || "composer-2.5"), content: [] },
+            message: {
+              id: msgId,
+              type: "message",
+              role: "assistant",
+              model: String(model || "composer-2.5"),
+              content: [],
+              usage: anthropicUsageFromAgent(),
+            },
           }),
         );
         const settled = await settleCustomTools(session, live);
@@ -543,11 +635,24 @@ function streamCustomAnthropic(opts: {
             controller.enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index }));
             index += 1;
           }
-          controller.enqueue(encodeSseEvent("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use" } }));
+          controller.enqueue(
+            encodeSseEvent("message_delta", {
+              type: "message_delta",
+              delta: { stop_reason: "tool_use" },
+              usage: anthropicUsageFromAgent(live.usage),
+            }),
+          );
           controller.enqueue(encodeSseEvent("message_stop", { type: "message_stop" }));
           return;
         }
-        controller.enqueue(encodeSseEvent("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } }));
+        logAgentUsage(live.usage);
+        controller.enqueue(
+          encodeSseEvent("message_delta", {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn" },
+            usage: anthropicUsageFromAgent(live.usage),
+          }),
+        );
         controller.enqueue(encodeSseEvent("message_stop", { type: "message_stop" }));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

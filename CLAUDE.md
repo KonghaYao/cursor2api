@@ -4,11 +4,29 @@
 
 ---
 
+## 硬约束：无 SDK、无二进制、无 Cloud sandbox VM
+
+后续改聊天路径时 **先对照这一节**。官方文档 [SDK TypeScript](https://cursor.com/cn/docs/sdk/typescript) 的 `local` / `cloud` **都不是本网关的产品形态**。
+
+| 禁止 | 不要做的事 |
+|------|------------|
+| **不装 `@cursor/sdk`** | 不要写进 `package.json` / `deno.json` / `import("@cursor/sdk")`。聊天实现是仓库内 `src/lib/sdk_agent_host.ts` |
+| **不要二进制依赖** | 不要 SDK 平台包（`@cursor/sdk--*`）、不要本机 agent 可执行文件、不要为 `local: { cwd }` 拉 sandbox / ripgrep。Deno Deploy 跑不了这些 |
+| **不要 Cloud 托管 sandbox VM** | 不要 `Agent.create({ cloud })`，不要 `POST https://api.cursor.com/v1/agents` 开 `bc-…` 对话。VM 自带 shell/edit，没有 OpenAI 式 park `tool_calls` |
+
+**是什么：** 网关进程内对 `POST https://api2.cursor.sh/agent.v1.AgentService/Run` 的 Connect JSON 客户端；MCP 只开家族 allowlist；客户端 function tools → 合成 `custom-user-tools`，`execute()` 在本进程 park。模型仍是 Cursor 托管推理，循环与 customTools **不在** Cursor sandbox VM。
+
+**日志里的 `cloud`：** `GATEWAY_UPSTREAM` 只有 `"inference"` 或 `"cloud"`，默认 `"cloud"` = 不走 Inference。`cloud_openai.ts` / `CloudChatError` / 测试名 `cloud OpenAI…` 同此。**不是** Cloud Agents。`GET /health` 的 `rpc` 才是真实路径。
+
+`sdkLocalAgentCreateOptions()` 只是 MCP allowlist 的形状备忘（单测用），**运行时不会** `Agent.create({ local })`。
+
+---
+
 ## 2026-09-09：Inference 已死；聊天走 AgentService customTools（无 `@cursor/sdk`）
 
 台账：**INC-2026-09-09**。Cursor Agent 作为本网关的客户端 **总会带 function `tools`**。「无 tools 走 Cloud REST」不是产品场景，不要再加回那条分流。
 
-网关 **不再依赖** npm `@cursor/sdk`（无 agent 二进制、无默认 shell/edit）。聊天实现是仓库内的 `AgentService/Run` Connect JSON 客户端：`src/lib/sdk_agent_host.ts`。协议与 SDK local Agent 同一条上游，只实现网关需要的 MCP customTools 子集。
+网关 **禁止** npm `@cursor/sdk`、禁止 agent 二进制、禁止 Cursor 托管 sandbox VM。聊天实现是仓库内的 `AgentService/Run` Connect JSON 客户端：`src/lib/sdk_agent_host.ts`。线协议与 SDK 文档里 **local 循环用的同一条 RPC**（`AgentService/Run` + MCP customTools），但 **不是** 官方 SDK local runtime（无 cwd 沙盒、无默认 shell/edit）。
 
 ### 上游怎么选（不要再试 Inference）
 
@@ -43,26 +61,30 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 | **Deno**（含 Deploy） | WHATWG `fetch` + `ReadableStream` body。Deno 的 fetch 在 HTTP/1.1 / HTTP/2 上是 **全双工**（响应头可在请求体未结束时到达）。**不要**设 `duplex: "half"`（那是浏览器/undici 半双工，exec 回不去）。 |
 | **Node / Bun** | `node:http2`。undici `fetch({ duplex: "half" })` **不是**全双工，不能用来跑 AgentService/Run。 |
 
-Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。官方 SDK 的 `local.useHttp1ForAgent` 是 RunSSE + HTTP/1.1 退路，网关不走那条。
+Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。不要为了半双工去装 `@cursor/sdk` 或走官方 `local.useHttp1ForAgent`（那是 SDK 的 RunSSE / HTTP/1.1 退路，带二进制）。
 
 `stream: true` 的 `tool_calls` 仍须 **一条完整 delta**（见 2026-08-31）。会话用稳定 `x-session-id` park `execute()`；`SESSION_MODE=random` 不行。
+
+客户端 `usage`：从 `interactionUpdate.turnEnded` 读 token 字段（proto JSON 的 `inputTokens` 等，uint64 可能是字符串），映射成 OpenAI `prompt_tokens` / `cached_tokens` 与 Anthropic `input_tokens` / `cache_read_input_tokens`。同一 `send()` 内多段 turnEnded 相加。park 成 `tool_calls` 时 turn 还没结束，那一枪 usage 为 0。不要为了 usage 去调 Cloud `getUsage` 或装 SDK。
 
 Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里的 legacy abort）。**不要**把这个 signal 接到 AgentService 双工或 `settleCustomTools` 上，否则第一枪 `tool_calls` 返回后 park 被掐掉，第二枪 `role: tool` 会 409。`deno.json` 开 `--unstable-no-legacy-abort`。若 isolate / 流已经没了，跟进改为把 tool results 写成新 user prompt，而不是 409。
 
 ### 不要做的
 
 - 把 tools 改回 `InferenceService/Stream`
-- 无 tools 时改走 Cloud `bc-…` REST 当「简单聊天」
+- 无 tools 时改走 Cloud `bc-…` REST 当「简单聊天」（Cursor 托管 sandbox VM）
 - 给 Agent 开 `shell` / `edit` / `task` 或默认 toolset
 - 把客户端 tools 挂成 HTTP MCP 让 Cloud VM 反调
 - 用 `GetUsableModels` / `/v1/models` 判断 Inference 是否还能打
-- 再加回 `@cursor/sdk` / 本地 agent 二进制来跑聊天
+- 再加回 `@cursor/sdk`、SDK 平台二进制、或本机 agent 可执行文件来跑聊天
+- 把 `GATEWAY_UPSTREAM=cloud` 理解成 Cloud Agents / `Agent.create({ cloud })`
 - 指纹路径每轮 `randomId()` 当 conversationId（9/1 cache 事故）
 - 设 `excludeWorkspaceContext = true`（Dashboard `crsr_` 会 invalid_argument）
 - 设 `customSystemPrompt`（上游当成 `--system-prompt` 拒掉）
 - 只把最后一条 user 丢给 AgentService（OpenAI `system` 必须折进 user 文本）
 - 跟进轮次再把 system / 整段 history 叠进 `userMessageAction`（Cursor `conversationState` 里已经有上文，会打坏 cache）
 - 把 HTTP `request.signal` 绑到 parked AgentService/Run 上（Deno.serve 成功响应会 abort，第二枪 `role: tool` 变 409）
+- 给 AgentService 只送 `modelId: composer-2.5` 而不带 `parameters.fast=false`（上游默认 Fast，Team Usage 记成 `composer-2.5-fast`）
 
 ---
 

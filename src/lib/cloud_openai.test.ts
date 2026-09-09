@@ -73,7 +73,10 @@ test("cloudModelSelection maps -fast to model.params", () => {
     id: "composer-2.5",
     params: [{ id: "fast", value: "true" }],
   });
-  assert.deepEqual(cloudModelSelection("composer-2.5"), { id: "composer-2.5" });
+  assert.deepEqual(cloudModelSelection("composer-2.5"), {
+    id: "composer-2.5",
+    params: [{ id: "fast", value: "false" }],
+  });
   assert.equal(cloudModelSelection("auto"), undefined);
 });
 
@@ -82,7 +85,10 @@ test("cloudModelSelection upgrades Grok to fast when client tools are present", 
     id: "grok-4.6",
     params: [{ id: "fast", value: "true" }],
   });
-  assert.deepEqual(cloudModelSelection("grok-4.6", {}), { id: "grok-4.6" });
+  assert.deepEqual(cloudModelSelection("grok-4.6", {}), {
+    id: "grok-4.6",
+    params: [{ id: "fast", value: "false" }],
+  });
 });
 
 test("extractCloudPromptImages reads OpenAI data URLs and https URLs", () => {

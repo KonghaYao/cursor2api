@@ -37,9 +37,36 @@ export function field(obj: JsonObject | undefined, ...names: string[]): unknown 
   return undefined;
 }
 
-export function gatewayAgentModelId(model: unknown): string {
+export type AgentModelParam = { id: string; value: string };
+
+export type AgentModelSelection = {
+  modelId: string;
+  parameters?: AgentModelParam[];
+};
+
+/**
+ * AgentService family ids omit `-fast`. Composer’s `fast` param defaults to
+ * true when omitted, so Team Usage bills `composer-2.5` as `composer-2.5-fast`.
+ * Always send an explicit true/false for Composer (and Grok).
+ */
+export function gatewayAgentModelSelection(
+  model: unknown,
+  opts?: { fast?: boolean; hasClientTools?: boolean },
+): AgentModelSelection {
   const raw = typeof model === "string" && model.trim() && model !== "auto" ? model.trim() : "composer-2.5";
-  return raw.replace(/-fast$/i, "");
+  const suffixFast = /-fast$/i.test(raw);
+  const modelId = raw.replace(/-fast$/i, "");
+  const composer = /^composer-/i.test(modelId);
+  const grok = /grok/i.test(modelId);
+  const fast = suffixFast || Boolean(opts?.fast) || (Boolean(opts?.hasClientTools) && grok);
+  if (composer || grok || suffixFast || opts?.fast) {
+    return { modelId, parameters: [{ id: "fast", value: fast ? "true" : "false" }] };
+  }
+  return { modelId };
+}
+
+export function gatewayAgentModelId(model: unknown): string {
+  return gatewayAgentModelSelection(model).modelId;
 }
 
 export function mcpToolDefinitions(tools: CustomToolSpec[]): JsonObject[] {
@@ -55,6 +82,7 @@ export function mcpToolDefinitions(tools: CustomToolSpec[]): JsonObject[] {
 export function buildRunRequest(opts: {
   prompt: string;
   modelId: string;
+  modelParameters?: AgentModelParam[];
   conversationId: string;
   conversationGroupId?: string;
   runId: string;
@@ -65,6 +93,13 @@ export function buildRunRequest(opts: {
 }): JsonObject {
   const messageId = crypto.randomUUID();
   const mcpTools = mcpToolDefinitions(opts.tools);
+  const selection = gatewayAgentModelSelection(opts.modelId);
+  const parameters = opts.modelParameters ?? selection.parameters;
+  const requestedModel: JsonObject = {
+    modelId: selection.modelId,
+    builtInModel: true,
+  };
+  if (parameters?.length) requestedModel.parameters = parameters;
   const req: JsonObject = {
     conversationState: opts.conversationState ?? {},
     action: {
@@ -75,10 +110,7 @@ export function buildRunRequest(opts: {
         },
       },
     },
-    requestedModel: {
-      modelId: opts.modelId,
-      builtInModel: true,
-    },
+    requestedModel,
     mcpTools: { mcpTools },
     conversationId: opts.conversationId,
     conversationGroupId: opts.conversationGroupId || opts.conversationId,
@@ -308,9 +340,89 @@ export function parseMcpArgs(exec: JsonObject): ParsedMcpCall | undefined {
   };
 }
 
+export type AgentTurnUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
+};
+
+function pickToken(...vals: unknown[]): number | undefined {
+  for (const v of vals) {
+    if (typeof v === "number" && Number.isFinite(v) && v >= 0) return v;
+    if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v)) && Number(v) >= 0) return Number(v);
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      const rec = v as JsonObject;
+      const wrapped = rec.numberValue ?? rec.number_value ?? rec.intValue ?? rec.int_value;
+      if (typeof wrapped === "number" && Number.isFinite(wrapped) && wrapped >= 0) return wrapped;
+      if (typeof wrapped === "string" && wrapped.trim() !== "" && Number.isFinite(Number(wrapped)) && Number(wrapped) >= 0) {
+        return Number(wrapped);
+      }
+    }
+  }
+  return undefined;
+}
+
+/** AgentService TurnEnded / nested usage. Proto JSON uint64 is often a string. */
+export function parseAgentTurnUsage(raw: unknown): AgentTurnUsage | undefined {
+  const obj = asObject(raw);
+  if (!obj) return undefined;
+  const nested = asObject(field(obj, "usage")) ?? obj;
+  const inputTokens = pickToken(
+    nested.inputTokens,
+    nested.input_tokens,
+    nested.promptTokens,
+    nested.prompt_tokens,
+  );
+  const outputTokens = pickToken(
+    nested.outputTokens,
+    nested.output_tokens,
+    nested.completionTokens,
+    nested.completion_tokens,
+  );
+  const cacheReadTokens = pickToken(nested.cacheReadTokens, nested.cache_read_tokens);
+  const cacheWriteTokens = pickToken(nested.cacheWriteTokens, nested.cache_write_tokens);
+  const reasoningTokens = pickToken(nested.reasoningTokens, nested.reasoning_tokens);
+  if (
+    inputTokens == null &&
+    outputTokens == null &&
+    cacheReadTokens == null &&
+    cacheWriteTokens == null &&
+    reasoningTokens == null
+  ) {
+    return undefined;
+  }
+  return {
+    inputTokens: inputTokens ?? 0,
+    outputTokens: outputTokens ?? 0,
+    cacheReadTokens,
+    cacheWriteTokens,
+    reasoningTokens,
+  };
+}
+
+function addOptionalToken(a?: number, b?: number): number | undefined {
+  if (a == null && b == null) return undefined;
+  return (a ?? 0) + (b ?? 0);
+}
+
+export function addAgentTurnUsage(a?: AgentTurnUsage, b?: AgentTurnUsage): AgentTurnUsage | undefined {
+  if (!b) return a;
+  if (!a) return b;
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: addOptionalToken(a.cacheReadTokens, b.cacheReadTokens),
+    cacheWriteTokens: addOptionalToken(a.cacheWriteTokens, b.cacheWriteTokens),
+    reasoningTokens: addOptionalToken(a.reasoningTokens, b.reasoningTokens),
+  };
+}
+
 export type ServerCase =
   | { kind: "textDelta"; text: string }
-  | { kind: "turnEnded" }
+  | { kind: "turnEnded"; usage?: AgentTurnUsage }
+  | { kind: "usage"; usage: AgentTurnUsage }
   | { kind: "heartbeat" }
   | { kind: "checkpoint"; state: JsonObject }
   | { kind: "exec"; exec: JsonObject; execKind: string }
@@ -363,8 +475,13 @@ export function parseServerMessage(raw: unknown): ServerCase {
     const inner = asObject(field(update, "message")) ?? update;
     const textDelta = asObject(field(inner, "textDelta", "text_delta"));
     if (textDelta) return { kind: "textDelta", text: String(field(textDelta, "text") || "") };
-    if (field(inner, "turnEnded", "turn_ended") !== undefined) return { kind: "turnEnded" };
+    const ended = field(inner, "turnEnded", "turn_ended");
+    if (ended !== undefined) {
+      return { kind: "turnEnded", usage: parseAgentTurnUsage(ended) ?? parseAgentTurnUsage(inner) };
+    }
     if (field(inner, "heartbeat") !== undefined) return { kind: "heartbeat" };
+    const usageOnly = parseAgentTurnUsage(field(inner, "usage", "tokenUsage", "token_usage"));
+    if (usageOnly) return { kind: "usage", usage: usageOnly };
     return { kind: "ignore" };
   }
 

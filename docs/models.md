@@ -10,12 +10,14 @@
 
 ## Composer（Standard / Fast）
 
-| 客户端 `model` | 额外字段 | 发给 Cursor 的 route |
-|----------------|----------|----------------------|
-| `composer-2.5` | — | `composer-2.5` |
-| `composer-2.5-fast` | — | `composer-2.5-fast` |
-| `composer-2.5` | `fast: true`（见下） | `composer-2.5-fast` |
-| `composer-2` / `composer-2-fast` | 同上规则 | 对应 `composer-2*` |
+Inference 路径把 Standard / Fast 写成**两条 route id**。AgentService / SDK **不是**：家族 id 永远是 `composer-2.5`，档位在 `requestedModel.parameters`（SDK 的 `model.params`）里。**省略 `fast` 时上游默认 `true`**，Team Usage 会把标准档记成 `composer-2.5-fast`。
+
+| 客户端 `model` | 额外字段 | Inference route | AgentService `requestedModel` |
+|----------------|----------|-----------------|-------------------------------|
+| `composer-2.5` | — | `composer-2.5` | `{ modelId: "composer-2.5", parameters: [{ id: "fast", value: "false" }] }` |
+| `composer-2.5-fast` | — | `composer-2.5-fast` | `{ modelId: "composer-2.5", parameters: [{ id: "fast", value: "true" }] }` |
+| `composer-2.5` | `fast: true`（见下） | `composer-2.5-fast` | 同上，`fast=true` |
+| `composer-2` / `composer-2-fast` | 同上规则 | 对应 `composer-2*` | 同上，剥 `-fast` 后写 `parameters.fast` |
 
 **Fast 开关**（任选其一，为 true 时且 `model` 尚未带 `-fast` 后缀）：
 

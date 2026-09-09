@@ -629,6 +629,7 @@ Deno.test("cloud GET /v1/models uses api.cursor.com", async () => {
 });
 
 function installFakeCustomToolHost(created: string[] = []) {
+  const usage = { inputTokens: 40, outputTokens: 4, cacheReadTokens: 30, cacheWriteTokens: 2 };
   setCustomToolAgentHostForTests({
     async create({ customTools }: { customTools: SdkCustomToolMap }) {
       const names = Object.keys(customTools);
@@ -639,14 +640,14 @@ function installFakeCustomToolHost(created: string[] = []) {
         async send(prompt: string) {
           const wait = (async () => {
             if (prompt.includes("executed your custom tools")) {
-              return { text: "done:22c from tool results" };
+              return { text: "done:22c from tool results", usage };
             }
             const first = names[0];
-            if (!first) return { text: "no-tools" };
+            if (!first) return { text: "no-tools", usage };
             const result = await customTools[first]!.execute({ city: "Tokyo" }, {});
             const rec = result as { content?: Array<{ text?: string }> };
             const text = rec?.content?.[0]?.text || JSON.stringify(result);
-            return { text: `done:${text}` };
+            return { text: `done:${text}`, usage };
           })();
           return { wait: () => wait };
         },
@@ -685,6 +686,9 @@ Deno.test("cloud OpenAI tools park customTools.execute and resume with client re
       throw new Error(`expected tool_calls, got ${JSON.stringify(chatBody)}`);
     }
     const tc = chatBody.choices[0].message.tool_calls;
+    if (Array.isArray(tc) && Number(chatBody?.usage?.prompt_tokens || 0) !== 0) {
+      throw new Error(`tool_calls response should not have turnEnded usage yet: ${JSON.stringify(chatBody.usage)}`);
+    }
     if (!Array.isArray(tc) || tc.length !== 1 || tc[0]?.function?.name !== "get_weather") {
       throw new Error(`expected one complete get_weather tool_call, got ${JSON.stringify(tc)}`);
     }
@@ -712,6 +716,9 @@ Deno.test("cloud OpenAI tools park customTools.execute and resume with client re
     const chat2Body = await chat2.json();
     if (!String(chat2Body?.choices?.[0]?.message?.content || "").includes("22")) {
       throw new Error(`expected final text from customTools.execute, got ${JSON.stringify(chat2Body)}`);
+    }
+    if (chat2Body?.usage?.prompt_tokens !== 40 || chat2Body?.usage?.prompt_tokens_details?.cached_tokens !== 30) {
+      throw new Error(`expected AgentService usage on final turn, got ${JSON.stringify(chat2Body.usage)}`);
     }
   } finally {
     setCustomToolAgentHostForTests(undefined);
@@ -847,6 +854,9 @@ Deno.test("cloud chat always uses customTools, never Cloud REST agents", async (
     const firstBody = await first.json();
     if (!String(firstBody?.choices?.[0]?.message?.content || "").includes("no-tools")) {
       throw new Error(`expected SDK text, got ${JSON.stringify(firstBody)}`);
+    }
+    if (firstBody?.usage?.prompt_tokens !== 40 || firstBody?.usage?.completion_tokens !== 4) {
+      throw new Error(`expected usage on no-tools chat, got ${JSON.stringify(firstBody.usage)}`);
     }
     const second = await chat("sess-1", "again");
     if (second.status !== 200) throw new Error(`second ${second.status}: ${await second.text()}`);

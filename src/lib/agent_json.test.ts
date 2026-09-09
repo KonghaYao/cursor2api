@@ -5,6 +5,7 @@ import {
   buildRunRequest,
   connectErrorMessage,
   gatewayAgentModelId,
+  gatewayAgentModelSelection,
   mcpArgsToRecord,
   mcpSuccessResult,
   mcpToolDefinitions,
@@ -16,6 +17,30 @@ test("gatewayAgentModelId strips trailing -fast and defaults composer-2.5", () =
   assert.equal(gatewayAgentModelId("composer-2.5-fast"), "composer-2.5");
   assert.equal(gatewayAgentModelId("auto"), "composer-2.5");
   assert.equal(gatewayAgentModelId(""), "composer-2.5");
+});
+
+test("gatewayAgentModelSelection sends explicit fast=false for composer-2.5", () => {
+  assert.deepEqual(gatewayAgentModelSelection("composer-2.5"), {
+    modelId: "composer-2.5",
+    parameters: [{ id: "fast", value: "false" }],
+  });
+  assert.deepEqual(gatewayAgentModelSelection("composer-2.5-fast"), {
+    modelId: "composer-2.5",
+    parameters: [{ id: "fast", value: "true" }],
+  });
+  assert.deepEqual(gatewayAgentModelSelection("composer-2.5", { fast: true }), {
+    modelId: "composer-2.5",
+    parameters: [{ id: "fast", value: "true" }],
+  });
+  assert.deepEqual(gatewayAgentModelSelection("grok-4.6", { hasClientTools: true }), {
+    modelId: "grok-4.6",
+    parameters: [{ id: "fast", value: "true" }],
+  });
+  assert.deepEqual(gatewayAgentModelSelection("grok-4.6"), {
+    modelId: "grok-4.6",
+    parameters: [{ id: "fast", value: "false" }],
+  });
+  assert.deepEqual(gatewayAgentModelSelection("gpt-5.6-luna"), { modelId: "gpt-5.6-luna" });
 });
 
 test("mcp allowlist is the MCP proto family, not shell/edit", () => {
@@ -44,7 +69,9 @@ test("buildRunRequest omits excludeWorkspaceContext and only carries mcp tools",
   });
   assert.equal(req.excludeWorkspaceContext, undefined);
   assert.equal((req.mcpFileSystemOptions as { enabled: boolean }).enabled, false);
-  assert.equal((req.requestedModel as { modelId: string }).modelId, "composer-2.5");
+  const rm = req.requestedModel as { modelId: string; parameters?: Array<{ id: string; value: string }> };
+  assert.equal(rm.modelId, "composer-2.5");
+  assert.deepEqual(rm.parameters, [{ id: "fast", value: "false" }]);
   const tools = (req.mcpTools as { mcpTools: Array<{ toolName: string }> }).mcpTools;
   assert.equal(tools[0]?.toolName, "lookup");
 });
@@ -71,6 +98,33 @@ test("parseServerMessage reads camelCase and snake_case interaction updates", ()
     parseServerMessage({ execServerMessage: { id: 1, execId: "e", mcpArgs: { name: "x" } } }).kind,
     "exec",
   );
+});
+
+test("parseServerMessage reads turnEnded usage (proto JSON + nested SDK shape)", () => {
+  const flat = parseServerMessage({
+    interactionUpdate: {
+      turnEnded: { inputTokens: "1200", outputTokens: "80", cacheReadTokens: "1100", cacheWriteTokens: "0" },
+    },
+  });
+  assert.equal(flat.kind, "turnEnded");
+  if (flat.kind !== "turnEnded") throw new Error("expected turnEnded");
+  assert.deepEqual(flat.usage, {
+    inputTokens: 1200,
+    outputTokens: 80,
+    cacheReadTokens: 1100,
+    cacheWriteTokens: 0,
+    reasoningTokens: undefined,
+  });
+  const nested = parseServerMessage({
+    interaction_update: {
+      turn_ended: { usage: { input_tokens: 20, output_tokens: 3, cache_read_tokens: 12, reasoning_tokens: 2 } },
+    },
+  });
+  assert.equal(nested.kind, "turnEnded");
+  if (nested.kind !== "turnEnded") throw new Error("expected turnEnded");
+  assert.equal(nested.usage?.inputTokens, 20);
+  assert.equal(nested.usage?.cacheReadTokens, 12);
+  assert.equal(nested.usage?.reasoningTokens, 2);
 });
 
 test("mcp args unwrap protobuf Value JSON and plain JSON", () => {

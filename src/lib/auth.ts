@@ -9,7 +9,11 @@ export type GatewayUpstream = "inference" | "cloud";
 
 export type GatewayCtx = {
   kv: Kv;
-  /** `cloud` = official Cloud Agents REST (`api.cursor.com`). Default inference. */
+  /**
+   * `"cloud"` is a leftover name: chat is AgentService/Run + in-process customTools,
+   * not Cloud Agents VM (`POST /v1/agents`) and not `@cursor/sdk`. `"inference"` is
+   * legacy Stream (dead for Dashboard `crsr_` keys).
+   */
   upstream?: GatewayUpstream;
 };
 

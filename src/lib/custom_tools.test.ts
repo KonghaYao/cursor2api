@@ -149,7 +149,10 @@ test("sdk local agent allowlists only mcp so customTools work and builtins stay 
   });
   assert.deepEqual(opts.tools, ["mcp"]);
   assert.deepEqual(SDK_CUSTOM_ONLY_BUILTIN_TOOLS, ["mcp"]);
-  assert.deepEqual(opts.model, { id: "composer-2.5" });
+  assert.deepEqual(opts.model, {
+    id: "composer-2.5",
+    params: [{ id: "fast", value: "true" }],
+  });
   const local = opts.local as { cwd: string; settingSources: unknown[]; customTools: unknown };
   assert.equal(local.cwd, "/tmp/gateway-agent-cwd");
   assert.deepEqual(local.settingSources, []);

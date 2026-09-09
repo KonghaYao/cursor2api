@@ -185,12 +185,14 @@ export function cloudModelSelection(
 ): { id: string; params?: Array<{ id: string; value: string }> } | undefined {
   const id = String(model ?? "").trim();
   if (!id || id === "default" || id === "auto") return undefined;
-  const fast = /(-fast)$/i.test(id) || body?.fast === true;
+  const suffixFast = /(-fast)$/i.test(id) || body?.fast === true;
   const base = id.replace(/-fast$/i, "");
   const grok = /grok/i.test(base);
-  // Non-fast Grok + tools failed upstream historically; Cloud Agents get the fast param instead.
-  if (fast || (hasClientTools && grok)) {
-    return { id: base, params: [{ id: "fast", value: "true" }] };
+  const composer = /^composer-/i.test(base);
+  const fast = suffixFast || (hasClientTools && grok);
+  // Composer’s omitted `fast` param defaults to true on Agent/Cloud APIs.
+  if (composer || grok || suffixFast) {
+    return { id: base, params: [{ id: "fast", value: fast ? "true" : "false" }] };
   }
   return { id };
 }
@@ -497,7 +499,7 @@ export function cloudHealthBody() {
     rpc: "agent.v1.AgentService/Run (customTools only)",
     modes: ["/v1/chat/completions", "/v1/messages"],
     auth: "Authorization Bearer Cursor API key",
-    tools: 'AgentService tools: ["mcp"] only — OpenAI/Anthropic function tools as customTools.execute (parked); no shell/edit/grep; not HTTP MCP; not InferenceService; not @cursor/sdk',
+    tools: 'AgentService tools: ["mcp"] only — OpenAI/Anthropic function tools as customTools.execute (parked); no shell/edit/grep; not HTTP MCP; not InferenceService; not @cursor/sdk; not SDK/agent binaries; not Cloud Agents sandbox VM',
     models: "GET https://api.cursor.com/v1/models",
     session: "stable x-session-id parks customTools.execute across turns",
   };

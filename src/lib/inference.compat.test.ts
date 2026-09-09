@@ -22,6 +22,8 @@ import {
   toAnthropicError,
   toAnthropicMessage,
   toOpenAICompletion,
+  toOpenAIUsage,
+  normalizeCursorUsage,
 } from "./inference.ts";
 
 const TINY_PNG_B64 =
@@ -246,6 +248,23 @@ test("anthropicToCursor preserves text/tool_result ordering and media in tool re
   assert.equal(result?.isError, true);
   assert.ok((result?.experimentalContent as Array<Record<string, unknown>>).some((part) => part.image));
   assert.equal(msgs[2]?.text, "after");
+});
+
+test("normalizeCursorUsage reads AgentService inputTokens/outputTokens", () => {
+  const u = normalizeCursorUsage({
+    usage: { inputTokens: 40, outputTokens: 4, cacheReadTokens: 30, cacheWriteTokens: 2 },
+  });
+  assert.equal(u.promptTokens, 40);
+  assert.equal(u.completionTokens, 4);
+  assert.equal(u.cacheReadTokens, 30);
+  assert.equal(u.cacheWriteTokens, 2);
+  assert.deepEqual(toOpenAIUsage(u), {
+    prompt_tokens: 40,
+    completion_tokens: 4,
+    total_tokens: 44,
+    prompt_tokens_details: { cached_tokens: 30 },
+    cache_write_tokens: 2,
+  });
 });
 
 test("toAnthropicMessage exposes cache usage and maps errors", () => {

@@ -1,16 +1,19 @@
 /**
- * CustomToolAgentHost backed by agent.v1.AgentService/Run (no @cursor/sdk).
+ * CustomToolAgentHost backed by agent.v1.AgentService/Run (no @cursor/sdk,
+ * no agent binary, no Cursor-hosted Cloud Agents sandbox VM).
  * MCP family only; customTools.execute stays in-process (parked by custom_tools.ts).
  */
 import { exchangeApiKey } from "./auth.ts";
 import { randomId } from "./bytes.ts";
 import {
+  addAgentTurnUsage,
   buildRunRequest,
   clientHeartbeatMessage,
   clientRunMessage,
   execIds,
   execThrow,
-  gatewayAgentModelId,
+  gatewayAgentModelSelection,
+  type AgentModelParam,
   kvGetBlobResult,
   kvSetBlobResult,
   listMcpResourcesResult,
@@ -23,6 +26,7 @@ import {
   parseServerMessage,
   readMcpResourceNotFound,
   requestContextResult,
+  type AgentTurnUsage,
   type CustomToolSpec,
   type JsonObject,
 } from "./agent_json.ts";
@@ -86,7 +90,10 @@ export function createSdkAgentHost(opts?: {
       const accessToken = await resolveAccessToken(createOpts.apiKey, exchange);
       const agentId = randomId();
       const conversationId = randomId();
-      const modelId = gatewayAgentModelId(createOpts.model);
+      const selection = gatewayAgentModelSelection(createOpts.model, {
+        fast: createOpts.fast,
+        hasClientTools: Object.keys(createOpts.customTools).length > 0,
+      });
       const cwd = createOpts.cwd || readEnv("GATEWAY_AGENT_CWD") || "/tmp";
       const tools = specsFromCustomTools(createOpts.customTools);
       const blobs = new Map<string, string>();
@@ -102,7 +109,8 @@ export function createSdkAgentHost(opts?: {
             accessToken,
             conversationId,
             agentSessionId: agentId,
-            modelId,
+            modelId: selection.modelId,
+            modelParameters: selection.parameters,
             cwd,
             prompt,
             tools,
@@ -130,6 +138,7 @@ async function runTurn(opts: {
   conversationId: string;
   agentSessionId: string;
   modelId: string;
+  modelParameters?: AgentModelParam[];
   cwd: string;
   prompt: string;
   tools: CustomToolSpec[];
@@ -137,7 +146,7 @@ async function runTurn(opts: {
   blobs: Map<string, string>;
   conversationState?: JsonObject;
   onCheckpoint: (state: JsonObject) => void;
-}): Promise<{ text: string; error?: string }> {
+}): Promise<{ text: string; error?: string; usage?: AgentTurnUsage }> {
   const duplex = await opts.openRun({
     accessToken: opts.accessToken,
     conversationId: opts.conversationId,
@@ -145,6 +154,7 @@ async function runTurn(opts: {
   const runId = randomId();
   let text = "";
   let error: string | undefined;
+  let usage: AgentTurnUsage | undefined;
   const inflight = new Set<Promise<void>>();
 
   const heartbeat = setInterval(() => {
@@ -164,6 +174,7 @@ async function runTurn(opts: {
         buildRunRequest({
           prompt: opts.prompt,
           modelId: opts.modelId,
+          modelParameters: opts.modelParameters,
           conversationId: opts.conversationId,
           runId,
           agentSessionId: opts.agentSessionId,
@@ -190,7 +201,12 @@ async function runTurn(opts: {
         opts.onCheckpoint(parsed.state);
         continue;
       }
+      if (parsed.kind === "usage") {
+        usage = addAgentTurnUsage(usage, parsed.usage);
+        continue;
+      }
       if (parsed.kind === "turnEnded") {
+        usage = addAgentTurnUsage(usage, parsed.usage);
         break;
       }
       if (parsed.kind === "abort") {
@@ -271,7 +287,7 @@ async function runTurn(opts: {
     clearInterval(heartbeat);
     duplex.close();
   }
-  return { text, error };
+  return { text, error, usage };
 }
 
 /** Default host used by the chat path. */

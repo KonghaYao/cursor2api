@@ -124,6 +124,64 @@ test("JWT credentials skip exchange_user_api_key", async () => {
   await agent.close();
 });
 
+test("AgentService requestedModel sends explicit fast for composer standard vs fast", async () => {
+  async function requestedModelFor(model: string, customTools: Record<string, unknown> = {}) {
+    const duplex = new InteractiveDuplex();
+    duplex.onSend = (message) => {
+      if (field(message, "runRequest")) {
+        duplex.push({ interactionUpdate: { textDelta: { text: "PONG" } } });
+        duplex.push({ interactionUpdate: { turnEnded: {} } });
+      }
+    };
+    const host = createSdkAgentHost({
+      openRun: async () => duplex,
+      exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+    });
+    const agent = await host.create({ apiKey: "crsr_test", model, customTools: customTools as never });
+    await (await agent.send("ping")).wait();
+    await agent.close();
+    const run = asObject(field(duplex.sent[0], "runRequest"));
+    return asObject(field(run, "requestedModel"));
+  }
+
+  const standard = await requestedModelFor("composer-2.5", { lookup: { description: "x", inputSchema: {} } });
+  assert.equal(standard?.modelId, "composer-2.5");
+  assert.deepEqual(standard?.parameters, [{ id: "fast", value: "false" }]);
+
+  const fast = await requestedModelFor("composer-2.5-fast");
+  assert.equal(fast?.modelId, "composer-2.5");
+  assert.deepEqual(fast?.parameters, [{ id: "fast", value: "true" }]);
+});
+
+test("in-repo host returns turnEnded usage to wait()", async () => {
+  const duplex = new InteractiveDuplex();
+  duplex.onSend = (message) => {
+    if (field(message, "runRequest")) {
+      duplex.push({ interactionUpdate: { textDelta: { text: "PONG" } } });
+      duplex.push({
+        interactionUpdate: {
+          turnEnded: { inputTokens: 40, outputTokens: 4, cacheReadTokens: 30, cacheWriteTokens: 2 },
+        },
+      });
+    }
+  };
+  const host = createSdkAgentHost({
+    openRun: async () => duplex,
+    exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+  });
+  const agent = await host.create({ apiKey: "crsr_test", model: "composer-2.5", customTools: {} });
+  const result = await (await agent.send("ping")).wait();
+  assert.equal(result.text, "PONG");
+  assert.deepEqual(result.usage, {
+    inputTokens: 40,
+    outputTokens: 4,
+    cacheReadTokens: 30,
+    cacheWriteTokens: 2,
+    reasoningTokens: undefined,
+  });
+  await agent.close();
+});
+
 async function waitFor<T>(fn: () => T | undefined, timeoutMs = 1000): Promise<T> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
