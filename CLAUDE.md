@@ -6,7 +6,7 @@
 
 ## 2026-09-09：Inference 已死；聊天走 AgentService customTools（无 `@cursor/sdk`）
 
-Cursor Agent 作为本网关的客户端 **总会带 function `tools`**。「无 tools 走 Cloud REST」不是产品场景，不要再加回那条分流。
+台账：**INC-2026-09-09**。Cursor Agent 作为本网关的客户端 **总会带 function `tools`**。「无 tools 走 Cloud REST」不是产品场景，不要再加回那条分流。
 
 网关 **不再依赖** npm `@cursor/sdk`（无 agent 二进制、无默认 shell/edit）。聊天实现是仓库内的 `AgentService/Run` Connect JSON 客户端：`src/lib/sdk_agent_host.ts`。协议与 SDK local Agent 同一条上游，只实现网关需要的 MCP customTools 子集。
 
@@ -282,6 +282,20 @@ python3 scripts/analyze_team_usage.py team-usage-events-*.csv -o reports/usage-<
 | 根因结论 | 跨轮次看 **cache 正常**；含首轮偏低来自多会话 + **&gt;25k 的冷枪**（换轨整段 in_wo，**不算初始**） |
 | 状态 | **closed（M1）**；坏段/尖峰仍作运营参考 |
 | 续记 | T 固定 **25k**（前 **33k**→91.84%/604 行）；**33k→25k** 少剔 14 行、M1 **91.7%**；旧自适应 T=4096 只剔 157 行 |
+
+###### INC-2026-09-09 — 【L】InferenceService/Stream 对 Dashboard `crsr_` 失效
+
+| 字段 | 内容 |
+|------|------|
+| 分级 | **L（大事故）** |
+| 观测窗 (CST) | **2026-09-09**（当日发现并改线；精确坏段以各环境打 Stream 的时间为准） |
+| 主要坏段 (CST) | Dashboard `crsr_`：`exchange_user_api_key` / `GetUsableModels` 仍可能 200；`POST …/aiserver.v1.InferenceService/Stream` 稳定 `ERROR_NOT_LOGGED_IN`。聊天与 tools 全灭。 |
+| 触发指标 | 产品路径不可用（非 M1/M5 cache SLO）；与 **9/1 conversationId** 无关 |
+| 用户/团队 | 使用 Dashboard `crsr_` 的网关客户端（Cursor Agent 带 function tools） |
+| 证据 | 本机探针 Stream 信封 `ERROR_NOT_LOGGED_IN`；同 key `GET https://api.cursor.com/v1/models` 200；`AgentService/Run` 可聊 |
+| 根因结论 | **Cursor 上游**：Inference 这条 RPC 对 Dashboard API key 不再当已登录会话。不是网关把 model id / session_fp 弄丢。 |
+| 状态 | **mitigated**：聊天改 `agent.v1.AgentService/Run` + 进程内 customTools（`684da64` / `454122d`）。Inference 仍死，禁止加回。 |
+| 续记 | 2026-09-09：实机 Deno `8789` OpenAI probe 7/7、Anthropic `system`、`grok-4.6-fast` PONG。上游另拒 `excludeWorkspaceContext` 与 `customSystemPrompt`（`--system-prompt`）。AgentService 会话 id 仍是进程内 random，**未**绑 `tenant:session_fp`；Team Usage Cache Read 尚未用 CSV 验证。 |
 
 ### 成本归因（简表）
 
