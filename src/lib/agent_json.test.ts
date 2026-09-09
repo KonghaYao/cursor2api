@@ -135,6 +135,49 @@ test("parseServerMessage reads camelCase and snake_case interaction updates", ()
   );
 });
 
+test("parseServerMessage reads thinkingDelta (proto oneof and SDK type)", () => {
+  assert.deepEqual(
+    parseServerMessage({ interactionUpdate: { thinkingDelta: { text: "step 1" } } }),
+    { kind: "thinkingDelta", text: "step 1" },
+  );
+  assert.deepEqual(
+    parseServerMessage({ interaction_update: { thinking_delta: { text: "step 2" } } }),
+    { kind: "thinkingDelta", text: "step 2" },
+  );
+  assert.deepEqual(
+    parseServerMessage({ interactionUpdate: { type: "thinking-delta", text: "step 3" } }),
+    { kind: "thinkingDelta", text: "step 3" },
+  );
+});
+
+test("buildRunRequest attaches inline images and clientSupportsInlineImages", () => {
+  const req = buildRunRequest({
+    prompt: "what is this?",
+    modelId: "composer-2.5",
+    conversationId: "c1",
+    runId: "r1",
+    agentSessionId: "a1",
+    tools: [],
+    images: [{ uuid: "u1", path: "image-u1.png", mimeType: "image/png", data: "aaaa" }],
+  });
+  assert.equal(req.clientSupportsInlineImages, true);
+  const user = (req.action as { userMessageAction: { userMessage: Record<string, unknown> } }).userMessageAction.userMessage;
+  assert.equal(user.text, "what is this?");
+  const images = (user.selectedContext as { selectedImages: Array<{ data: string; mimeType: string }> }).selectedImages;
+  assert.equal(images.length, 1);
+  assert.equal(images[0]?.data, "aaaa");
+  assert.equal(images[0]?.mimeType, "image/png");
+  const plain = buildRunRequest({
+    prompt: "hi",
+    modelId: "composer-2.5",
+    conversationId: "c1",
+    runId: "r1",
+    agentSessionId: "a1",
+    tools: [],
+  });
+  assert.equal(plain.clientSupportsInlineImages, undefined);
+});
+
 test("parseServerMessage reads turnEnded usage (proto JSON + nested SDK shape)", () => {
   const flat = parseServerMessage({
     interactionUpdate: {

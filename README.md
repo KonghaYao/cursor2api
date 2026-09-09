@@ -50,8 +50,8 @@ curl -sS https://cursor2api.freetavily.deno.net/v1/chat/completions \
 | Fast 档 | 可用 | 模型名带 `-fast`，或请求体写 `"fast": true`。`composer-2.5`、`grok-4.6` 默认是标准档，不是 Fast |
 | 思考强度 effort | 可用（仅 Grok） | 用 `reasoning_effort`（`low` / `medium` / `high` / `max`）。不写则按 `high`。Composer 没有这个档位 |
 | Composer Max | 不可用 | 请求里的 `max` / `max_mode` 目前不会生效 |
-| 思考过程 thinking | 不可用 | 不会返回 `reasoning_content` |
-| 图片 / 文件 | 不可用 | 带图或附件时模型看不到 |
+| 思考过程 thinking | 可用 | OpenAI 看 `reasoning_content`；Anthropic 看 `thinking` 块。只转发明文思考，不转发加密内容 |
+| 图片 | 可用 | 用户消息里的 `image_url` / Anthropic `image`（data URL 或 http 图）会转给模型。文件附件还不行 |
 | `max_tokens` | 不可用 | 目前限制不住上游输出长度 |
 | 模型列表 | 可用 | `GET /v1/models`。列表里没有的第三方模型（例如 Luna）仍可能能打，差的是账号额度或地区，不是网关没接 |
 | 部署环境 | Deno / Node 可用 | Cloudflare Workers 上聊天会失败 |

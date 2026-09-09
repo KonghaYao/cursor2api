@@ -41,6 +41,14 @@ export function field(obj: JsonObject | undefined, ...names: string[]): unknown 
 
 export type AgentModelParam = { id: string; value: string };
 
+/** Inline image on AgentService UserMessage.selectedContext (Connect JSON bytes = base64). */
+export type AgentInlineImage = {
+  uuid: string;
+  path: string;
+  mimeType: string;
+  data: string;
+};
+
 export type AgentModelSelection = {
   modelId: string;
   parameters?: AgentModelParam[];
@@ -108,6 +116,7 @@ export function buildRunRequest(opts: {
   tools: CustomToolSpec[];
   conversationState?: JsonObject;
   cwd?: string;
+  images?: AgentInlineImage[];
 }): JsonObject {
   const messageId = crypto.randomUUID();
   const mcpTools = mcpToolDefinitions(opts.tools);
@@ -118,14 +127,26 @@ export function buildRunRequest(opts: {
     builtInModel: true,
   };
   if (parameters?.length) requestedModel.parameters = parameters;
+  const images = opts.images?.filter((img) => img.data) ?? [];
+  const userMessage: JsonObject = {
+    text: opts.prompt,
+    messageId,
+  };
+  if (images.length) {
+    userMessage.selectedContext = {
+      selectedImages: images.map((img) => ({
+        uuid: img.uuid,
+        path: img.path,
+        mimeType: img.mimeType,
+        data: img.data,
+      })),
+    };
+  }
   const req: JsonObject = {
     conversationState: opts.conversationState ?? {},
     action: {
       userMessageAction: {
-        userMessage: {
-          text: opts.prompt,
-          messageId,
-        },
+        userMessage,
       },
     },
     requestedModel,
@@ -143,6 +164,8 @@ export function buildRunRequest(opts: {
       workspaceProjectDir: opts.cwd || "/tmp",
     },
   };
+  // Cursor only honours SelectedImage.data when this is true.
+  if (images.length) req.clientSupportsInlineImages = true;
   return req;
 }
 
@@ -439,6 +462,7 @@ export function addAgentTurnUsage(a?: AgentTurnUsage, b?: AgentTurnUsage): Agent
 
 export type ServerCase =
   | { kind: "textDelta"; text: string }
+  | { kind: "thinkingDelta"; text: string }
   | { kind: "turnEnded"; usage?: AgentTurnUsage }
   | { kind: "usage"; usage: AgentTurnUsage }
   | { kind: "heartbeat" }
@@ -493,6 +517,12 @@ export function parseServerMessage(raw: unknown): ServerCase {
     const inner = asObject(field(update, "message")) ?? update;
     const textDelta = asObject(field(inner, "textDelta", "text_delta"));
     if (textDelta) return { kind: "textDelta", text: String(field(textDelta, "text") || "") };
+    const thinkingDelta = asObject(field(inner, "thinkingDelta", "thinking_delta"));
+    if (thinkingDelta) return { kind: "thinkingDelta", text: String(field(thinkingDelta, "text") || "") };
+    const type = String(field(inner, "type") || "");
+    if (type === "thinking-delta" || type === "thinking_delta") {
+      return { kind: "thinkingDelta", text: String(field(inner, "text") || "") };
+    }
     const ended = field(inner, "turnEnded", "turn_ended");
     if (ended !== undefined) {
       return { kind: "turnEnded", usage: parseAgentTurnUsage(ended) ?? parseAgentTurnUsage(inner) };

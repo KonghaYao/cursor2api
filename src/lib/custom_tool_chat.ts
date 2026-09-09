@@ -30,7 +30,8 @@ import {
   type CustomToolDef,
   type ParkedClientTool,
 } from "./custom_tools.ts";
-import { gatewayAgentModelSelection, type AgentTurnUsage } from "./agent_json.ts";
+import { gatewayAgentModelSelection, type AgentInlineImage, type AgentTurnUsage } from "./agent_json.ts";
+import { openaiContentToCursorParts } from "./content_parts.ts";
 import { defaultSdkAgentHost } from "./sdk_agent_host.ts";
 import { resolveSessionMode } from "./session.ts";
 
@@ -68,6 +69,21 @@ export function sdkLocalAgentCreateOptions(opts: {
 }
 
 function lastUserPrompt(messages: unknown[]): string {
+  const content = lastUserContent(messages);
+  if (content == null) return "(empty)";
+  if (typeof content === "string" && content.trim()) return content;
+  if (Array.isArray(content)) {
+    const text = content
+      .map((p) => (p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string" ? String((p as { text: string }).text) : ""))
+      .filter(Boolean)
+      .join("\n");
+    if (text) return text;
+    return "";
+  }
+  return "(empty)";
+}
+
+function lastUserContent(messages: unknown[]): unknown {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (!m || typeof m !== "object") continue;
@@ -76,17 +92,42 @@ function lastUserPrompt(messages: unknown[]): string {
     if (Array.isArray(rec.content) && rec.content.some((b) => b && typeof b === "object" && String((b as Record<string, unknown>).type || "") === "tool_result")) {
       continue;
     }
-    const content = rec.content;
-    if (typeof content === "string" && content.trim()) return content;
-    if (Array.isArray(content)) {
-      const text = content
-        .map((p) => (p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string" ? String((p as { text: string }).text) : ""))
-        .filter(Boolean)
-        .join("\n");
-      if (text) return text;
-    }
+    return rec.content;
   }
-  return "(empty)";
+  return undefined;
+}
+
+function extForMime(mime: string): string {
+  const t = mime.toLowerCase();
+  if (t.includes("jpeg") || t.includes("jpg")) return "jpg";
+  if (t.includes("webp")) return "webp";
+  if (t.includes("gif")) return "gif";
+  if (t.includes("png")) return "png";
+  return "png";
+}
+
+export function agentImagesFromCursorParts(parts: Array<Record<string, unknown>>): AgentInlineImage[] {
+  const out: AgentInlineImage[] = [];
+  for (const part of parts) {
+    const image = part.image as { data?: string; mimeType?: string } | undefined;
+    if (!image?.data) continue;
+    const mimeType = image.mimeType || "image/png";
+    const uuid = crypto.randomUUID();
+    out.push({
+      uuid,
+      path: `image-${uuid}.${extForMime(mimeType)}`,
+      mimeType,
+      data: image.data,
+    });
+  }
+  return out;
+}
+
+async function lastUserAgentImages(messages: unknown[]): Promise<AgentInlineImage[]> {
+  const content = lastUserContent(messages);
+  if (content == null || typeof content === "string") return [];
+  const converted = await openaiContentToCursorParts(content);
+  return agentImagesFromCursorParts(converted.parts);
 }
 
 function messageText(content: unknown): string {
@@ -141,9 +182,14 @@ export function composeCustomToolPrompt(opts: {
   return [policy, wrapped, user].filter(Boolean).join("\n\n");
 }
 
+export type CustomToolTurnResult = { text: string; thinking?: string; error?: string; usage?: AgentTurnUsage };
+
 export type CustomToolAgentHandle = {
   agentId: string;
-  send: (prompt: string) => Promise<{ wait: () => Promise<{ text: string; error?: string; usage?: AgentTurnUsage }> }>;
+  send: (
+    prompt: string,
+    opts?: { images?: AgentInlineImage[] },
+  ) => Promise<{ wait: () => Promise<CustomToolTurnResult> }>;
   close: () => Promise<void>;
 };
 
@@ -161,9 +207,10 @@ export type CustomToolAgentHost = {
 type LiveTurn = {
   agent: CustomToolAgentHandle;
   session: ClientToolSession;
-  wait: () => Promise<{ text: string; error?: string; usage?: AgentTurnUsage }>;
+  wait: () => Promise<CustomToolTurnResult>;
   done: boolean;
   text: string;
+  thinking?: string;
   error?: string;
   usage?: AgentTurnUsage;
 };
@@ -228,6 +275,7 @@ async function settleCustomTools(
   void live.wait().then((result) => {
     live.done = true;
     live.text = result.text;
+    live.thinking = result.thinking;
     live.error = result.error;
     live.usage = result.usage;
     stop();
@@ -313,7 +361,8 @@ async function startCustomToolTurn(opts: {
         messages,
         followUp: Boolean(existing),
       });
-  const run = await agent.send(prompt);
+  const images = toolFollowUp ? [] : await lastUserAgentImages(messages);
+  const run = await agent.send(prompt, images.length ? { images } : undefined);
   const live: LiveTurn = {
     agent,
     session,
@@ -326,10 +375,11 @@ async function startCustomToolTurn(opts: {
   void live.wait().then((result) => {
     live.done = true;
     live.text = result.text;
+    live.thinking = result.thinking;
     live.error = result.error;
     live.usage = result.usage;
   });
-  console.log(`  custom_tools ${existing ? "follow" : "create"} session=${sessionId.slice(0, 24)} agent=${agent.agentId.slice(0, 14)} tools=${opts.tools.length}`);
+  console.log(`  custom_tools ${existing ? "follow" : "create"} session=${sessionId.slice(0, 24)} agent=${agent.agentId.slice(0, 14)} tools=${opts.tools.length} images=${images.length}`);
   return { live, session, sessionId, continued: false };
 }
 
@@ -368,8 +418,16 @@ function logAgentUsage(usage?: AgentTurnUsage) {
   );
 }
 
-function liveResult(live: LiveTurn): { text: string; error?: string; usage?: AgentTurnUsage } {
-  return { text: live.text, error: live.error, usage: live.usage };
+function liveResult(live: LiveTurn): CustomToolTurnResult {
+  return { text: live.text, thinking: live.thinking, error: live.error, usage: live.usage };
+}
+
+function anthropicContentBlocks(opts: { thinking?: string; text?: string; toolUses?: unknown[] }): unknown[] {
+  const content: unknown[] = [];
+  if (opts.thinking) content.push({ type: "thinking", thinking: opts.thinking });
+  if (opts.text) content.push({ type: "text", text: opts.text });
+  if (opts.toolUses?.length) content.push(...opts.toolUses);
+  return content.length ? content : [{ type: "text", text: "" }];
 }
 
 function openAiCompletion(opts: {
@@ -377,6 +435,7 @@ function openAiCompletion(opts: {
   agentId: string;
   sessionId: string;
   text: string;
+  thinking?: string;
   error?: string;
   usage?: AgentTurnUsage;
   toolCalls?: ReturnType<typeof clientToolsToOpenAi>;
@@ -386,6 +445,7 @@ function openAiCompletion(opts: {
     role: "assistant",
     content: opts.text || (toolCalls ? null : ""),
   };
+  if (opts.thinking) message.reasoning_content = opts.thinking;
   if (toolCalls) message.tool_calls = toolCalls;
   return {
     id: opts.agentId,
@@ -424,6 +484,7 @@ export async function handleCustomToolChatCompletions(opts: {
         agentId,
         sessionId: started.sessionId,
         text: started.live.text,
+        thinking: started.live.thinking,
         usage: started.live.usage,
         toolCalls,
       }),
@@ -438,6 +499,7 @@ export async function handleCustomToolChatCompletions(opts: {
       agentId,
       sessionId: started.sessionId,
       text: result.text,
+      thinking: result.thinking,
       error: result.error,
       usage: result.usage,
     }),
@@ -461,15 +523,12 @@ export async function handleCustomToolMessages(opts: {
   if (settled.kind === "tools") {
     offerClientToolBatch(started.session, settled.batch);
     const toolUses = clientToolsToAnthropic(settled.batch);
-    const content: unknown[] = [];
-    if (started.live.text) content.push({ type: "text", text: started.live.text });
-    content.push(...toolUses);
     return jsonResponse(200, {
       id: `msg_${agentId}`,
       type: "message",
       role: "assistant",
       model: String(opts.body.model || "composer-2.5"),
-      content,
+      content: anthropicContentBlocks({ thinking: started.live.thinking, text: started.live.text, toolUses }),
       stop_reason: "tool_use",
       usage: anthropicUsageFromAgent(started.live.usage),
       cursor_agent_id: agentId,
@@ -483,7 +542,7 @@ export async function handleCustomToolMessages(opts: {
     type: "message",
     role: "assistant",
     model: String(opts.body.model || "composer-2.5"),
-    content: [{ type: "text", text: result.text || result.error || "" }],
+    content: anthropicContentBlocks({ thinking: result.thinking, text: result.text || result.error || "" }),
     stop_reason: "end_turn",
     usage: anthropicUsageFromAgent(result.usage),
     cursor_agent_id: agentId,
@@ -517,6 +576,7 @@ function streamCustomOpenAi(opts: {
       try {
         controller.enqueue(chunk({ role: "assistant" }));
         const settled = await settleCustomTools(session, live);
+        if (live.thinking) controller.enqueue(chunk({ reasoning_content: live.thinking }));
         if (live.text) controller.enqueue(chunk({ content: live.text }));
         const usage = openaiUsageFromAgent(live.usage);
         if (settled.kind === "tools") {
@@ -612,11 +672,29 @@ function streamCustomAnthropic(opts: {
         );
         const settled = await settleCustomTools(session, live);
         let index = 0;
+        if (live.thinking) {
+          controller.enqueue(
+            encodeSseEvent("content_block_start", {
+              type: "content_block_start",
+              index,
+              content_block: { type: "thinking", thinking: "" },
+            }),
+          );
+          controller.enqueue(
+            encodeSseEvent("content_block_delta", {
+              type: "content_block_delta",
+              index,
+              delta: { type: "thinking_delta", thinking: live.thinking },
+            }),
+          );
+          controller.enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index }));
+          index += 1;
+        }
         if (live.text) {
-          controller.enqueue(encodeSseEvent("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
-          controller.enqueue(encodeSseEvent("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: live.text } }));
-          controller.enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index: 0 }));
-          index = 1;
+          controller.enqueue(encodeSseEvent("content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } }));
+          controller.enqueue(encodeSseEvent("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: live.text } }));
+          controller.enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index }));
+          index += 1;
         }
         if (settled.kind === "tools") {
           offerClientToolBatch(session, settled.batch);

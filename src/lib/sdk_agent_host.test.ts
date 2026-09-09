@@ -211,6 +211,37 @@ test("in-repo host returns turnEnded usage to wait()", async () => {
   await agent.close();
 });
 
+test("in-repo host collects thinkingDelta and sends selectedImages", async () => {
+  const duplex = new InteractiveDuplex();
+  duplex.onSend = (message) => {
+    if (field(message, "runRequest")) {
+      duplex.push({ interactionUpdate: { thinkingDelta: { text: "count the pixels" } } });
+      duplex.push({ interactionUpdate: { textDelta: { text: "a cat" } } });
+      duplex.push({ interactionUpdate: { turnEnded: {} } });
+    }
+  };
+  const host = createSdkAgentHost({
+    openRun: async () => duplex,
+    exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+  });
+  const agent = await host.create({ apiKey: "crsr_test", model: "composer-2.5", customTools: {} });
+  const result = await (
+    await agent.send("what is this?", {
+      images: [{ uuid: "u1", path: "image-u1.png", mimeType: "image/png", data: "aaaa" }],
+    })
+  ).wait();
+  assert.equal(result.thinking, "count the pixels");
+  assert.equal(result.text, "a cat");
+  const run = asObject(field(duplex.sent[0], "runRequest"));
+  assert.equal(run?.clientSupportsInlineImages, true);
+  const user = asObject(
+    field(asObject(field(asObject(field(run, "action")), "userMessageAction")), "userMessage"),
+  );
+  const images = (user?.selectedContext as { selectedImages: Array<{ data: string }> } | undefined)?.selectedImages;
+  assert.equal(images?.[0]?.data, "aaaa");
+  await agent.close();
+});
+
 async function waitFor<T>(fn: () => T | undefined, timeoutMs = 1000): Promise<T> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {

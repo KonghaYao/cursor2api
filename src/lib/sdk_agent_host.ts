@@ -26,6 +26,7 @@ import {
   parseServerMessage,
   readMcpResourceNotFound,
   requestContextResult,
+  type AgentInlineImage,
   type AgentTurnUsage,
   type CustomToolSpec,
   type JsonObject,
@@ -102,7 +103,7 @@ export function createSdkAgentHost(opts?: {
 
       const handle: CustomToolAgentHandle = {
         agentId,
-        async send(prompt: string) {
+        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[] }) {
           if (closed) throw new Error("agent is closed");
           const run = runTurn({
             openRun,
@@ -113,6 +114,7 @@ export function createSdkAgentHost(opts?: {
             modelParameters: selection.parameters,
             cwd,
             prompt,
+            images: sendOpts?.images,
             tools,
             customTools: createOpts.customTools,
             blobs,
@@ -141,18 +143,20 @@ async function runTurn(opts: {
   modelParameters?: AgentModelParam[];
   cwd: string;
   prompt: string;
+  images?: AgentInlineImage[];
   tools: CustomToolSpec[];
   customTools: SdkCustomToolMap;
   blobs: Map<string, string>;
   conversationState?: JsonObject;
   onCheckpoint: (state: JsonObject) => void;
-}): Promise<{ text: string; error?: string; usage?: AgentTurnUsage }> {
+}): Promise<{ text: string; thinking?: string; error?: string; usage?: AgentTurnUsage }> {
   const duplex = await opts.openRun({
     accessToken: opts.accessToken,
     conversationId: opts.conversationId,
   });
   const runId = randomId();
   let text = "";
+  let thinking = "";
   let error: string | undefined;
   let usage: AgentTurnUsage | undefined;
   const inflight = new Set<Promise<void>>();
@@ -181,6 +185,7 @@ async function runTurn(opts: {
           tools: opts.tools,
           conversationState: opts.conversationState,
           cwd: opts.cwd,
+          images: opts.images,
         }),
       ),
     );
@@ -195,6 +200,10 @@ async function runTurn(opts: {
       }
       if (parsed.kind === "textDelta") {
         text += parsed.text;
+        continue;
+      }
+      if (parsed.kind === "thinkingDelta") {
+        thinking += parsed.text;
         continue;
       }
       if (parsed.kind === "checkpoint") {
@@ -287,7 +296,7 @@ async function runTurn(opts: {
     clearInterval(heartbeat);
     duplex.close();
   }
-  return { text, error, usage };
+  return { text, thinking: thinking || undefined, error, usage };
 }
 
 /** Default host used by the chat path. */
