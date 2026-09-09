@@ -87,7 +87,7 @@ export function createSdkAgentHost(opts?: {
       const agentId = randomId();
       const conversationId = randomId();
       const modelId = gatewayAgentModelId(createOpts.model);
-      const cwd = createOpts.cwd || readEnv("GATEWAY_AGENT_CWD") || "./";
+      const cwd = createOpts.cwd || readEnv("GATEWAY_AGENT_CWD") || "/tmp";
       const tools = specsFromCustomTools(createOpts.customTools);
       const blobs = new Map<string, string>();
       let conversationState: JsonObject | undefined;

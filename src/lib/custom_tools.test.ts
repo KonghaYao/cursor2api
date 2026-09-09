@@ -16,7 +16,9 @@ import {
 } from "./custom_tools.ts";
 import {
   SDK_CUSTOM_ONLY_BUILTIN_TOOLS,
+  composeCustomToolPrompt,
   sdkLocalAgentCreateOptions,
+  systemPromptFromClient,
 } from "./custom_tool_chat.ts";
 import { MCP_ALLOWED_PROTO_TOOLS } from "./agent_json.ts";
 
@@ -86,6 +88,28 @@ test("parked customTools.execute resolves when the client posts tool results", a
   const result = await parked;
   assert.equal(result.isError, undefined);
   assert.match(result.content[0]!.text, /temp/);
+});
+
+test("system and Anthropic body.system are folded into the user prompt", () => {
+  const openai = systemPromptFromClient({
+    messages: [
+      { role: "system", content: "Reply with exactly TOKEN" },
+      { role: "user", content: "hi" },
+    ],
+  });
+  assert.equal(openai, "Reply with exactly TOKEN");
+  const anthropic = systemPromptFromClient({
+    system: [{ type: "text", text: "be terse" }],
+    messages: [{ role: "user", content: "hi" }],
+  });
+  assert.equal(anthropic, "be terse");
+  const prompt = composeCustomToolPrompt({
+    body: { messages: [{ role: "system", content: "secret ALPHA" }, { role: "user", content: "code?" }] },
+    tools: [],
+    messages: [{ role: "system", content: "secret ALPHA" }, { role: "user", content: "code?" }],
+  });
+  assert.match(prompt, /<system>\nsecret ALPHA\n<\/system>/);
+  assert.match(prompt, /code\?/);
 });
 
 test("sdk local agent allowlists only mcp so customTools work and builtins stay off", () => {

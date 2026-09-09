@@ -43,7 +43,7 @@ export function sdkLocalAgentCreateOptions(opts: {
   customTools: SdkCustomToolMap;
   cwd?: string;
 }): Record<string, unknown> {
-  const cwd = opts.cwd || readEnv("GATEWAY_AGENT_CWD") || "./";
+  const cwd = opts.cwd || readEnv("GATEWAY_AGENT_CWD") || "/tmp";
   const modelId = gatewayAgentModelId(opts.model);
   return {
     apiKey: opts.apiKey,
@@ -57,7 +57,7 @@ export function sdkLocalAgentCreateOptions(opts: {
   };
 }
 
-function lastUserPrompt(messages: unknown[], _followUp: boolean): string {
+function lastUserPrompt(messages: unknown[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (!m || typeof m !== "object") continue;
@@ -77,6 +77,53 @@ function lastUserPrompt(messages: unknown[], _followUp: boolean): string {
     }
   }
   return "(empty)";
+}
+
+function messageText(content: unknown): string {
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content.map(messageText).filter(Boolean).join("\n").trim();
+  }
+  if (content && typeof content === "object") {
+    const rec = content as Record<string, unknown>;
+    if (typeof rec.text === "string") return rec.text.trim();
+    if (rec.content !== undefined) return messageText(rec.content);
+  }
+  return "";
+}
+
+/** OpenAI system/developer messages plus Anthropic `body.system`. */
+export function systemPromptFromClient(body: Record<string, unknown>): string {
+  const parts: string[] = [];
+  const sys = body.system;
+  if (typeof sys === "string" && sys.trim()) parts.push(sys.trim());
+  else if (Array.isArray(sys)) {
+    for (const block of sys) {
+      const text = messageText(block);
+      if (text) parts.push(text);
+    }
+  }
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    const rec = m as Record<string, unknown>;
+    if (rec.role !== "system" && rec.role !== "developer") continue;
+    const text = messageText(rec.content);
+    if (text) parts.push(text);
+  }
+  return parts.join("\n\n");
+}
+
+export function composeCustomToolPrompt(opts: {
+  body: Record<string, unknown>;
+  tools: CustomToolDef[];
+  messages: unknown[];
+}): string {
+  const policy = toolPolicyPrompt(opts.body, opts.tools);
+  const system = systemPromptFromClient(opts.body);
+  const user = lastUserPrompt(opts.messages);
+  const wrapped = system ? `<system>\n${system}\n</system>` : "";
+  return [policy, wrapped, user].filter(Boolean).join("\n\n");
 }
 
 export type CustomToolAgentHandle = {
@@ -213,9 +260,11 @@ async function startCustomToolTurn(opts: {
   const host = await resolveHost();
   const customTools = toSdkCustomTools(session);
   const agent = existing?.agent ?? (await host.create({ apiKey: opts.apiKey, model: opts.body.model, customTools }));
-  const prompt = [toolPolicyPrompt(opts.body, opts.tools), lastUserPrompt(messages, Boolean(existing))]
-    .filter(Boolean)
-    .join("\n\n");
+  const prompt = composeCustomToolPrompt({
+    body: opts.body,
+    tools: opts.tools,
+    messages,
+  });
   const run = await agent.send(prompt);
   const live: LiveTurn = {
     agent,

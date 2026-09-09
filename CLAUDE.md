@@ -32,7 +32,7 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 - 空头 / 不含 MCP → **`customTools` 也不会出现**
 - 只开 MCP 家族 → customTools 可用，shell/edit/grep/task/webSearch 关掉
 
-`AgentRunRequest.excludeWorkspaceContext = true`。不要把客户端 tools 挂成 HTTP MCP。
+**不要**设 `AgentRunRequest.excludeWorkspaceContext = true`（`Workspace context exclusion is not allowed…`），也**不要**设 `customSystemPrompt`（会被当成 CLI `--system-prompt` 打回 `unknown option`）。无 workspace 靠 MCP allowlist + `mcpFileSystemOptions.enabled = false`。客户端 `system` **折进 user 文本**（`<system>…</system>`）。不要把客户端 tools 挂成 HTTP MCP。
 
 ### 运行时
 
@@ -56,6 +56,9 @@ Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。官方 SDK 的 
 - 用 `GetUsableModels` / `/v1/models` 判断 Inference 是否还能打
 - 再加回 `@cursor/sdk` / 本地 agent 二进制来跑聊天
 - 指纹路径每轮 `randomId()` 当 conversationId（9/1 cache 事故）
+- 设 `excludeWorkspaceContext = true`（Dashboard `crsr_` 会 invalid_argument）
+- 设 `customSystemPrompt`（上游当成 `--system-prompt` 拒掉）
+- 只把最后一条 user 丢给 AgentService（OpenAI `system` 必须折进 user 文本）
 
 ---
 

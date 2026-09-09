@@ -33,7 +33,7 @@ test("mcp tool definitions use custom-user-tools wire names", () => {
   assert.match(String(defs[0]?.inputSchemaJson), /object/);
 });
 
-test("buildRunRequest excludes workspace context and only carries mcp tools", () => {
+test("buildRunRequest omits excludeWorkspaceContext and only carries mcp tools", () => {
   const req = buildRunRequest({
     prompt: "hi",
     modelId: "composer-2.5",
@@ -42,10 +42,23 @@ test("buildRunRequest excludes workspace context and only carries mcp tools", ()
     agentSessionId: "a1",
     tools: [{ name: "lookup" }],
   });
-  assert.equal(req.excludeWorkspaceContext, true);
+  assert.equal(req.excludeWorkspaceContext, undefined);
+  assert.equal((req.mcpFileSystemOptions as { enabled: boolean }).enabled, false);
   assert.equal((req.requestedModel as { modelId: string }).modelId, "composer-2.5");
   const tools = (req.mcpTools as { mcpTools: Array<{ toolName: string }> }).mcpTools;
   assert.equal(tools[0]?.toolName, "lookup");
+});
+
+test("buildRunRequest does not send customSystemPrompt", () => {
+  const req = buildRunRequest({
+    prompt: "hi",
+    modelId: "composer-2.5",
+    conversationId: "c1",
+    runId: "r1",
+    agentSessionId: "a1",
+    tools: [],
+  });
+  assert.equal(req.customSystemPrompt, undefined);
 });
 
 test("parseServerMessage reads camelCase and snake_case interaction updates", () => {

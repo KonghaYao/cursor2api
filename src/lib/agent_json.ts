@@ -65,7 +65,7 @@ export function buildRunRequest(opts: {
 }): JsonObject {
   const messageId = crypto.randomUUID();
   const mcpTools = mcpToolDefinitions(opts.tools);
-  return {
+  const req: JsonObject = {
     conversationState: opts.conversationState ?? {},
     action: {
       userMessageAction: {
@@ -82,14 +82,18 @@ export function buildRunRequest(opts: {
     mcpTools: { mcpTools },
     conversationId: opts.conversationId,
     conversationGroupId: opts.conversationGroupId || opts.conversationId,
-    excludeWorkspaceContext: true,
+    // Do not set excludeWorkspaceContext or customSystemPrompt: Dashboard
+    // crsr_ rejects both (`Workspace context exclusion is not allowed…` /
+    // `unknown option '--system-prompt'`). Client system text is folded into
+    // the user prompt. Builtins stay off via MCP-only allowlist.
     runId: opts.runId,
     agentSessionId: opts.agentSessionId,
     mcpFileSystemOptions: {
       enabled: false,
-      workspaceProjectDir: opts.cwd || "",
+      workspaceProjectDir: opts.cwd || "/tmp",
     },
   };
+  return req;
 }
 
 export function clientRunMessage(runRequest: JsonObject): JsonObject {
