@@ -42,7 +42,7 @@ curl -sS https://cursor2api.freetavily.deno.net/v1/chat/completions \
 | 能力 | 状态 | 用户侧含义 |
 |------|------|------------|
 | 文本聊天 | 可用 | OpenAI `/v1/chat/completions`、Anthropic `/v1/messages` |
-| 流式 `stream: true` | 可用，但不逐字推 | 能收到 SSE；正文往往等这一轮结束后一次性出来。工具调用仍是一整块，不会拆碎 |
+| 流式 `stream: true` | 可用 | 正文和思考跟 Cursor 后端增量推 SSE。工具调用仍是一整块，不会拆碎 |
 | 工具调用 | 可用 | 和 OpenAI / Anthropic 一样：先拿到 `tool_calls` / `tool_use`，本地执行后再回传结果 |
 | `system` 提示 | 可用 | 同一会话里，系统提示只在第一轮生效 |
 | 上下文缓存 | 部分可用 | 同一条对话（第一条 user + 模型 / 工具 / 系统提示不变）会复用 Cursor 会话。不必传 `x-session-id`。Deno Deploy 用 KV 只记会话 id（不存聊天正文），换实例也能续上。工具执行（`tool_calls` 到回传 `role: tool`）必须在**同一进程**里完成；换实例后会把工具结果折进新的 user 消息继续 |

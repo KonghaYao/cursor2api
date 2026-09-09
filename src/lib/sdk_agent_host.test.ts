@@ -268,6 +268,31 @@ test("in-repo host collects thinkingDelta and sends selectedImages", async () =>
   await agent.close();
 });
 
+test("in-repo host onDelta emits thinking and text before wait resolves", async () => {
+  const duplex = new InteractiveDuplex();
+  duplex.onSend = (message) => {
+    if (field(message, "runRequest")) {
+      duplex.push({ interactionUpdate: { thinkingDelta: { text: "hmm" } } });
+      duplex.push({ interactionUpdate: { textDelta: { text: "hel" } } });
+      duplex.push({ interactionUpdate: { textDelta: { text: "lo" } } });
+    }
+  };
+  const host = createSdkAgentHost({
+    openRun: async () => duplex,
+    exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+  });
+  const agent = await host.create({ apiKey: "crsr_test", model: "composer-2.5", customTools: {} });
+  const deltas: Array<{ text?: string; thinking?: string }> = [];
+  const run = await agent.send("ping", { onDelta: (chunk) => deltas.push({ ...chunk }) });
+  await waitFor(() => (deltas.length >= 3 ? true : undefined));
+  assert.deepEqual(deltas, [{ thinking: "hmm" }, { text: "hel" }, { text: "lo" }]);
+  duplex.push({ interactionUpdate: { turnEnded: {} } });
+  const result = await run.wait();
+  assert.equal(result.thinking, "hmm");
+  assert.equal(result.text, "hello");
+  await agent.close();
+});
+
 async function waitFor<T>(fn: () => T | undefined, timeoutMs = 1000): Promise<T> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {

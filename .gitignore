@@ -7,5 +7,6 @@ node_modules/
 .wrangler/
 .dev.vars
 deno.lock
+.peri/
 reports/
 *.csv

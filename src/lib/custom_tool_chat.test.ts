@@ -463,3 +463,121 @@ test("KV message length cursor forwards every new user after an isolate hop", as
   assert.doesNotMatch(prompts[1] || "", /^one$/m);
   assert.doesNotMatch(prompts[1] || "", /^ok$/m);
 });
+
+async function consumeSse(
+  body: ReadableStream<Uint8Array> | null,
+  afterRole: () => void,
+  until: (buf: string) => boolean,
+): Promise<string> {
+  if (!body) throw new Error("missing body");
+  const reader = body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  let kicked = false;
+  while (true) {
+    if (!kicked && buf.includes('"role":"assistant"')) {
+      kicked = true;
+      afterRole();
+    }
+    if (until(buf)) return buf;
+    const { done, value } = await reader.read();
+    if (value) buf += dec.decode(value, { stream: true });
+    if (done) {
+      if (!kicked) afterRole();
+      return buf;
+    }
+  }
+}
+
+test("OpenAI stream=true forwards AgentService thinking and text deltas", async () => {
+  let onDelta: ((chunk: { text?: string; thinking?: string }) => void) | undefined;
+  let finish!: (result: { text: string; thinking: string }) => void;
+  const finished = new Promise<{ text: string; thinking: string }>((resolve) => {
+    finish = resolve;
+  });
+  setCustomToolAgentHostForTests({
+    async create() {
+      return {
+        agentId: "agent-sse",
+        async send(_prompt, opts) {
+          onDelta = opts?.onDelta;
+          return { wait: () => finished };
+        },
+        async close() {},
+      };
+    },
+  });
+  const res = await handleCustomToolChatCompletions({
+    headers: new Headers({ authorization: "Bearer crsr_test" }),
+    body: {
+      model: "composer-2.5",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    },
+    tools: [],
+  });
+  assert.equal(res.status, 200);
+  const sse = await consumeSse(
+    res.body,
+    () => {
+      assert.ok(onDelta, "send() should pass onDelta");
+      onDelta!({ thinking: "hmm" });
+      onDelta!({ text: "hel" });
+      onDelta!({ text: "lo" });
+      finish({ text: "hello", thinking: "hmm" });
+    },
+    (buf) => buf.includes("data: [DONE]"),
+  );
+  assert.match(sse, /"reasoning_content":"hmm"/);
+  assert.match(sse, /"content":"hel"/);
+  assert.match(sse, /"content":"lo"/);
+  assert.equal(sse.includes('"content":"hello"'), false);
+  assert.match(sse, /"finish_reason":"stop"/);
+});
+
+test("Anthropic stream=true forwards thinking then text deltas", async () => {
+  let onDelta: ((chunk: { text?: string; thinking?: string }) => void) | undefined;
+  let finish!: (result: { text: string; thinking: string }) => void;
+  const finished = new Promise<{ text: string; thinking: string }>((resolve) => {
+    finish = resolve;
+  });
+  setCustomToolAgentHostForTests({
+    async create() {
+      return {
+        agentId: "agent-asyn",
+        async send(_prompt, opts) {
+          onDelta = opts?.onDelta;
+          return { wait: () => finished };
+        },
+        async close() {},
+      };
+    },
+  });
+  const res = await handleCustomToolMessages({
+    headers: new Headers({ "x-api-key": "crsr_test" }),
+    body: {
+      model: "grok-4.6-fast",
+      stream: true,
+      max_tokens: 64,
+      messages: [{ role: "user", content: "hi" }],
+    },
+    tools: [],
+    requestId: "req_sse",
+  });
+  assert.equal(res.status, 200);
+  const sse = await consumeSse(
+    res.body,
+    () => {
+      assert.ok(onDelta);
+      onDelta!({ thinking: "plan" });
+      onDelta!({ text: "ok" });
+      finish({ text: "ok", thinking: "plan" });
+    },
+    (buf) => buf.includes("message_stop"),
+  );
+  assert.match(sse, /thinking_delta/);
+  assert.match(sse, /"thinking":"plan"/);
+  assert.match(sse, /text_delta/);
+  assert.match(sse, /"text":"ok"/);
+});
+

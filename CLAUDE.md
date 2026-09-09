@@ -84,7 +84,7 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 
 Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。不要为了半双工去装 `@cursor/sdk` 或走官方 `local.useHttp1ForAgent`（那是 SDK 的 RunSSE / HTTP/1.1 退路，带二进制）。
 
-`stream: true` 的 `tool_calls` 仍须 **一条完整 delta**（见 2026-08-31）。会话 id 由网关内部计算（`tenant:agentRunFp`），**不要**再靠客户端 `x-session-id`；`SESSION_MODE=random` 不行。
+`stream: true` 的 `tool_calls` 仍须 **一条完整 delta**（见 2026-08-31）。文本 / thinking 跟 AgentService `textDelta` / `thinkingDelta` 增量转成 SSE。会话 id 由网关内部计算（`tenant:agentRunFp`），**不要**再靠客户端 `x-session-id`；`SESSION_MODE=random` 不行。
 
 客户端 `usage`：从 `interactionUpdate.turnEnded` 读 token 字段（proto JSON 的 `inputTokens` 等，uint64 可能是字符串），映射成 OpenAI `prompt_tokens` / `cached_tokens` 与 Anthropic `input_tokens` / `cache_read_input_tokens`。同一 `send()` 内多段 turnEnded 相加。park 成 `tool_calls` 时 turn 还没结束，那一枪 usage 为 0。不要为了 usage 去调 Cloud `getUsage` 或装 SDK。
 

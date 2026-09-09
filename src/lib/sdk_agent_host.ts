@@ -103,7 +103,7 @@ export function createSdkAgentHost(opts?: {
 
       const handle: CustomToolAgentHandle = {
         agentId,
-        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[] }) {
+        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void }) {
           if (closed) throw new Error("agent is closed");
           const run = runTurn({
             openRun,
@@ -115,6 +115,7 @@ export function createSdkAgentHost(opts?: {
             cwd,
             prompt,
             images: sendOpts?.images,
+            onDelta: sendOpts?.onDelta,
             tools,
             customTools: createOpts.customTools,
             blobs,
@@ -145,6 +146,7 @@ async function runTurn(opts: {
   cwd: string;
   prompt: string;
   images?: AgentInlineImage[];
+  onDelta?: (chunk: { text?: string; thinking?: string }) => void;
   tools: CustomToolSpec[];
   customTools: SdkCustomToolMap;
   blobs: Map<string, string>;
@@ -201,10 +203,12 @@ async function runTurn(opts: {
       }
       if (parsed.kind === "textDelta") {
         text += parsed.text;
+        if (parsed.text) opts.onDelta?.({ text: parsed.text });
         continue;
       }
       if (parsed.kind === "thinkingDelta") {
         thinking += parsed.text;
+        if (parsed.text) opts.onDelta?.({ thinking: parsed.text });
         continue;
       }
       if (parsed.kind === "checkpoint") {

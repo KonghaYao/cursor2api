@@ -564,6 +564,9 @@ export function parseServerMessage(raw: unknown): ServerCase {
     const thinkingDelta = asObject(field(inner, "thinkingDelta", "thinking_delta"));
     if (thinkingDelta) return { kind: "thinkingDelta", text: String(field(thinkingDelta, "text") || "") };
     const type = String(field(inner, "type") || "");
+    if (type === "text-delta" || type === "text_delta") {
+      return { kind: "textDelta", text: String(field(inner, "text") || "") };
+    }
     if (type === "thinking-delta" || type === "thinking_delta") {
       return { kind: "thinkingDelta", text: String(field(inner, "text") || "") };
     }

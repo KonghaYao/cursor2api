@@ -181,6 +181,10 @@ test("parseServerMessage reads thinkingDelta (proto oneof and SDK type)", () => 
     parseServerMessage({ interactionUpdate: { type: "thinking-delta", text: "step 3" } }),
     { kind: "thinkingDelta", text: "step 3" },
   );
+  assert.deepEqual(
+    parseServerMessage({ interactionUpdate: { type: "text-delta", text: "Hello" } }),
+    { kind: "textDelta", text: "Hello" },
+  );
 });
 
 test("buildRunRequest attaches inline images and clientSupportsInlineImages", () => {

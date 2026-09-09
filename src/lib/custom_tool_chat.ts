@@ -276,11 +276,18 @@ export function composeCustomToolTurnPrompt(opts: {
 
 export type CustomToolTurnResult = { text: string; thinking?: string; error?: string; usage?: AgentTurnUsage };
 
+export type AgentStreamDelta = { text?: string; thinking?: string };
+
+export type CustomToolSendOpts = {
+  images?: AgentInlineImage[];
+  onDelta?: (chunk: AgentStreamDelta) => void;
+};
+
 export type CustomToolAgentHandle = {
   agentId: string;
   send: (
     prompt: string,
-    opts?: { images?: AgentInlineImage[] },
+    opts?: CustomToolSendOpts,
   ) => Promise<{ wait: () => Promise<CustomToolTurnResult> }>;
   close: () => Promise<void>;
 };
@@ -302,6 +309,80 @@ export type CustomToolAgentHost = {
   create: (opts: CustomToolAgentCreateOpts) => Promise<CustomToolAgentHandle>;
 };
 
+type TextDeltaHub = {
+  streamedText: string;
+  streamedThinking: string;
+  ackedText: number;
+  ackedThinking: number;
+  push: (chunk: AgentStreamDelta) => void;
+  subscribe: (fn: () => void) => () => void;
+};
+
+function createTextDeltaHub(): TextDeltaHub {
+  let streamedText = "";
+  let streamedThinking = "";
+  let ackedText = 0;
+  let ackedThinking = 0;
+  const waiters = new Set<() => void>();
+  return {
+    get streamedText() {
+      return streamedText;
+    },
+    get streamedThinking() {
+      return streamedThinking;
+    },
+    get ackedText() {
+      return ackedText;
+    },
+    set ackedText(value: number) {
+      ackedText = value;
+    },
+    get ackedThinking() {
+      return ackedThinking;
+    },
+    set ackedThinking(value: number) {
+      ackedThinking = value;
+    },
+    push(chunk: AgentStreamDelta) {
+      let changed = false;
+      if (chunk.text) {
+        streamedText += chunk.text;
+        changed = true;
+      }
+      if (chunk.thinking) {
+        streamedThinking += chunk.thinking;
+        changed = true;
+      }
+      if (changed) for (const fn of waiters) fn();
+    },
+    subscribe(fn: () => void) {
+      waiters.add(fn);
+      return () => {
+        waiters.delete(fn);
+      };
+    },
+  };
+}
+
+function longerText(a?: string, b?: string): string {
+  const x = a || "";
+  const y = b || "";
+  return x.length >= y.length ? x : y;
+}
+
+function ackLiveDeltas(live: LiveTurn, thinking?: string, text?: string): void {
+  live.deltas.ackedThinking = Math.max(
+    live.deltas.ackedThinking,
+    (thinking || "").length,
+    live.deltas.streamedThinking.length,
+  );
+  live.deltas.ackedText = Math.max(
+    live.deltas.ackedText,
+    (text || "").length,
+    live.deltas.streamedText.length,
+  );
+}
+
 type LiveTurn = {
   agent: CustomToolAgentHandle;
   session: ClientToolSession;
@@ -311,6 +392,7 @@ type LiveTurn = {
   thinking?: string;
   error?: string;
   usage?: AgentTurnUsage;
+  deltas: TextDeltaHub;
 };
 
 const liveTurns = new Map<string, LiveTurn>();
@@ -515,7 +597,11 @@ async function startCustomToolTurn(opts: {
   if (priorMessageCount && messages.length > priorMessageCount) {
     console.log(`  custom_tools slice prior=${priorMessageCount} n=${messages.length}`);
   }
-  const run = await agent.send(prompt, images.length ? { images } : undefined);
+  const deltas = createTextDeltaHub();
+  const run = await agent.send(prompt, {
+    ...(images.length ? { images } : {}),
+    onDelta: (chunk) => deltas.push(chunk),
+  });
   await persistCommittedLength();
   const live: LiveTurn = {
     agent,
@@ -523,6 +609,7 @@ async function startCustomToolTurn(opts: {
     wait: run.wait,
     done: false,
     text: "",
+    deltas,
   };
   session.agentId = agent.agentId;
   liveTurns.set(key, live);
@@ -643,6 +730,7 @@ export async function handleCustomToolChatCompletions(opts: {
     offerClientToolBatch(started.session, settled.batch);
     const toolCalls = clientToolsToOpenAi(settled.batch);
     console.log(`  custom_tools park ${toolCalls.map((c) => c.function.name).join(",")}`);
+    ackLiveDeltas(started.live, started.live.thinking, started.live.text);
     return jsonResponse(
       200,
       openAiCompletion({
@@ -658,6 +746,7 @@ export async function handleCustomToolChatCompletions(opts: {
   }
   const result = started.live.done ? liveResult(started.live) : await started.live.wait();
   logAgentUsage(result.usage);
+  ackLiveDeltas(started.live, result.thinking, result.text);
   return jsonResponse(
     200,
     openAiCompletion({
@@ -697,6 +786,7 @@ export async function handleCustomToolMessages(opts: {
   if (settled.kind === "tools") {
     offerClientToolBatch(started.session, settled.batch);
     const toolUses = clientToolsToAnthropic(settled.batch);
+    ackLiveDeltas(started.live, started.live.thinking, started.live.text);
     return jsonResponse(200, {
       id: `msg_${agentId}`,
       type: "message",
@@ -711,6 +801,7 @@ export async function handleCustomToolMessages(opts: {
   }
   const result = started.live.done ? liveResult(started.live) : await started.live.wait();
   logAgentUsage(result.usage);
+  ackLiveDeltas(started.live, result.thinking, result.text);
   return jsonResponse(200, {
     id: `msg_${agentId}`,
     type: "message",
@@ -732,7 +823,7 @@ function streamCustomOpenAi(opts: {
   agentId: string;
   signal?: AbortSignal;
 }): Promise<Response> {
-  const { live, session, sessionId, model, agentId, signal } = opts;
+  const { live, session, sessionId, model, agentId } = opts;
   const created = Math.floor(Date.now() / 1000);
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -747,15 +838,34 @@ function streamCustomOpenAi(opts: {
           conversation_id: sessionId,
           ...extra,
         });
+      let emittedThinking = live.deltas.ackedThinking;
+      let emittedText = live.deltas.ackedText;
+      const flush = () => {
+        const thinking = longerText(live.thinking, live.deltas.streamedThinking);
+        const text = longerText(live.text, live.deltas.streamedText);
+        if (thinking.length > emittedThinking) {
+          controller.enqueue(chunk({ reasoning_content: thinking.slice(emittedThinking) }));
+          emittedThinking = thinking.length;
+        }
+        if (text.length > emittedText) {
+          controller.enqueue(chunk({ content: text.slice(emittedText) }));
+          emittedText = text.length;
+        }
+      };
       try {
         controller.enqueue(chunk({ role: "assistant" }));
+        const unsub = live.deltas.subscribe(flush);
+        flush();
         const settled = await settleCustomTools(session, live);
-        if (live.thinking) controller.enqueue(chunk({ reasoning_content: live.thinking }));
-        if (live.text) controller.enqueue(chunk({ content: live.text }));
+        unsub();
+        flush();
+        live.deltas.ackedThinking = emittedThinking;
+        live.deltas.ackedText = emittedText;
         const usage = openaiUsageFromAgent(live.usage);
         if (settled.kind === "tools") {
           offerClientToolBatch(session, settled.batch);
           const toolCalls = clientToolsToOpenAi(settled.batch);
+          console.log(`  custom_tools park ${toolCalls.map((c) => c.function.name).join(",")}`);
           controller.enqueue(chunk({ tool_calls: toolCalls }));
           controller.enqueue(chunk({}, "tool_calls", { usage }));
           controller.enqueue(
@@ -826,10 +936,66 @@ function streamCustomAnthropic(opts: {
   requestId: string;
   signal?: AbortSignal;
 }): Promise<Response> {
-  const { live, session, model, agentId, requestId, signal } = opts;
+  const { live, session, model, agentId, requestId } = opts;
   const msgId = `msg_${agentId}`;
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      let index = 0;
+      let open: "thinking" | "text" | null = null;
+      let emittedThinking = live.deltas.ackedThinking;
+      let emittedText = live.deltas.ackedText;
+      const closeOpen = () => {
+        if (!open) return;
+        controller.enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index }));
+        index += 1;
+        open = null;
+      };
+      const flush = () => {
+        const thinking = longerText(live.thinking, live.deltas.streamedThinking);
+        const text = longerText(live.text, live.deltas.streamedText);
+        if (thinking.length > emittedThinking) {
+          if (open !== "thinking") {
+            closeOpen();
+            controller.enqueue(
+              encodeSseEvent("content_block_start", {
+                type: "content_block_start",
+                index,
+                content_block: { type: "thinking", thinking: "" },
+              }),
+            );
+            open = "thinking";
+          }
+          controller.enqueue(
+            encodeSseEvent("content_block_delta", {
+              type: "content_block_delta",
+              index,
+              delta: { type: "thinking_delta", thinking: thinking.slice(emittedThinking) },
+            }),
+          );
+          emittedThinking = thinking.length;
+        }
+        if (text.length > emittedText) {
+          if (open !== "text") {
+            closeOpen();
+            controller.enqueue(
+              encodeSseEvent("content_block_start", {
+                type: "content_block_start",
+                index,
+                content_block: { type: "text", text: "" },
+              }),
+            );
+            open = "text";
+          }
+          controller.enqueue(
+            encodeSseEvent("content_block_delta", {
+              type: "content_block_delta",
+              index,
+              delta: { type: "text_delta", text: text.slice(emittedText) },
+            }),
+          );
+          emittedText = text.length;
+        }
+      };
       try {
         controller.enqueue(
           encodeSseEvent("message_start", {
@@ -844,32 +1010,14 @@ function streamCustomAnthropic(opts: {
             },
           }),
         );
+        const unsub = live.deltas.subscribe(flush);
+        flush();
         const settled = await settleCustomTools(session, live);
-        let index = 0;
-        if (live.thinking) {
-          controller.enqueue(
-            encodeSseEvent("content_block_start", {
-              type: "content_block_start",
-              index,
-              content_block: { type: "thinking", thinking: "" },
-            }),
-          );
-          controller.enqueue(
-            encodeSseEvent("content_block_delta", {
-              type: "content_block_delta",
-              index,
-              delta: { type: "thinking_delta", thinking: live.thinking },
-            }),
-          );
-          controller.enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index }));
-          index += 1;
-        }
-        if (live.text) {
-          controller.enqueue(encodeSseEvent("content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } }));
-          controller.enqueue(encodeSseEvent("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: live.text } }));
-          controller.enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index }));
-          index += 1;
-        }
+        unsub();
+        flush();
+        closeOpen();
+        live.deltas.ackedThinking = emittedThinking;
+        live.deltas.ackedText = emittedText;
         if (settled.kind === "tools") {
           offerClientToolBatch(session, settled.batch);
           for (const call of clientToolsToAnthropic(settled.batch)) {
