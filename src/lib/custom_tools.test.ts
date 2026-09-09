@@ -90,7 +90,6 @@ test("extractLatestClientToolResults keeps only the last assistant tool round", 
     extractLatestClientToolResults(full).map((r) => r.id),
     ["call_2"],
   );
-  assert.equal(extractLatestClientToolResults(full)[0]?.name, "lookup");
   assert.deepEqual(
     extractClientToolResults(full).map((r) => r.id),
     ["call_1", "call_2"],
@@ -103,8 +102,8 @@ test("extractLatestClientToolResults keeps only the last assistant tool round", 
     { role: "user", content: [{ type: "tool_result", tool_use_id: "u2", content: "new" }] },
   ];
   assert.deepEqual(
-    extractLatestClientToolResults(anthropic).map((r) => ({ id: r.id, content: r.content, name: r.name })),
-    [{ id: "u2", content: "new", name: "lookup" }],
+    extractLatestClientToolResults(anthropic).map((r) => ({ id: r.id, content: r.content })),
+    [{ id: "u2", content: "new" }],
   );
 });
 
@@ -124,7 +123,7 @@ test("parked customTools.execute resolves when the client posts tool results", a
   assert.match(result.content[0]!.text, /temp/);
 });
 
-test("system is folded into first-shot user prompt by default", () => {
+test("system and Anthropic body.system are read but not folded into the user prompt", () => {
   const openai = systemPromptFromClient({
     messages: [
       { role: "system", content: "Reply with exactly TOKEN" },
@@ -142,8 +141,8 @@ test("system is folded into first-shot user prompt by default", () => {
     tools: [],
     messages: [{ role: "system", content: "secret ALPHA" }, { role: "user", content: "code?" }],
   });
-  assert.match(prompt, /<system>\nsecret ALPHA\n<\/system>/);
-  assert.match(prompt, /code\?/);
+  assert.equal(prompt, "code?");
+  assert.doesNotMatch(prompt, /<system>/);
   const follow = composeCustomToolPrompt({
     body: {
       messages: [
@@ -165,37 +164,9 @@ test("system is folded into first-shot user prompt by default", () => {
   assert.equal(follow, "second");
   assert.equal(follow.includes("secret ALPHA"), false);
   assert.equal(follow.includes("first"), false);
-  const followWithTools = composeCustomToolPrompt({
-    body: { messages: [{ role: "user", content: "second" }] },
-    tools: openaiToolsToCustom([{ type: "function", function: { name: "lookup" } }]),
-    messages: [
-      { role: "user", content: "first" },
-      { role: "assistant", content: "ok" },
-      { role: "user", content: "second" },
-    ],
-    followUp: true,
-  });
-  assert.equal(followWithTools, "second");
 });
 
-test("GATEWAY_FOLD_SYSTEM=0 keeps first-shot user prompt without <system>", () => {
-  const prev = process.env.GATEWAY_FOLD_SYSTEM;
-  process.env.GATEWAY_FOLD_SYSTEM = "0";
-  try {
-    const prompt = composeCustomToolPrompt({
-      body: { messages: [{ role: "system", content: "secret ALPHA" }, { role: "user", content: "code?" }] },
-      tools: [],
-      messages: [{ role: "system", content: "secret ALPHA" }, { role: "user", content: "code?" }],
-    });
-    assert.equal(prompt, "code?");
-    assert.doesNotMatch(prompt, /<system>/);
-  } finally {
-    if (prev === undefined) delete process.env.GATEWAY_FOLD_SYSTEM;
-    else process.env.GATEWAY_FOLD_SYSTEM = prev;
-  }
-});
-
-test("composeCustomToolTurnPrompt does not reship full tool history on a warm thread", () => {
+test("composeCustomToolTurnPrompt leaves tool history off the user action", () => {
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "lookup" } }]);
   const messages = [
     { role: "system", content: "be brief" },
@@ -215,21 +186,9 @@ test("composeCustomToolTurnPrompt does not reship full tool history on a warm th
   ];
   const body = { model: "composer-2.5", messages };
   const warm = composeCustomToolTurnPrompt({ body, tools, messages, hadPriorTurn: true });
-  assert.match(warm, /call_2/);
-  assert.match(warm, /humidity/);
-  assert.match(warm, /<gw_tool_results>/);
-  assert.doesNotMatch(warm, /call_1/);
-  assert.doesNotMatch(warm, /weather in tokyo/);
-  assert.doesNotMatch(warm, /<system>/);
-  assert.doesNotMatch(warm, /executed your custom tools/);
-
+  assert.equal(warm, "");
   const cold = composeCustomToolTurnPrompt({ body, tools, messages, hadPriorTurn: false });
-  assert.match(cold, /call_1/);
-  assert.match(cold, /call_2/);
-  assert.match(cold, /weather in tokyo/);
-  assert.match(cold, /<gw_tool_results>/);
-  assert.match(cold, /<system>/);
-  assert.match(cold, /be brief/);
+  assert.equal(cold, "");
 
   const nextUser = composeCustomToolTurnPrompt({
     body,
@@ -271,16 +230,13 @@ test("composeCustomToolTurnPrompt slices multiple new users after priorMessageCo
   assert.equal(sameLen, "first");
 });
 
-test("composeToolResultPrompt wraps gw_tool_results JSON", () => {
-  const text = composeToolResultPrompt([{ id: "call_1", name: "lookup", content: '{"temp":22}' }]);
-  assert.match(text, /<gw_tool_results>/);
+test("composeToolResultPrompt lists client tool output", () => {
+  const text = composeToolResultPrompt([{ id: "call_1", content: '{"temp":22}' }]);
   assert.match(text, /call_1/);
-  assert.match(text, /"name":"lookup"/);
   assert.match(text, /22/);
   const failed = composeToolResultPrompt([{ id: "call_2", content: "lookup failed", isError: true }]);
-  assert.match(failed, /call_2/);
+  assert.match(failed, /call_2 ERROR:/);
   assert.match(failed, /lookup failed/);
-  assert.match(failed, /"is_error":true/);
 });
 
 test("sdk local agent allowlists only mcp so customTools work and builtins stay off", () => {

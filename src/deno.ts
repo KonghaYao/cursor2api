@@ -57,9 +57,9 @@ if (isDeploy) {
 }
 
 if (upstream === "cloud") {
-  console.log("  deno  chat → AgentService/Run (empty mcpTools; parse <gw_tool_call>)");
+  console.log("  deno  chat → AgentService/Run customTools (MCP family; spliced conversationState)");
   console.log("  models GET https://api.cursor.com/v1/models");
-  console.log("  tools    MCP family header only; fold system into first user (GATEWAY_FOLD_SYSTEM=0 to send customSystemPrompt)");
+  console.log("  tools    MCP family header + in-process custom-user-tools; no customSystemPrompt");
 } else {
   console.log("  deno  InferenceService/Stream  (dead for Dashboard crsr_ keys)");
 }

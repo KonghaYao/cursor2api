@@ -1,12 +1,13 @@
 /**
- * OpenAI/Anthropic function tools → gateway catalog + `<gw_tool_results>`.
+ * OpenAI/Anthropic function tools → in-process Cursor customTools.
  *
- * Upstream AgentService runs text-only (empty mcpTools). The chat path parses
- * `<gw_tool_call>` after turnEnded. Park helpers below are leftover for unit
- * tests, not the product path.
+ * customTools.execute() runs in this process (AgentService MCP executor). We park it and
+ * return OpenAI tool_calls so the gateway client executes the real tool.
+ * This is not HTTP MCP: Cloud VMs never call us back.
+ *
+ * stream=true: complete tool_calls in one delta (Cursor Agent, 2026-08-31).
  */
 import { randomId } from "./bytes.ts";
-import { composeGwToolResultsPrompt } from "./text_tool_calls.ts";
 
 export const CUSTOM_TOOL_PARK_TIMEOUT_MS = 9 * 60 * 1000;
 export const CUSTOM_TOOL_PARALLEL_DEBOUNCE_MS = 50;
@@ -208,50 +209,18 @@ function contentToText(content: unknown): string {
     .join("\n");
 }
 
-export type ClientToolResult = { id: string; name?: string; content: string; isError?: boolean };
-
-function toolNamesById(messages: unknown[]): Map<string, string> {
-  const names = new Map<string, string>();
-  for (const m of messages) {
-    if (!m || typeof m !== "object") continue;
-    const rec = m as Record<string, unknown>;
-    if (String(rec.role || "").toLowerCase() !== "assistant") continue;
-    if (Array.isArray(rec.tool_calls)) {
-      for (const raw of rec.tool_calls) {
-        if (!raw || typeof raw !== "object") continue;
-        const tc = raw as Record<string, unknown>;
-        const id = String(tc.id || "").trim();
-        const fn = tc.function && typeof tc.function === "object" ? (tc.function as Record<string, unknown>) : tc;
-        const name = String(fn.name || tc.name || "").trim();
-        if (id && name) names.set(id, name);
-      }
-    }
-    if (!Array.isArray(rec.content)) continue;
-    for (const block of rec.content) {
-      if (!block || typeof block !== "object") continue;
-      const b = block as Record<string, unknown>;
-      if (String(b.type || "") !== "tool_use") continue;
-      const id = String(b.id || "").trim();
-      const name = String(b.name || "").trim();
-      if (id && name) names.set(id, name);
-    }
-  }
-  return names;
-}
+export type ClientToolResult = { id: string; content: string; isError?: boolean };
 
 export function composeToolResultPrompt(results: ClientToolResult[]): string {
-  return composeGwToolResultsPrompt(
-    results.map((r) => ({
-      id: r.id,
-      name: r.name,
-      content: r.content,
-      isError: r.isError,
-    })),
-  );
+  const lines = results.map((r) => (r.isError ? `- ${r.id} ERROR: ${r.content}` : `- ${r.id}: ${r.content}`));
+  return [
+    "The client executed your custom tools. Results:",
+    ...lines,
+    "Continue from these results. Do not call the same tools again unless you need new data.",
+  ].join("\n");
 }
 
-export function extractClientToolResults(messages: unknown[], names?: Map<string, string>): ClientToolResult[] {
-  const byId = names ?? toolNamesById(messages);
+export function extractClientToolResults(messages: unknown[]): ClientToolResult[] {
   const out: ClientToolResult[] = [];
   for (const m of messages) {
     if (!m || typeof m !== "object") continue;
@@ -260,10 +229,8 @@ export function extractClientToolResults(messages: unknown[], names?: Map<string
     if (role === "tool" || role === "function") {
       const id = String(rec.tool_call_id || rec.toolCallId || rec.id || "").trim();
       if (!id) continue;
-      const name = String(rec.name || byId.get(id) || "").trim() || undefined;
       out.push({
         id,
-        name,
         content: contentToText(rec.content) || "",
         isError: Boolean(rec.is_error || rec.isError),
       });
@@ -278,7 +245,6 @@ export function extractClientToolResults(messages: unknown[], names?: Map<string
       if (!id) continue;
       out.push({
         id,
-        name: byId.get(id),
         content: contentToText(b.content ?? b.text) || "",
         isError: Boolean(b.is_error || b.isError),
       });
@@ -302,15 +268,14 @@ function assistantHasToolCalls(message: unknown): boolean {
 /**
  * Clients (Cursor Agent) resend the full transcript every turn.
  * Only the tool results after the latest assistant tool_calls / tool_use
- * belong on this Run; older rounds already live in conversationState.
- * Names are resolved from the full transcript (the slice starts after the assistant).
+ * belong to the current park; older rounds already live in conversationState.
  */
 export function extractLatestClientToolResults(messages: unknown[]): ClientToolResult[] {
   let from = 0;
   for (let i = 0; i < messages.length; i++) {
     if (assistantHasToolCalls(messages[i])) from = i + 1;
   }
-  return extractClientToolResults(messages.slice(from), toolNamesById(messages));
+  return extractClientToolResults(messages.slice(from));
 }
 
 export function lastTurnIsToolResult(messages: unknown[]): boolean {

@@ -1,8 +1,7 @@
 /**
  * CustomToolAgentHost backed by agent.v1.AgentService/Run (no @cursor/sdk,
  * no agent binary, no Cursor-hosted Cloud Agents sandbox VM).
- * MCP family only on the wire allowlist; upstream mcpTools catalog is empty.
- * Residual mcpArgs from upstream → mcpError (text-only run), not execute/park.
+ * MCP family only; customTools.execute stays in-process (parked by custom_tools.ts).
  */
 import { exchangeApiKey } from "./auth.ts";
 import { randomId } from "./bytes.ts";
@@ -21,20 +20,22 @@ import {
   mcpAllowlistResult,
   mcpErrorResult,
   mcpStateResult,
+  mcpSuccessResult,
   parseKvBlob,
+  parseMcpArgs,
   parseServerMessage,
   readMcpResourceNotFound,
   requestContextResult,
   type AgentInlineImage,
   type AgentTurnUsage,
+  type CustomToolSpec,
   type JsonObject,
 } from "./agent_json.ts";
 import { abortAgentDuplex, closeAgentDuplex, openAgentRun, type OpenAgentRun } from "./agent_run.ts";
-import type { CustomToolAgentHandle, CustomToolAgentHost } from "./custom_tool_chat.ts";
-import { GW_TOOL_CALL_OPEN, MCP_NATIVE_REDIRECT, TEXT_ONLY_MCP_ERROR } from "./text_tool_calls.ts";
+import type { CustomToolAgentHandle, CustomToolAgentHost, SdkCustomToolMap } from "./custom_tool_chat.ts";
 
 const HEARTBEAT_MS = 15_000;
-/** `AbortController.abort(reason)` used by release() — close the Run, do not cancelAction. */
+/** `AbortController.abort(reason)` used when parking tool_calls — close the Run, do not cancelAction. */
 const RELEASE_REASON = "release";
 
 function isJwt(token: string): boolean {
@@ -56,6 +57,14 @@ function readEnv(name: string): string | undefined {
   return undefined;
 }
 
+function specsFromCustomTools(customTools: SdkCustomToolMap): CustomToolSpec[] {
+  return Object.entries(customTools).map(([name, tool]) => ({
+    name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+  }));
+}
+
 async function resolveAccessToken(
   apiKey: string,
   exchange: typeof exchangeApiKey,
@@ -65,11 +74,11 @@ async function resolveAccessToken(
   return exchanged.accessToken;
 }
 
-function assistantLooksLikeTextToolCall(text: string): boolean {
-  if (text.includes(GW_TOOL_CALL_OPEN)) return true;
-  if (/```(?:json)?[\s\S]{0,800}"name"\s*:\s*"[^"]+"\s*,\s*"arguments"/i.test(text)) return true;
-  if (/"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:/.test(text)) return true;
-  return false;
+function contentToText(result: { content?: Array<{ type?: string; text?: string }>; isError?: boolean }): string {
+  const parts = Array.isArray(result.content) ? result.content : [];
+  const text = parts.map((p) => (typeof p?.text === "string" ? p.text : "")).filter(Boolean).join("\n");
+  if (text) return text;
+  return result.isError ? "custom tool failed" : "";
 }
 
 export function createSdkAgentHost(opts?: {
@@ -89,13 +98,14 @@ export function createSdkAgentHost(opts?: {
         reasoningEffort: createOpts.reasoningEffort,
       });
       const cwd = createOpts.cwd || readEnv("GATEWAY_AGENT_CWD") || "/tmp";
+      const tools = specsFromCustomTools(createOpts.customTools);
       const blobs = new Map<string, string>();
       let conversationState: JsonObject | undefined = createOpts.conversationState;
       let closed = false;
 
       const handle: CustomToolAgentHandle = {
         agentId,
-        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void; signal?: AbortSignal; systemPrompt?: string }) {
+        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void; signal?: AbortSignal; conversationState?: JsonObject; blobs?: Map<string, string>; resume?: boolean }) {
           if (closed) throw new Error("agent is closed");
           const abort = new AbortController();
           const onClientAbort = () => abort.abort();
@@ -104,6 +114,10 @@ export function createSdkAgentHost(opts?: {
             if (clientSignal.aborted) abort.abort();
             else clientSignal.addEventListener("abort", onClientAbort, { once: true });
           }
+          if (sendOpts?.blobs) {
+            for (const [id, data] of sendOpts.blobs) blobs.set(id, data);
+          }
+          if (sendOpts?.conversationState) conversationState = sendOpts.conversationState;
           const run = runTurn({
             openRun,
             accessToken,
@@ -116,9 +130,11 @@ export function createSdkAgentHost(opts?: {
             images: sendOpts?.images,
             onDelta: sendOpts?.onDelta,
             signal: abort.signal,
-            systemPrompt: sendOpts?.systemPrompt,
+            tools,
+            customTools: createOpts.customTools,
             blobs,
             conversationState,
+            resume: Boolean(sendOpts?.resume),
             onCheckpoint: (state) => {
               conversationState = state;
               createOpts.onCheckpoint?.(state);
@@ -176,9 +192,11 @@ async function runTurn(opts: {
   images?: AgentInlineImage[];
   onDelta?: (chunk: { text?: string; thinking?: string }) => void;
   signal?: AbortSignal;
-  systemPrompt?: string;
+  tools: CustomToolSpec[];
+  customTools: SdkCustomToolMap;
   blobs: Map<string, string>;
   conversationState?: JsonObject;
+  resume?: boolean;
   onCheckpoint: (state: JsonObject) => void;
 }): Promise<{ text: string; thinking?: string; error?: string; usage?: AgentTurnUsage }> {
   let duplex: Awaited<ReturnType<OpenAgentRun>> | undefined;
@@ -197,9 +215,6 @@ async function runTurn(opts: {
   let thinking = "";
   let error: string | undefined;
   let usage: AgentTurnUsage | undefined;
-  let conversationState = opts.conversationState;
-  let nudgedForTextTools = false;
-  const wantsTextTools = opts.prompt.includes(GW_TOOL_CALL_OPEN);
   const inflight = new Set<Promise<void>>();
   let heartbeat: ReturnType<typeof setInterval> | undefined;
 
@@ -235,11 +250,11 @@ async function runTurn(opts: {
           conversationId: opts.conversationId,
           runId,
           agentSessionId: opts.agentSessionId,
-          tools: [],
+          tools: opts.tools,
           conversationState: opts.conversationState,
           cwd: opts.cwd,
           images: opts.images,
-          systemPrompt: opts.systemPrompt,
+          resume: opts.resume,
         }),
       ),
     );
@@ -264,7 +279,6 @@ async function runTurn(opts: {
         continue;
       }
       if (parsed.kind === "checkpoint") {
-        conversationState = parsed.state;
         opts.onCheckpoint(parsed.state);
         continue;
       }
@@ -274,35 +288,6 @@ async function runTurn(opts: {
       }
       if (parsed.kind === "turnEnded") {
         usage = mergeAgentTurnUsage(usage, parsed.usage);
-        if (
-          wantsTextTools &&
-          !nudgedForTextTools &&
-          !cancelled &&
-          !error &&
-          !assistantLooksLikeTextToolCall(text)
-        ) {
-          nudgedForTextTools = true;
-          await duplex.send(
-            clientRunMessage(
-              buildRunRequest({
-                prompt: [
-                  MCP_NATIVE_REDIRECT,
-                  "Your last reply had no <gw_tool_call> block. Native Shell/MCP/lookup calls will not work.",
-                  "Write one catalog <gw_tool_call> now and stop. Do not write a table of unavailable tools.",
-                ].join(" "),
-                modelId: opts.modelId,
-                modelParameters: opts.modelParameters,
-                conversationId: opts.conversationId,
-                runId: randomId(),
-                agentSessionId: opts.agentSessionId,
-                tools: [],
-                conversationState,
-                cwd: opts.cwd,
-              }),
-            ),
-          );
-          continue;
-        }
         break;
       }
       if (parsed.kind === "abort") {
@@ -327,11 +312,11 @@ async function runTurn(opts: {
         const { id, execId } = execIds(parsed.exec);
         const kind = parsed.execKind;
         if (kind === "requestContextArgs" || kind === "request_context_args") {
-          await duplex.send(requestContextResult(id, execId, { cwd: opts.cwd, tools: [] }));
+          await duplex.send(requestContextResult(id, execId, { cwd: opts.cwd, tools: opts.tools }));
           continue;
         }
         if (kind === "mcpStateExecArgs" || kind === "mcp_state_exec_args") {
-          await duplex.send(mcpStateResult(id, execId, []));
+          await duplex.send(mcpStateResult(id, execId, opts.tools));
           continue;
         }
         if (kind === "listMcpResourcesExecArgs" || kind === "list_mcp_resources_exec_args") {
@@ -347,10 +332,29 @@ async function runTurn(opts: {
           continue;
         }
         if (kind === "mcpArgs" || kind === "mcp_args") {
+          const call = parseMcpArgs(parsed.exec);
           track(
             (async () => {
-              if (cancelled) return;
-              await duplex!.send(mcpErrorResult(id, execId, TEXT_ONLY_MCP_ERROR));
+              if (!call?.toolName) {
+                await duplex!.send(mcpErrorResult(id, execId, "missing MCP tool name"));
+                return;
+              }
+              const tool = opts.customTools[call.toolName];
+              if (!tool) {
+                await duplex!.send(mcpErrorResult(id, execId, `Unknown custom tool: ${call.toolName}`));
+                return;
+              }
+              try {
+                const result = await tool.execute(call.args || {}, { toolCallId: call.toolCallId });
+                if (cancelled) return;
+                await duplex!.send(
+                  mcpSuccessResult(id, execId, contentToText(result), Boolean(result.isError)),
+                );
+              } catch (err) {
+                if (cancelled) return;
+                const message = err instanceof Error ? err.message : String(err);
+                await duplex!.send(mcpErrorResult(id, execId, message));
+              }
             })(),
           );
           continue;
@@ -378,4 +382,4 @@ export function defaultSdkAgentHost(): CustomToolAgentHost {
   return createSdkAgentHost();
 }
 
-export type { CustomToolSpec } from "./agent_json.ts";
+export type { CustomToolSpec };

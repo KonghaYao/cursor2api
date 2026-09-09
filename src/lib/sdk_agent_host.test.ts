@@ -5,7 +5,7 @@ import { createSdkAgentHost } from "./sdk_agent_host.ts";
 import type { AgentDuplex, OpenAgentRun } from "./agent_run.ts";
 import type { JsonObject } from "./agent_json.ts";
 import { asObject, field } from "./agent_json.ts";
-import { GW_TOOL_CALL_CLOSE, GW_TOOL_CALL_OPEN } from "./text_tool_calls.ts";
+import { spliceConversationFromClient, utf8FromBlobData } from "./conversation_state.ts";
 
 afterEachClear();
 
@@ -42,7 +42,7 @@ class InteractiveDuplex implements AgentDuplex {
   }
 }
 
-test("in-repo host replies mcpError on mcpArgs without parking execute", async () => {
+test("in-repo host parks customTools.execute and finishes after the tool result", async () => {
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "get_weather" } }]);
   const session = upsertClientToolSession("t", "s", tools);
   const customTools = toSdkCustomTools(session);
@@ -70,8 +70,7 @@ test("in-repo host replies mcpError on mcpArgs without parking execute", async (
       });
       return;
     }
-    const mcpResult = asObject(field(exec, "mcpResult", "mcp_result"));
-    if (field(mcpResult, "error")) {
+    if (field(exec, "mcpResult", "mcp_result")) {
       duplex.push({ interactionUpdate: { textDelta: { text: "22c in Tokyo" } } });
       duplex.push({ interactionUpdate: { turnEnded: {} } });
     }
@@ -85,100 +84,17 @@ test("in-repo host replies mcpError on mcpArgs without parking execute", async (
   const agent = await host.create({ apiKey: "crsr_test", model: "composer-2.5-fast", customTools });
   const run = await agent.send("weather in Tokyo?");
 
-  await waitFor(() =>
-    duplex.sent.find((m) => {
-      const exec = asObject(field(m, "execClientMessage", "exec_client_message"));
-      const err = asObject(field(asObject(field(exec, "mcpResult", "mcp_result")), "error"));
-      return typeof field(err, "error") === "string";
-    }),
-  );
-  assert.equal(session.parked.length, 0);
-  const errorMsg = duplex.sent
-    .map((m) => {
-      const exec = asObject(field(m, "execClientMessage", "exec_client_message"));
-      const err = asObject(field(asObject(field(exec, "mcpResult", "mcp_result")), "error"));
-      return field(err, "error");
-    })
-    .find((v) => typeof v === "string");
-  assert.match(String(errorMsg), /text-only run/);
-  assert.match(String(errorMsg), /ListMcpResources/);
-  assert.match(String(errorMsg), /<gw_tool_call>/);
-  assert.doesNotMatch(String(errorMsg), /not registered/);
+  const parked = await waitFor(() => session.parked.find((p) => !p.offered));
+  assert.equal(parked?.name, "get_weather");
+  assert.equal(parked?.args.city, "Tokyo");
+  parked!.resolve?.({ content: [{ type: "text", text: '{"temp":22}' }] });
 
   const result = await run.wait();
   assert.equal(result.error, undefined);
   assert.equal(result.text, "22c in Tokyo");
-  await agent.close();
-});
-
-test("in-repo host requestContext/mcpState/listMcp advertise no custom-user-tools server", async () => {
-  const duplex = new InteractiveDuplex();
-  duplex.onSend = (message) => {
-    if (field(message, "runRequest", "run_request")) {
-      duplex.push({ execServerMessage: { id: 1, execId: "ctx", requestContextArgs: {} } });
-      return;
-    }
-    const exec = asObject(field(message, "execClientMessage", "exec_client_message"));
-    if (field(exec, "requestContextResult", "request_context_result")) {
-      duplex.push({ execServerMessage: { id: 2, execId: "state", mcpStateExecArgs: {} } });
-      return;
-    }
-    if (field(exec, "mcpStateExecResult", "mcp_state_exec_result")) {
-      duplex.push({ execServerMessage: { id: 3, execId: "list", listMcpResourcesExecArgs: {} } });
-      return;
-    }
-    if (field(exec, "listMcpResourcesExecResult", "list_mcp_resources_exec_result")) {
-      duplex.push({ interactionUpdate: { textDelta: { text: "ok" } } });
-      duplex.push({ interactionUpdate: { turnEnded: {} } });
-    }
-  };
-  const host = createSdkAgentHost({
-    openRun: async () => duplex,
-    exchange: async () => ({ accessToken: "tok", refreshToken: null }),
-  });
-  const agent = await host.create({ apiKey: "crsr_test", model: "composer-2.5", customTools: {} });
-  const result = await (await agent.send("try other tools")).wait();
-  assert.equal(result.text, "ok");
-  const blob = JSON.stringify(duplex.sent);
-  assert.doesNotMatch(blob, /custom-user-tools/);
-  assert.doesNotMatch(blob, /\/bin\/zsh/);
-  assert.doesNotMatch(blob, /Call listed custom tools via MCP/);
-  assert.match(blob, /"servers":\[\]/);
-  assert.match(blob, /"resources":\[\]/);
-  await agent.close();
-});
-
-test("in-repo host nudges once when catalog prompt yields no gw_tool_call", async () => {
-  const duplex = new InteractiveDuplex();
-  let runs = 0;
-  duplex.onSend = (message) => {
-    if (!field(message, "runRequest", "run_request")) return;
-    runs += 1;
-    if (runs === 1) {
-      duplex.push({ interactionUpdate: { textDelta: { text: "I only have MCP" } } });
-      duplex.push({ interactionUpdate: { turnEnded: {} } });
-      return;
-    }
-    duplex.push({
-      interactionUpdate: {
-        textDelta: {
-          text: `${GW_TOOL_CALL_OPEN}{"name":"lookup","arguments":{"q":"tokyo_temp"}}${GW_TOOL_CALL_CLOSE}`,
-        },
-      },
-    });
-    duplex.push({ interactionUpdate: { turnEnded: {} } });
-  };
-  const host = createSdkAgentHost({
-    openRun: async () => duplex,
-    exchange: async () => ({ accessToken: "tok", refreshToken: null }),
-  });
-  const agent = await host.create({ apiKey: "crsr_test", model: "composer-2.5", customTools: {} });
-  const catalog = `${GW_TOOL_CALL_OPEN}\n{"name":"lookup","arguments":{}}\n${GW_TOOL_CALL_CLOSE}`;
-  const result = await (await agent.send(`look up tokyo\n${catalog}`)).wait();
-  assert.equal(runs, 2);
-  assert.match(result.text, /I only have MCP/);
-  assert.match(result.text, /tokyo_temp/);
-  assert.match(result.text, /<gw_tool_call>/);
+  assert.ok(
+    duplex.sent.some((m) => field(asObject(field(m, "execClientMessage")), "mcpResult", "mcp_result")),
+  );
   await agent.close();
 });
 
@@ -441,7 +357,7 @@ test("abort sends ConversationAction.cancelAction then closes the run", async ()
   await agent.close();
 });
 
-test("release closes the run without cancelAction or mcpSuccess", async () => {
+test("release closes the run without cancelAction or mcpResult", async () => {
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "get_weather" } }]);
   const session = upsertClientToolSession("t", "s-release", tools);
   const customTools = toSdkCustomTools(session);
@@ -469,11 +385,10 @@ test("release closes the run without cancelAction or mcpSuccess", async () => {
   });
   const agent = await host.create({ apiKey: "crsr_test", model: "composer-2.5", customTools });
   const run = await agent.send("weather?");
-  await waitFor(() =>
-    duplex.sent.some((m) => field(asObject(field(m, "execClientMessage")), "mcpResult", "mcp_result")),
-  );
-  assert.equal(session.parked.length, 0);
+  const parked = await waitFor(() => session.parked.find((p) => !p.offered));
+  assert.ok(parked);
   run.release?.();
+  parked.resolve?.({ content: [{ type: "text", text: "should-not-reach-cursor" }], isError: true });
   const result = await run.wait();
   assert.equal(result.error, undefined);
   assert.equal(
@@ -481,11 +396,57 @@ test("release closes the run without cancelAction or mcpSuccess", async () => {
     false,
   );
   assert.equal(
-    duplex.sent.some((m) => {
-      const exec = asObject(field(m, "execClientMessage", "exec_client_message"));
-      return field(asObject(field(exec, "mcpResult", "mcp_result")), "success") !== undefined;
-    }),
+    duplex.sent.some((m) => field(asObject(field(m, "execClientMessage")), "mcpResult", "mcp_result")),
     false,
   );
+  await agent.close();
+});
+
+test("in-repo host serves spliced rootPromptMessagesJson blobs on getBlob", async () => {
+  const messages = [
+    { role: "system", content: "be brief" },
+    { role: "user", content: "weather in tokyo?" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: "{}" } }],
+    },
+    { role: "tool", tool_call_id: "call_1", content: '{"temp":22}' },
+  ];
+  const tools = openaiToolsToCustom([{ type: "function", function: { name: "get_weather" } }]);
+  const spliced = await spliceConversationFromClient({ body: { messages }, tools, messages });
+  const firstId = String((spliced.conversationState.rootPromptMessagesJson as string[])[0]);
+  const duplex = new InteractiveDuplex();
+  duplex.onSend = (message) => {
+    if (field(message, "runRequest")) {
+      assert.equal(Boolean(field(asObject(field(asObject(field(message, "runRequest")), "action")), "resumeAction")), true);
+      duplex.push({ kvServerMessage: { id: 9, getBlobArgs: { blobId: firstId } } });
+      return;
+    }
+    const kv = asObject(field(message, "kvClientMessage"));
+    if (kv && field(kv, "getBlobResult")) {
+      duplex.push({ interactionUpdate: { turnEnded: {} } });
+    }
+  };
+  const host = createSdkAgentHost({
+    openRun: async () => duplex,
+    exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+  });
+  const session = upsertClientToolSession("t", "blob", tools);
+  const agent = await host.create({
+    apiKey: "crsr_test",
+    model: "composer-2.5",
+    customTools: toSdkCustomTools(session),
+  });
+  const run = await agent.send(spliced.prompt, {
+    resume: spliced.resume,
+    conversationState: spliced.conversationState,
+    blobs: spliced.blobs,
+  });
+  const result = await run.wait();
+  assert.equal(result.error, undefined);
+  const kv = duplex.sent.map((m) => asObject(field(m, "kvClientMessage"))).find((row) => row && field(row, "getBlobResult"));
+  const data = String(field(asObject(field(kv, "getBlobResult")), "blobData") || "");
+  assert.match(utf8FromBlobData(data), /be brief/);
   await agent.close();
 });

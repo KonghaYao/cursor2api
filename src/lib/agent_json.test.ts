@@ -13,8 +13,6 @@ import {
   parseMcpArgs,
   parseServerMessage,
   mergeAgentTurnUsage,
-  mcpStateResult,
-  requestContextResult,
   promptCacheHitPercent,
   aggregatePromptCacheHitPercent,
 } from "./agent_json.ts";
@@ -129,20 +127,7 @@ test("mcp tool definitions use custom-user-tools wire names", () => {
   assert.match(String(defs[0]?.inputSchemaJson), /object/);
 });
 
-test("requestContext and mcpState do not advertise custom-user-tools or a fake shell workspace", () => {
-  const ctx = JSON.stringify(requestContextResult(1, "ctx", { cwd: "/tmp", tools: [{ name: "lookup" }] }));
-  assert.doesNotMatch(ctx, /custom-user-tools/);
-  assert.doesNotMatch(ctx, /\/bin\/zsh/);
-  assert.doesNotMatch(ctx, /darwin/);
-  assert.doesNotMatch(ctx, /Call listed custom tools via MCP/);
-  assert.match(ctx, /"workspacePaths":\[\]/);
-  assert.match(ctx, /"mcpInstructions":\[\]/);
-  const state = JSON.stringify(mcpStateResult(2, "mcp-state", [{ name: "lookup" }]));
-  assert.doesNotMatch(state, /custom-user-tools/);
-  assert.match(state, /"servers":\[\]/);
-});
-
-test("buildRunRequest omits excludeWorkspaceContext and sends empty mcpTools", () => {
+test("buildRunRequest omits excludeWorkspaceContext and only carries mcp tools", () => {
   const req = buildRunRequest({
     prompt: "hi",
     modelId: "composer-2.5",
@@ -153,15 +138,14 @@ test("buildRunRequest omits excludeWorkspaceContext and sends empty mcpTools", (
   });
   assert.equal(req.excludeWorkspaceContext, undefined);
   assert.equal((req.mcpFileSystemOptions as { enabled: boolean }).enabled, false);
-  assert.equal((req.mcpFileSystemOptions as { workspaceProjectDir?: string }).workspaceProjectDir, undefined);
   const rm = req.requestedModel as { modelId: string; parameters?: Array<{ id: string; value: string }> };
   assert.equal(rm.modelId, "composer-2.5");
   assert.deepEqual(rm.parameters, [{ id: "fast", value: "false" }]);
-  const tools = (req.mcpTools as { mcpTools: unknown[] }).mcpTools;
-  assert.deepEqual(tools, []);
+  const tools = (req.mcpTools as { mcpTools: Array<{ toolName: string }> }).mcpTools;
+  assert.equal(tools[0]?.toolName, "lookup");
 });
 
-test("buildRunRequest omits customSystemPrompt by default", () => {
+test("buildRunRequest does not send customSystemPrompt", () => {
   const req = buildRunRequest({
     prompt: "hi",
     modelId: "composer-2.5",
@@ -173,17 +157,32 @@ test("buildRunRequest omits customSystemPrompt by default", () => {
   assert.equal(req.customSystemPrompt, undefined);
 });
 
-test("buildRunRequest sets customSystemPrompt when systemPrompt is passed", () => {
-  const req = buildRunRequest({
+test("buildRunRequest omits empty conversationState and uses resumeAction", () => {
+  const plain = buildRunRequest({
     prompt: "hi",
     modelId: "composer-2.5",
     conversationId: "c1",
     runId: "r1",
     agentSessionId: "a1",
-    tools: [],
-    systemPrompt: "  You are a helpful assistant.  ",
+    tools: [{ name: "lookup" }],
   });
-  assert.equal(req.customSystemPrompt, "You are a helpful assistant.");
+  assert.equal(plain.conversationState, undefined);
+  assert.ok((plain.action as { userMessageAction?: unknown }).userMessageAction);
+  const resumed = buildRunRequest({
+    prompt: "",
+    modelId: "composer-2.5",
+    conversationId: "c1",
+    runId: "r1",
+    agentSessionId: "a1",
+    tools: [{ name: "lookup" }],
+    resume: true,
+    conversationState: { rootPromptMessagesJson: ["abc"] },
+  });
+  assert.deepEqual((resumed.action as { resumeAction?: unknown }).resumeAction, {});
+  assert.equal((resumed.action as { userMessageAction?: unknown }).userMessageAction, undefined);
+  assert.deepEqual(resumed.conversationState, { rootPromptMessagesJson: ["abc"] });
+  const tools = (resumed.mcpTools as { mcpTools: Array<{ toolName: string }> }).mcpTools;
+  assert.equal(tools[0]?.toolName, "lookup");
 });
 
 test("parseServerMessage reads camelCase and snake_case interaction updates", () => {

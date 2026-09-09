@@ -317,7 +317,7 @@ function rejectRandomSession(): Response | undefined {
   if (resolveSessionMode() !== "random") return undefined;
   return jsonResponse(400, {
     error: {
-      message: "SESSION_MODE=random breaks stable conversationId; text gw_tool_call tools need tenant:agentRunFp.",
+      message: "SESSION_MODE=random cannot park customTools.execute across turns.",
       type: "invalid_request_error",
       code: "session_required_for_client_tools",
     },
@@ -348,7 +348,7 @@ export async function handleCloudMessages(
       400,
       toAnthropicError(
         {
-          message: "SESSION_MODE=random breaks stable conversationId; text gw_tool_call tools need tenant:agentRunFp.",
+          message: "SESSION_MODE=random cannot park customTools.execute across turns.",
           type: "invalid_request_error",
         },
         requestId,
@@ -496,7 +496,7 @@ export function cloudHealthBody() {
     rpc: "agent.v1.AgentService/Run (customTools only)",
     modes: ["/v1/chat/completions", "/v1/messages"],
     auth: "Authorization Bearer Cursor API key",
-    tools: 'AgentService upstream tools: empty MCP; client function tools via text <gw_tool_call> fences (not parked execute); no shell/edit/grep; not HTTP MCP; not InferenceService; not @cursor/sdk; not SDK/agent binaries; not Cloud Agents sandbox VM',
+    tools: 'AgentService customTools (MCP family allowlist; in-process execute/park; no shell/edit/grep; not HTTP MCP; not InferenceService; not @cursor/sdk; not SDK/agent binaries; not Cloud Agents sandbox VM)',
     models: "GET https://api.cursor.com/v1/models",
     session: "conversationId = tenant:agentRunFp (model/tools/system/first user); client x-session-id ignored",
   };

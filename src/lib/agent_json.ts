@@ -113,15 +113,15 @@ export function buildRunRequest(opts: {
   conversationGroupId?: string;
   runId: string;
   agentSessionId: string;
-  /** Kept for call-site compat; wire catalog is always empty (text-only tools). */
   tools: CustomToolSpec[];
   conversationState?: JsonObject;
   cwd?: string;
   images?: AgentInlineImage[];
-  /** When set (SDK systemPrompt / Connect customSystemPrompt), requires account flag. */
-  systemPrompt?: string;
+  /** Tool-result follow-up: history is already in conversationState roots. */
+  resume?: boolean;
 }): JsonObject {
   const messageId = crypto.randomUUID();
+  const mcpTools = mcpToolDefinitions(opts.tools);
   const selection = gatewayAgentModelSelection(opts.modelId);
   const parameters = opts.modelParameters ?? selection.parameters;
   const requestedModel: JsonObject = {
@@ -145,29 +145,29 @@ export function buildRunRequest(opts: {
     };
   }
   const req: JsonObject = {
-    conversationState: opts.conversationState ?? {},
-    action: {
-      userMessageAction: {
-        userMessage,
-      },
-    },
+    action: opts.resume
+      ? { resumeAction: {} }
+      : { userMessageAction: { userMessage } },
     requestedModel,
-    mcpTools: { mcpTools: [] },
+    mcpTools: { mcpTools },
     conversationId: opts.conversationId,
     conversationGroupId: opts.conversationGroupId || opts.conversationId,
-    // Never set excludeWorkspaceContext (Dashboard crsr_ rejects it). Only set
-    // customSystemPrompt when the caller passes a non-empty systemPrompt (SDK
-    // systemPrompt equivalent; accounts without the flag still get unknown option).
+    // Do not set excludeWorkspaceContext or customSystemPrompt: Dashboard
+    // crsr_ rejects both (`Workspace context exclusion is not allowed…` /
+    // `unknown option '--system-prompt'`). Client system lives in spliced
+    // rootPromptMessagesJson. Builtins stay off via MCP-only allowlist.
     runId: opts.runId,
     agentSessionId: opts.agentSessionId,
     mcpFileSystemOptions: {
       enabled: false,
+      workspaceProjectDir: opts.cwd || "/tmp",
     },
   };
+  if (opts.conversationState && Object.keys(opts.conversationState).length > 0) {
+    req.conversationState = opts.conversationState;
+  }
   // Cursor only honours SelectedImage.data when this is true.
   if (images.length) req.clientSupportsInlineImages = true;
-  const systemPrompt = typeof opts.systemPrompt === "string" ? opts.systemPrompt.trim() : "";
-  if (systemPrompt) req.customSystemPrompt = systemPrompt;
   return req;
 }
 
@@ -198,35 +198,56 @@ export function execIds(exec: JsonObject): { id: unknown; execId: unknown } {
   };
 }
 
-/** Empty MCP inventory. Do not advertise `custom-user-tools` — that is how models end up listing MCP instead of emitting `<gw_tool_call>`. */
-export function mcpStateResult(id: unknown, execId: unknown, _tools: CustomToolSpec[] = []): JsonObject {
+export function mcpStateResult(id: unknown, execId: unknown, tools: CustomToolSpec[]): JsonObject {
+  const defs = mcpToolDefinitions(tools);
   return execReply(id, execId, {
-    mcpStateExecResult: { success: { servers: [] } },
+    mcpStateExecResult: {
+      success: {
+        servers: [
+          {
+            serverName: CUSTOM_USER_TOOLS_SERVER,
+            serverIdentifier: CUSTOM_USER_TOOLS_SERVER,
+            status: "ready",
+            tools: defs,
+            instructions: [
+              {
+                serverName: CUSTOM_USER_TOOLS_SERVER,
+                serverIdentifier: CUSTOM_USER_TOOLS_SERVER,
+                instructions: "In-process OpenAI/Anthropic function tools offered through GetMcpTools / CallMcpTool.",
+              },
+            ],
+          },
+        ],
+      },
+    },
   });
 }
 
-/** No fake darwin/zsh/`/tmp` workspace and no MCP server instructions. */
-export function requestContextResult(
-  id: unknown,
-  execId: unknown,
-  _opts?: { cwd?: string; tools?: CustomToolSpec[] },
-): JsonObject {
+export function requestContextResult(id: unknown, execId: unknown, opts: { cwd: string; tools: CustomToolSpec[] }): JsonObject {
+  const defs = mcpToolDefinitions(opts.tools);
+  const cwd = opts.cwd || "/tmp";
   return execReply(id, execId, {
     requestContextResult: {
       success: {
         requestContext: {
           env: {
-            osVersion: "unknown",
-            workspacePaths: [],
-            shell: "",
+            osVersion: "darwin",
+            workspacePaths: [cwd],
+            shell: "/bin/zsh",
             sandboxEnabled: false,
             timeZone: "UTC",
-            projectFolder: "",
-            processWorkingDirectory: "",
+            projectFolder: cwd,
+            processWorkingDirectory: cwd,
             envInfoComplete: true,
           },
-          tools: [],
-          mcpInstructions: [],
+          tools: defs,
+          mcpInstructions: [
+            {
+              serverName: CUSTOM_USER_TOOLS_SERVER,
+              serverIdentifier: CUSTOM_USER_TOOLS_SERVER,
+              instructions: "Call listed custom tools via MCP.",
+            },
+          ],
           webSearchEnabled: false,
           webFetchEnabled: false,
           supportsMcpAuth: false,
