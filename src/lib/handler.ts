@@ -1,5 +1,13 @@
 import { connectUnary, getAccessToken, modelsFrom, AuthError, type GatewayCtx } from "./auth.ts";
 import { corsResponse, jsonResponse, randomId } from "./bytes.ts";
+import { CloudAgentsError } from "./cloud_agents.ts";
+import {
+  CloudChatError,
+  cloudHealthBody,
+  handleCloudChatCompletions,
+  handleCloudMessages,
+  handleCloudModels,
+} from "./cloud_openai.ts";
 import {
   anthropicToCursor,
   anthropicToolsToCursor,
@@ -368,6 +376,118 @@ async function runInference(
   return { turn, conversationId: prepared.clientId, sessionId: prepared.clientId };
 }
 
+async function handleInferenceChatCompletions(
+  ctx: GatewayCtx,
+  request: Request,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  const messages = await openaiMessagesToCursor((body.messages as unknown[]) || []);
+  const tools = openaiToolsToCursor(body.tools);
+  const route = resolveCursorModelRoute(body.model, {
+    fast: extractFastMode(body),
+    reasoningEffort: extractReasoningEffort(body),
+  });
+  const media = countCursorMediaParts(messages);
+  const hasTools = tools.length > 0 || openaiProviderDefinedTools(body.tools).length > 0;
+  const cursorRoute = upgradeGrokRouteForTools(route.routeId, hasTools);
+  console.log(
+    `  chat n=${messages.length} tools=${tools.length} images=${media.images} files=${media.files} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${cursorRoute}`,
+  );
+  if (body.stream) {
+    const { accessToken, tenant } = await getAccessToken(ctx, request.headers);
+    const prepared = await prepareChatTurn(body, tenant, (body.messages as unknown[]) || [], tools);
+    return streamOpenAiChatCompletion({
+      accessToken,
+      body: cursorBodyFromClient(body, {
+        messages: prepared.messages,
+        tools: prepared.tools,
+        conversationId: prepared.conversationId,
+        conversationGroupId: prepared.conversationGroupId,
+        messagesPipelined: prepared.messagesPipelined,
+      }),
+      model: body.model,
+      conversationId: prepared.clientId,
+      sessionId: prepared.sessionId,
+      tools: prepared.tools,
+      signal: request.signal,
+    });
+  }
+  const { turn, conversationId } = await runInference(ctx, request.headers, body, {
+    tools,
+    rawMessages: (body.messages as unknown[]) || [],
+  });
+  if (turn.error) console.log(`  infer error ${JSON.stringify(turn.error).slice(0, 200)}`);
+  if (turn.toolCalls?.length) {
+    for (const c of toolCallsToOpenAI(turn.toolCalls, tools)) {
+      console.log(`  ${c.function.name} ${c.function.arguments.slice(0, 280)}`);
+    }
+  }
+  return jsonResponse(
+    turn.status === 200 ? 200 : turn.status,
+    toOpenAICompletion({ model: body.model, turn, conversationId, tools }),
+  );
+}
+
+async function handleInferenceMessages(
+  ctx: GatewayCtx,
+  request: Request,
+  body: Record<string, unknown>,
+  requestId: string,
+): Promise<Response> {
+  const messages = await anthropicToCursor(body);
+  const tools = anthropicToolsToCursor(body.tools);
+  body.reasoning_effort = anthropicReasoningEffort(body);
+  const route = resolveCursorModelRoute(body.model, {
+    fast: extractFastMode(body),
+    reasoningEffort: extractReasoningEffort(body),
+  });
+  const media = countCursorMediaParts(messages);
+  const cursorRoute = upgradeGrokRouteForTools(route.routeId, tools.length > 0);
+  console.log(
+    `  messages n=${messages.length} tools=${tools.length} images=${media.images} files=${media.files} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${cursorRoute}`,
+  );
+  if (body.stream) {
+    const { accessToken, tenant } = await getAccessToken(ctx, request.headers);
+    const prepared = await prepareChatTurn(body, tenant, (body.messages as unknown[]) || [], tools, messages);
+    return streamAnthropicMessage({
+      accessToken,
+      body: cursorBodyFromClient(body, {
+        messages: prepared.messages,
+        tools: prepared.tools,
+        conversationId: prepared.conversationId,
+        conversationGroupId: prepared.conversationGroupId,
+        messagesPipelined: prepared.messagesPipelined,
+      }),
+      model: body.model,
+      conversationId: prepared.clientId,
+      sessionId: prepared.sessionId,
+      tools: prepared.tools,
+      signal: request.signal,
+      requestId,
+    });
+  }
+  const { turn, conversationId } = await runInference(ctx, request.headers, body, {
+    tools,
+    rawMessages: (body.messages as unknown[]) || [],
+    preconvertedMessages: messages,
+  });
+  if (turn.error) console.log(`  infer error ${JSON.stringify(turn.error).slice(0, 200)}`);
+  if (turn.toolCalls?.length) {
+    for (const c of toolCallsToOpenAI(turn.toolCalls, tools)) {
+      console.log(`  ${c.function.name} ${c.function.arguments.slice(0, 280)}`);
+    }
+  }
+  if (turn.error || turn.status !== 200) {
+    const error = turn.error || { message: `Inference request failed (${turn.status})`, type: "api_error" };
+    return jsonResponse(anthropicErrorStatus(error, turn.status), toAnthropicError(error, requestId), requestId);
+  }
+  return jsonResponse(
+    turn.status,
+    toAnthropicMessage({ model: body.model, turn, conversationId, tools, maxTokens: body.max_tokens }),
+    requestId,
+  );
+}
+
 export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): Promise<Response> {
   const url = new URL(request.url);
   const method = request.method.toUpperCase();
@@ -381,6 +501,7 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
     if (method === "OPTIONS") return corsResponse();
 
     if (method === "GET" && url.pathname === "/health") {
+      if (ctx.upstream === "cloud") return jsonResponse(200, cloudHealthBody());
       return jsonResponse(200, {
         ok: true,
         rpc: "/aiserver.v1.InferenceService/Stream",
@@ -391,6 +512,9 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
     }
 
     if (method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
+      if (ctx.upstream === "cloud") {
+        return handleCloudModels(request.headers, anthropicModelsRequest, requestId, request.signal);
+      }
       const { accessToken } = await getAccessToken(ctx, request.headers);
       const r = await connectUnary("/agent.v1.AgentService/GetUsableModels", accessToken, {});
       if (!r.ok) return modelsUpstreamError(r.status, r.text, anthropicModelsRequest, requestId);
@@ -430,120 +554,24 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       validateAnthropicRequest(body);
       const unsupported = rejectUnsupportedChatOptions(body);
       if (unsupported) return unsupported;
-      const messages = await anthropicToCursor(body);
-      const tools = anthropicToolsToCursor(body.tools);
-      body.reasoning_effort = anthropicReasoningEffort(body);
-      const route = resolveCursorModelRoute(body.model, {
-        fast: extractFastMode(body),
-        reasoningEffort: extractReasoningEffort(body),
-      });
-      const media = countCursorMediaParts(messages);
-      const cursorRoute = upgradeGrokRouteForTools(route.routeId, tools.length > 0);
-      console.log(
-        `  messages n=${messages.length} tools=${tools.length} images=${media.images} files=${media.files} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${cursorRoute}`,
-      );
-      if (body.stream) {
-        const { accessToken, tenant } = await getAccessToken(ctx, request.headers);
-        const prepared = await prepareChatTurn(
-          body,
-          tenant,
-          (body.messages as unknown[]) || [],
-          tools,
-          messages,
-        );
-        return streamAnthropicMessage({
-          accessToken,
-          body: cursorBodyFromClient(body, {
-            messages: prepared.messages,
-            tools: prepared.tools,
-            conversationId: prepared.conversationId,
-            conversationGroupId: prepared.conversationGroupId,
-            messagesPipelined: prepared.messagesPipelined,
-          }),
-          model: body.model,
-          conversationId: prepared.clientId,
-          sessionId: prepared.sessionId,
-          tools: prepared.tools,
+      if (ctx.upstream === "cloud") {
+        return handleCloudMessages(request.headers, body, requestId, ctx.kv, {
           signal: request.signal,
-          requestId,
         });
       }
-      const { turn, conversationId } = await runInference(ctx, request.headers, body, {
-        tools,
-        rawMessages: (body.messages as unknown[]) || [],
-        preconvertedMessages: messages,
-      });
-      if (turn.error) console.log(`  infer error ${JSON.stringify(turn.error).slice(0, 200)}`);
-      if (turn.toolCalls?.length) {
-        for (const c of toolCallsToOpenAI(turn.toolCalls, tools)) {
-          console.log(`  ${c.function.name} ${c.function.arguments.slice(0, 280)}`);
-        }
-      }
-      if (turn.error || turn.status !== 200) {
-        const error = turn.error || { message: `Inference request failed (${turn.status})`, type: "api_error" };
-        return jsonResponse(anthropicErrorStatus(error, turn.status), toAnthropicError(error, requestId), requestId);
-      }
-      return jsonResponse(
-        turn.status,
-        toAnthropicMessage({ model: body.model, turn, conversationId, tools, maxTokens: body.max_tokens }),
-        requestId,
-      );
+      return handleInferenceMessages(ctx, request, body, requestId);
     }
 
     if (method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
       const body = await readJson(request);
       const unsupported = rejectUnsupportedChatOptions(body);
       if (unsupported) return unsupported;
-      const messages = await openaiMessagesToCursor((body.messages as unknown[]) || []);
-      const tools = openaiToolsToCursor(body.tools);
-      const route = resolveCursorModelRoute(body.model, {
-        fast: extractFastMode(body),
-        reasoningEffort: extractReasoningEffort(body),
-      });
-      const media = countCursorMediaParts(messages);
-      const hasTools = tools.length > 0 || openaiProviderDefinedTools(body.tools).length > 0;
-      const cursorRoute = upgradeGrokRouteForTools(route.routeId, hasTools);
-      console.log(
-        `  chat n=${messages.length} tools=${tools.length} images=${media.images} files=${media.files} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${cursorRoute}`,
-      );
-      if (body.stream) {
-        const { accessToken, tenant } = await getAccessToken(ctx, request.headers);
-        const prepared = await prepareChatTurn(
-          body,
-          tenant,
-          (body.messages as unknown[]) || [],
-          tools,
-        );
-        return streamOpenAiChatCompletion({
-          accessToken,
-          body: cursorBodyFromClient(body, {
-            messages: prepared.messages,
-            tools: prepared.tools,
-            conversationId: prepared.conversationId,
-            conversationGroupId: prepared.conversationGroupId,
-            messagesPipelined: prepared.messagesPipelined,
-          }),
-          model: body.model,
-          conversationId: prepared.clientId,
-          sessionId: prepared.sessionId,
-          tools: prepared.tools,
+      if (ctx.upstream === "cloud") {
+        return handleCloudChatCompletions(request.headers, body, ctx.kv, {
           signal: request.signal,
         });
       }
-      const { turn, conversationId } = await runInference(ctx, request.headers, body, {
-        tools,
-        rawMessages: (body.messages as unknown[]) || [],
-      });
-      if (turn.error) console.log(`  infer error ${JSON.stringify(turn.error).slice(0, 200)}`);
-      if (turn.toolCalls?.length) {
-        for (const c of toolCallsToOpenAI(turn.toolCalls, tools)) {
-          console.log(`  ${c.function.name} ${c.function.arguments.slice(0, 280)}`);
-        }
-      }
-      return jsonResponse(
-        turn.status === 200 ? 200 : turn.status,
-        toOpenAICompletion({ model: body.model, turn, conversationId, tools }),
-      );
+      return handleInferenceChatCompletions(ctx, request, body);
     }
 
     console.log("  -> 404");
@@ -553,18 +581,22 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
     const status =
       err instanceof AuthError
         ? 401
-        : err instanceof RequestInputError
+        : err instanceof CloudAgentsError
           ? err.status
-          : err instanceof ImageInputError
-            ? 400
-            : 500;
+          : err instanceof CloudChatError
+            ? err.status
+            : err instanceof RequestInputError
+              ? err.status
+              : err instanceof ImageInputError
+                ? 400
+                : 500;
     console.log(`  -> ${status} ${message}`);
     const error = {
       message,
       type:
         status === 401
           ? "authentication_error"
-          : status === 400
+          : status === 400 || status === 409
             ? "invalid_request_error"
             : status === 413
               ? "request_too_large"

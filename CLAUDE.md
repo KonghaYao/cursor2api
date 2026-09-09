@@ -4,6 +4,66 @@
 
 ---
 
+## 2026-09-09：Inference 已死；聊天一律 `@cursor/sdk` customTools
+
+Cursor Agent 作为本网关的客户端 **总会带 function `tools`**。「无 tools 走 Cloud REST」不是产品场景，不要再加回那条分流。
+
+### 上游怎么选（不要再试 Inference）
+
+| 路径 | 对 Dashboard `crsr_` | 用途 |
+|------|----------------------|------|
+| `POST https://api2.cursor.sh/aiserver.v1.InferenceService/Stream` | **死了**：换票后 `GetUsableModels` 仍可能 200，Stream 回 `ERROR_NOT_LOGGED_IN` | **禁止**再把 chat / tools 接到这里 |
+| `https://api.cursor.com/v1/agents` Cloud REST | 能用 | **仅** `GET /v1/models`；不要用它跑对话（VM 会自带 shell/edit，且没有 OpenAI 那种 park `tool_calls`） |
+| `@cursor/sdk` local `Agent.create` | 能用（先 `exchange_user_api_key`） | **全部** `/v1/chat/completions` 与 `/v1/messages` |
+
+`@cursor/sdk` **没有** Chat Completions HTTP。`local.customTools` 是合成 MCP server `custom-user-tools`（`GetMcpTools` / `CallMcpTool`），`execute()` 在网关进程内。网关把 `execute()` **park** 成 OpenAI `tool_calls`，由调用方执行后再 POST `role: tool`。这不是 HTTP `/mcp`，Cloud VM 不会回调本网关。
+
+### 屏蔽 SDK 自带工具（只留 custom）
+
+SDK `AgentOptions.tools`：
+
+- `undefined` → 默认 toolset（shell / edit / grep / …）**禁止**
+- `[]` → **没有任何**内置工具，连 MCP 家族都关掉，**`customTools` 也不会出现**
+- `["mcp"]` → 只开 MCP 能力组（含 `customTools`），关掉 shell、edit、grep、task、webSearch 等
+
+因此网关 **必须** `tools: ["mcp"]`，再把客户端的 OpenAI/Anthropic function tools 填进 `local.customTools`。不要 `tools: []`，也不要漏写 `"mcp"`。
+
+```ts
+await Agent.create({
+  apiKey,
+  model: { id: "composer-2.5" },
+  tools: ["mcp"], // 唯一允许的内置能力组；不是 HTTP MCP
+  local: {
+    cwd: GATEWAY_AGENT_CWD, // 需要一个 git 目录
+    settingSources: [],     // 不要加载用户/项目 Cursor 设置里的工具
+    customTools,            // 仅客户端声明的 function tools
+  },
+});
+```
+
+`"mcp"` 不是给模型 shell，也不是 `POST /mcp`。省略它 = customTools 全部失效。
+
+### 运行时
+
+Local Agent 要 Node ≥ 22.13、cwd、git、子进程。**Deno Deploy / Cloudflare Workers 会 501**。生产用 bun 或 Node：
+
+```bash
+mkdir -p /tmp/gateway-agent-cwd && git -C /tmp/gateway-agent-cwd init
+GATEWAY_AGENT_CWD=/tmp/gateway-agent-cwd bun src/node.ts
+```
+
+`stream: true` 的 `tool_calls` 仍须 **一条完整 delta**（见 2026-08-31）。会话用稳定 `x-session-id` park `execute()`；`SESSION_MODE=random` 不行。
+
+### 不要做的
+
+- 把 tools 改回 `InferenceService/Stream`
+- 无 tools 时改走 Cloud `bc-…` REST 当「简单聊天」
+- 给 SDK 开 `shell` / `edit` / `task` 或默认 toolset
+- 把客户端 tools 挂成 HTTP MCP 让 Cloud VM 反调
+- 用 `GetUsableModels` / `/v1/models` 判断 Inference 是否还能打（那是 AgentService，Stream 已经死）
+
+---
+
 ## Team Usage CSV：缓存与成本分析方法
 
 从 Cursor Team 导出的 `team-usage-events-*.csv` 判断 **prompt cache 是否正常**、**成本花在哪**、**有没有事故级回归**。可复现脚本：`scripts/analyze_team_usage.py` → HTML 报告 `reports/usage-<date>-cache-cost.html`。

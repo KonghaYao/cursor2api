@@ -5,8 +5,12 @@ import { kvGetJwt, kvSetJwt, type Kv } from "./kv.ts";
 export const CURSOR_BASE = "https://api2.cursor.sh";
 export const CLIENT_VERSION = "sdk-1.0.30";
 
+export type GatewayUpstream = "inference" | "cloud";
+
 export type GatewayCtx = {
   kv: Kv;
+  /** `cloud` = official Cloud Agents REST (`api.cursor.com`). Default inference. */
+  upstream?: GatewayUpstream;
 };
 
 export function sdkHeaders(accessToken: string, requestId = randomId()): Record<string, string> {

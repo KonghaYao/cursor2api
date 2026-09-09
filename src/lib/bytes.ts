@@ -129,7 +129,7 @@ export function corsResponse(): Response {
     headers: {
       "access-control-allow-origin": "*",
       "access-control-allow-headers":
-        "authorization, content-type, x-api-key, anthropic-version, x-request-id",
+        "authorization, content-type, x-api-key, anthropic-version, x-request-id, mcp-session-id, x-session-id, x-cursor-session-id",
       "access-control-allow-methods": "GET,POST,OPTIONS",
     },
   });

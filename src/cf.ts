@@ -28,7 +28,7 @@ function kvFor(env: CfEnv): Kv {
   return {
     getItem: async (key) => (await storage.getItem(key)) as never,
     setItem: async (key, value, opts) => {
-      await storage.setItem(key, value as never, { ttl: kvEntryTtlSeconds(opts?.ttl) });
+      await storage.setItem(key, value as never, { ttl: kvEntryTtlSeconds(opts?.ttl, opts?.cap) });
     },
     removeItem: async (key) => {
       await storage.removeItem(key);
@@ -38,6 +38,6 @@ function kvFor(env: CfEnv): Kv {
 
 export default {
   async fetch(request: Request, env: CfEnv): Promise<Response> {
-    return handleGatewayRequest(request, { kv: kvFor(env) });
+    return handleGatewayRequest(request, { kv: kvFor(env), upstream: "cloud" });
   },
 };

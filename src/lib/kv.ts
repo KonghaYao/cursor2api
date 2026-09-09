@@ -3,9 +3,15 @@
  * Swap the backend per runtime: memory here, Cloudflare KV in src/cf.ts, Redis via unstorage, etc.
  */
 
+export type KvSetOpts = {
+  ttl?: number;
+  /** Override the default 5-minute cap (JWT). Cloud agent bindings use a longer cap. */
+  cap?: number;
+};
+
 export type Kv = {
   getItem<T = unknown>(key: string): Promise<T | null>;
-  setItem(key: string, value: unknown, opts?: { ttl?: number }): Promise<void>;
+  setItem(key: string, value: unknown, opts?: KvSetOpts): Promise<void>;
   removeItem(key: string): Promise<void>;
 };
 
@@ -14,13 +20,44 @@ export type CachedJwt = {
   exp: number;
 };
 
-/** All KV entries use at most this TTL (5 minutes). */
+/** Default cap for JWT / short-lived rows. */
 export const KV_TTL_SECONDS = 300;
 
-/** Seconds to store in KV; always capped at {@link KV_TTL_SECONDS}. */
-export function kvEntryTtlSeconds(preferred?: number): number {
-  if (preferred == null || !Number.isFinite(preferred) || preferred <= 0) return KV_TTL_SECONDS;
-  return Math.min(Math.floor(preferred), KV_TTL_SECONDS);
+/** Cloud session → agent bindings. Cursor agents outlive JWT exchange cache. */
+export const CLOUD_AGENT_KV_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+/** Seconds to store in KV; capped at `cap` (default {@link KV_TTL_SECONDS}). */
+export function kvEntryTtlSeconds(preferred?: number, cap = KV_TTL_SECONDS): number {
+  const max = cap > 0 ? cap : KV_TTL_SECONDS;
+  if (preferred == null || !Number.isFinite(preferred) || preferred <= 0) return max;
+  return Math.min(Math.floor(preferred), max);
+}
+
+export type CloudAgentBinding = {
+  agentId: string;
+};
+
+export function cloudAgentKvKey(tenant: string, sessionId: string): string {
+  return `cloud-agent:${tenant}:${sessionId}`;
+}
+
+export async function kvGetCloudAgent(kv: Kv, tenant: string, sessionId: string): Promise<string | null> {
+  const row = await kv.getItem<CloudAgentBinding>(cloudAgentKvKey(tenant, sessionId));
+  const agentId = row?.agentId;
+  if (typeof agentId !== "string" || !agentId.startsWith("bc-")) return null;
+  return agentId;
+}
+
+export async function kvSetCloudAgent(kv: Kv, tenant: string, sessionId: string, agentId: string): Promise<void> {
+  await kv.setItem(
+    cloudAgentKvKey(tenant, sessionId),
+    { agentId } satisfies CloudAgentBinding,
+    { ttl: CLOUD_AGENT_KV_TTL_SECONDS, cap: CLOUD_AGENT_KV_TTL_SECONDS },
+  );
+}
+
+export async function kvRemoveCloudAgent(kv: Kv, tenant: string, sessionId: string): Promise<void> {
+  await kv.removeItem(cloudAgentKvKey(tenant, sessionId));
 }
 
 /** Seconds until JWT refresh (60s before exp). */
@@ -38,8 +75,8 @@ export async function createDenoKv(): Promise<Kv> {
       const entry = await store.get([key]);
       return (entry.value ?? null) as T | null;
     },
-    async setItem(key: string, value: unknown, opts?: { ttl?: number }) {
-      const ttl = kvEntryTtlSeconds(opts?.ttl);
+    async setItem(key: string, value: unknown, opts?: KvSetOpts) {
+      const ttl = kvEntryTtlSeconds(opts?.ttl, opts?.cap);
       await store.set([key], value, { expireIn: ttl * 1000 });
     },
     async removeItem(key: string) {
@@ -66,8 +103,8 @@ export function createMemoryKv(): Kv {
       }
       return row.value as T;
     },
-    async setItem(key: string, value: unknown, opts?: { ttl?: number }) {
-      const ttl = kvEntryTtlSeconds(opts?.ttl);
+    async setItem(key: string, value: unknown, opts?: KvSetOpts) {
+      const ttl = kvEntryTtlSeconds(opts?.ttl, opts?.cap);
       const expiresAt = Date.now() + ttl * 1000;
       map.set(key, { value, expiresAt });
     },

@@ -7,6 +7,8 @@
 import { encodeConnectFrame } from "../src/lib/bytes.ts";
 import { handleGatewayRequest } from "../src/lib/handler.ts";
 import { createMemoryKv } from "../src/lib/kv.ts";
+import { cloudClientToolsClearForTests } from "../src/lib/cloud_openai.ts";
+import { setCustomToolAgentHostForTests, type SdkCustomToolMap } from "../src/lib/custom_tool_chat.ts";
 
 /** JWT-shaped test credential (skips exchange_user_api_key). */
 const TEST_JWT = "eyJhbGciOiJub25lIn0.eyJleHAiOjk5OTk5OTk5OTl9.test";
@@ -573,5 +575,225 @@ Deno.test("POST /v1/chat/completions forwards maxMode and top_p", async () => {
     if (!stops?.includes("END")) throw new Error(`stop ${JSON.stringify(cfg)}`);
   } finally {
     globalThis.fetch = original;
+  }
+});
+
+Deno.test("cloud gateway has no HTTP MCP callback endpoint", async () => {
+  const res = await handleGatewayRequest(
+    new Request("http://127.0.0.1/mcp", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }),
+    { kv: createMemoryKv(), upstream: "cloud" },
+  );
+  if (res.status !== 404) throw new Error(`expected 404 for /mcp, got ${res.status}: ${await res.text()}`);
+});
+
+Deno.test("cloud health advertises SDK customTools only, not Cloud REST chat or HTTP MCP", async () => {
+  const res = await handleGatewayRequest(new Request("http://127.0.0.1/health"), {
+    kv: createMemoryKv(),
+    upstream: "cloud",
+  });
+  if (res.status !== 200) throw new Error(`expected 200, got ${res.status}`);
+  const body = await res.json();
+  if (!String(body?.rpc || "").includes("@cursor/sdk")) {
+    throw new Error(`unexpected health: ${JSON.stringify(body)}`);
+  }
+  if (!String(body?.tools || "").includes('["mcp"]') && !String(body?.tools || "").includes("customTools")) {
+    throw new Error(`health should advertise mcp-only customTools: ${JSON.stringify(body)}`);
+  }
+  if (String(body?.tools || "").includes("/mcp") || String(body?.rpc || "").includes("api.cursor.com/v1/agents")) {
+    throw new Error(`health must not advertise HTTP MCP or Cloud REST chat: ${JSON.stringify(body)}`);
+  }
+});
+
+Deno.test("cloud GET /v1/models uses api.cursor.com", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (input, init) => {
+    const url = String(input);
+    if (url === "https://api.cursor.com/v1/models") {
+      const auth = new Headers(init?.headers).get("authorization") || "";
+      if (!auth.startsWith("Basic ")) return Promise.resolve(new Response("bad auth", { status: 401 }));
+      return Promise.resolve(new Response(JSON.stringify({ items: [{ id: "composer-2.5" }] })));
+    }
+    return original(input, init);
+  };
+  try {
+    const res = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/models", { headers: { authorization: "Bearer crsr_test" } }),
+      { kv: createMemoryKv(), upstream: "cloud" },
+    );
+    if (res.status !== 200) throw new Error(`expected 200, got ${res.status}: ${await res.text()}`);
+    const body = await res.json();
+    if (body?.data?.[0]?.id !== "composer-2.5") throw new Error(`unexpected ${JSON.stringify(body)}`);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+function installFakeCustomToolHost(created: string[] = []) {
+  setCustomToolAgentHostForTests({
+    async create({ customTools }: { customTools: SdkCustomToolMap }) {
+      const names = Object.keys(customTools);
+      const agentId = `local-test-agent-${created.length + 1}`;
+      created.push(agentId);
+      return {
+        agentId,
+        async send(_prompt: string) {
+          const wait = (async () => {
+            const first = names[0];
+            if (!first) return { text: "no-tools" };
+            const result = await customTools[first]!.execute({ city: "Tokyo" }, {});
+            const rec = result as { content?: Array<{ text?: string }> };
+            const text = rec?.content?.[0]?.text || JSON.stringify(result);
+            return { text: `done:${text}` };
+          })();
+          return { wait: () => wait };
+        },
+        async close() {},
+      };
+    },
+  });
+}
+
+Deno.test("cloud OpenAI tools park customTools.execute and resume with client results", async () => {
+  cloudClientToolsClearForTests();
+  installFakeCustomToolHost();
+  const kv = createMemoryKv();
+  const ctx = { kv, upstream: "cloud" as const };
+  const tools = [{ type: "function", function: { name: "get_weather", parameters: { type: "object", properties: { city: { type: "string" } } } } }];
+  try {
+    const chat = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer crsr_test",
+          "content-type": "application/json",
+          "x-session-id": "sess-tools",
+        },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          messages: [{ role: "user", content: "weather in tokyo?" }],
+          tools,
+        }),
+      }),
+      ctx,
+    );
+    if (chat.status !== 200) throw new Error(`chat ${chat.status}: ${await chat.text()}`);
+    const chatBody = await chat.json();
+    if (chatBody?.choices?.[0]?.finish_reason !== "tool_calls") {
+      throw new Error(`expected tool_calls, got ${JSON.stringify(chatBody)}`);
+    }
+    const tc = chatBody.choices[0].message.tool_calls;
+    if (!Array.isArray(tc) || tc.length !== 1 || tc[0]?.function?.name !== "get_weather") {
+      throw new Error(`expected one complete get_weather tool_call, got ${JSON.stringify(tc)}`);
+    }
+    const chat2 = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer crsr_test",
+          "content-type": "application/json",
+          "x-session-id": "sess-tools",
+        },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          messages: [
+            { role: "user", content: "weather in tokyo?" },
+            { role: "assistant", content: null, tool_calls: tc },
+            { role: "tool", tool_call_id: tc[0].id, content: '{"temp_c":22}' },
+          ],
+          tools,
+        }),
+      }),
+      ctx,
+    );
+    if (chat2.status !== 200) throw new Error(`chat2 ${chat2.status}: ${await chat2.text()}`);
+    const chat2Body = await chat2.json();
+    if (!String(chat2Body?.choices?.[0]?.message?.content || "").includes("22")) {
+      throw new Error(`expected final text from customTools.execute, got ${JSON.stringify(chat2Body)}`);
+    }
+  } finally {
+    setCustomToolAgentHostForTests(undefined);
+    cloudClientToolsClearForTests();
+  }
+});
+
+Deno.test("cloud stream=true emits complete tool_calls in one delta", async () => {
+  cloudClientToolsClearForTests();
+  installFakeCustomToolHost();
+  const kv = createMemoryKv();
+  const ctx = { kv, upstream: "cloud" as const };
+  try {
+    const chat = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer crsr_test",
+          "content-type": "application/json",
+          "x-session-id": "sess-stream-tools",
+        },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          stream: true,
+          messages: [{ role: "user", content: "weather?" }],
+          tools: [{ type: "function", function: { name: "lookup" } }],
+        }),
+      }),
+      ctx,
+    );
+    const text = await chat.text();
+    const toolCallDeltas = text.split("\n").filter((l) => l.includes('"tool_calls":['));
+    if (toolCallDeltas.length !== 1) {
+      throw new Error(`expected one complete tool_calls delta, got ${toolCallDeltas.length}: ${text}`);
+    }
+    if (!text.includes('"finish_reason":"tool_calls"')) throw new Error(`missing finish_reason tool_calls: ${text}`);
+    if (!text.includes('"name":"lookup"')) throw new Error(text);
+  } finally {
+    setCustomToolAgentHostForTests(undefined);
+    cloudClientToolsClearForTests();
+  }
+});
+
+Deno.test("cloud chat always uses SDK customTools, never Cloud REST agents", async () => {
+  cloudClientToolsClearForTests();
+  const created: string[] = [];
+  installFakeCustomToolHost(created);
+  const kv = createMemoryKv();
+  const urls: string[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (input, init) => {
+    urls.push(`${init?.method || "GET"} ${String(input)}`);
+    return original(input, init);
+  };
+  const chat = (session: string, text: string) =>
+    handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer crsr_test",
+          "content-type": "application/json",
+          "x-session-id": session,
+        },
+        body: JSON.stringify({ model: "composer-2.5", messages: [{ role: "user", content: text }] }),
+      }),
+      { kv, upstream: "cloud" },
+    );
+  try {
+    const first = await chat("sess-1", "hello");
+    if (first.status !== 200) throw new Error(`first ${first.status}: ${await first.text()}`);
+    const firstBody = await first.json();
+    if (!String(firstBody?.choices?.[0]?.message?.content || "").includes("no-tools")) {
+      throw new Error(`expected SDK text, got ${JSON.stringify(firstBody)}`);
+    }
+    const second = await chat("sess-1", "again");
+    if (second.status !== 200) throw new Error(`second ${second.status}: ${await second.text()}`);
+    const switched = await chat("sess-2", "new thread");
+    if (switched.status !== 200) throw new Error(`switch ${switched.status}: ${await switched.text()}`);
+    if (created.length !== 2) throw new Error(`expected 2 SDK agents, got ${created.join(",")}`);
+    if (urls.some((u) => u.includes("api.cursor.com/v1/agents"))) {
+      throw new Error(`chat must not hit Cloud REST: ${urls.join(",")}`);
+    }
+  } finally {
+    globalThis.fetch = original;
+    setCustomToolAgentHostForTests(undefined);
+    cloudClientToolsClearForTests();
   }
 });

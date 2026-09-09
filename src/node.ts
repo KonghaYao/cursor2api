@@ -9,17 +9,21 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { handleGatewayRequest } from "./lib/handler.ts";
 import { createMemoryKv } from "./lib/kv.ts";
+import type { GatewayUpstream } from "./lib/auth.ts";
 
 const PORT = Number(process.env.PORT || 8789);
 const kv = createMemoryKv();
+const upstream: GatewayUpstream = process.env.GATEWAY_UPSTREAM === "inference" ? "inference" : "cloud";
 
 function bindClientAbort(req: IncomingMessage): AbortController {
   const abort = new AbortController();
   const onClientGone = () => {
     if (!abort.signal.aborted) abort.abort(new Error("client closed"));
   };
-  req.once("close", onClientGone);
+  // Do not listen to IncomingMessage `close`: Bun emits it after the body is
+  // consumed, which would abort Cloud/SDK work before it starts.
   req.once("aborted", onClientGone);
+  req.socket?.once("close", onClientGone);
   return abort;
 }
 
@@ -93,7 +97,7 @@ async function onRequest(req: IncomingMessage, res: ServerResponse) {
   const clientAbort = bindClientAbort(req);
   try {
     const request = await incomingToRequest(req, clientAbort.signal);
-    const response = await handleGatewayRequest(request, { kv });
+    const response = await handleGatewayRequest(request, { kv, upstream });
     await writeResponse(res, response, req);
   } catch (err) {
     if (clientAbort.signal.aborted) {
@@ -124,7 +128,11 @@ function listen(host: string) {
 
 listen("127.0.0.1");
 listen("::1");
-console.log("  node  InferenceService/Stream  (client executes tool_calls)");
+console.log(
+  upstream === "cloud"
+    ? "  node  @cursor/sdk customTools only (tools:[mcp]; no Cloud REST chat)"
+    : "  node  InferenceService/Stream  (dead for Dashboard crsr_ keys)",
+);
 console.log("  GET  /health");
 console.log("  GET  /v1/models");
 console.log("  POST /v1/chat/completions");
