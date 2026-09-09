@@ -31,10 +31,12 @@ import {
   type CustomToolSpec,
   type JsonObject,
 } from "./agent_json.ts";
-import { openAgentRun, type OpenAgentRun } from "./agent_run.ts";
+import { abortAgentDuplex, closeAgentDuplex, openAgentRun, type OpenAgentRun } from "./agent_run.ts";
 import type { CustomToolAgentHandle, CustomToolAgentHost, SdkCustomToolMap } from "./custom_tool_chat.ts";
 
 const HEARTBEAT_MS = 15_000;
+/** `AbortController.abort(reason)` used when parking tool_calls — close the Run, do not cancelAction. */
+const RELEASE_REASON = "release";
 
 function isJwt(token: string): boolean {
   return token.startsWith("eyJ") && token.split(".").length === 3;
@@ -103,9 +105,15 @@ export function createSdkAgentHost(opts?: {
 
       const handle: CustomToolAgentHandle = {
         agentId,
-        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void }) {
+        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void; signal?: AbortSignal }) {
           if (closed) throw new Error("agent is closed");
           const abort = new AbortController();
+          const onClientAbort = () => abort.abort();
+          const clientSignal = sendOpts?.signal;
+          if (clientSignal) {
+            if (clientSignal.aborted) abort.abort();
+            else clientSignal.addEventListener("abort", onClientAbort, { once: true });
+          }
           const run = runTurn({
             openRun,
             accessToken,
@@ -127,7 +135,16 @@ export function createSdkAgentHost(opts?: {
               createOpts.onCheckpoint?.(state);
             },
           });
-          return { wait: () => run, abort: () => abort.abort() };
+          void run.finally(() => clientSignal?.removeEventListener("abort", onClientAbort));
+          return {
+            wait: () => run,
+            abort: () => {
+              if (!abort.signal.aborted) abort.abort();
+            },
+            release: () => {
+              if (!abort.signal.aborted) abort.abort(RELEASE_REASON);
+            },
+          };
         },
         async close() {
           closed = true;
@@ -136,6 +153,26 @@ export function createSdkAgentHost(opts?: {
       return handle;
     },
   };
+}
+
+function isAbortError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const name = (err as { name?: string }).name;
+  if (name === "AbortError") return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return /aborted|AbortError/i.test(message);
+}
+
+function isReleaseAbort(signal?: AbortSignal): boolean {
+  return signal?.reason === RELEASE_REASON;
+}
+
+function stopDuplex(duplex: NonNullable<Awaited<ReturnType<OpenAgentRun>>>, signal?: AbortSignal): Promise<void> {
+  if (isReleaseAbort(signal)) {
+    closeAgentDuplex(duplex);
+    return Promise.resolve();
+  }
+  return abortAgentDuplex(duplex);
 }
 
 async function runTurn(opts: {
@@ -156,23 +193,24 @@ async function runTurn(opts: {
   conversationState?: JsonObject;
   onCheckpoint: (state: JsonObject) => void;
 }): Promise<{ text: string; thinking?: string; error?: string; usage?: AgentTurnUsage }> {
-  const duplex = await opts.openRun({
-    accessToken: opts.accessToken,
-    conversationId: opts.conversationId,
-    signal: opts.signal,
-  });
-  const runId = randomId();
+  let duplex: Awaited<ReturnType<OpenAgentRun>> | undefined;
+  let cancelled = false;
+  let aborting: Promise<void> | undefined;
+  const stopOnce = () => {
+    if (cancelled) return;
+    cancelled = true;
+    if (!duplex) return;
+    aborting = stopDuplex(duplex, opts.signal);
+  };
+  opts.signal?.addEventListener("abort", stopOnce, { once: true });
+  if (opts.signal?.aborted) stopOnce();
+
   let text = "";
   let thinking = "";
   let error: string | undefined;
   let usage: AgentTurnUsage | undefined;
   const inflight = new Set<Promise<void>>();
-
-  const heartbeat = setInterval(() => {
-    void duplex.send(clientHeartbeatMessage()).catch(() => {
-      /* stream may already be closed */
-    });
-  }, HEARTBEAT_MS);
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
 
   const track = (work: Promise<void>) => {
     inflight.add(work);
@@ -180,6 +218,23 @@ async function runTurn(opts: {
   };
 
   try {
+    duplex = await opts.openRun({
+      accessToken: opts.accessToken,
+      conversationId: opts.conversationId,
+      signal: opts.signal,
+    });
+    if (cancelled) {
+      await stopDuplex(duplex, opts.signal);
+      return { text: "", thinking: undefined, error: undefined };
+    }
+
+    const runId = randomId();
+    heartbeat = setInterval(() => {
+      void duplex!.send(clientHeartbeatMessage()).catch(() => {
+        /* stream may already be closed */
+      });
+    }, HEARTBEAT_MS);
+
     await duplex.send(
       clientRunMessage(
         buildRunRequest({
@@ -198,6 +253,7 @@ async function runTurn(opts: {
     );
 
     while (true) {
+      if (cancelled) break;
       const raw = await duplex.next();
       if (!raw) break;
       const parsed = parseServerMessage(raw);
@@ -228,7 +284,7 @@ async function runTurn(opts: {
         break;
       }
       if (parsed.kind === "abort") {
-        error = "AgentService aborted the run";
+        if (!cancelled) error = "AgentService aborted the run";
         break;
       }
       if (parsed.kind === "heartbeat" || parsed.kind === "ignore" || parsed.kind === "query") {
@@ -273,22 +329,24 @@ async function runTurn(opts: {
           track(
             (async () => {
               if (!call?.toolName) {
-                await duplex.send(mcpErrorResult(id, execId, "missing MCP tool name"));
+                await duplex!.send(mcpErrorResult(id, execId, "missing MCP tool name"));
                 return;
               }
               const tool = opts.customTools[call.toolName];
               if (!tool) {
-                await duplex.send(mcpErrorResult(id, execId, `Unknown custom tool: ${call.toolName}`));
+                await duplex!.send(mcpErrorResult(id, execId, `Unknown custom tool: ${call.toolName}`));
                 return;
               }
               try {
                 const result = await tool.execute(call.args || {}, { toolCallId: call.toolCallId });
-                await duplex.send(
+                if (cancelled) return;
+                await duplex!.send(
                   mcpSuccessResult(id, execId, contentToText(result), Boolean(result.isError)),
                 );
               } catch (err) {
+                if (cancelled) return;
                 const message = err instanceof Error ? err.message : String(err);
-                await duplex.send(mcpErrorResult(id, execId, message));
+                await duplex!.send(mcpErrorResult(id, execId, message));
               }
             })(),
           );
@@ -300,10 +358,14 @@ async function runTurn(opts: {
 
     if (inflight.size) await Promise.allSettled([...inflight]);
   } catch (err) {
-    error = err instanceof Error ? err.message : String(err);
+    if (!cancelled && !isAbortError(err)) {
+      error = err instanceof Error ? err.message : String(err);
+    }
   } finally {
-    clearInterval(heartbeat);
-    duplex.close();
+    opts.signal?.removeEventListener("abort", stopOnce);
+    if (heartbeat) clearInterval(heartbeat);
+    if (aborting) await aborting;
+    else duplex?.close();
   }
   return { text, thinking: thinking || undefined, error, usage };
 }

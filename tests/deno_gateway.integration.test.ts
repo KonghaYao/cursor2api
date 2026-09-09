@@ -724,6 +724,102 @@ Deno.test("cloud OpenAI tools park customTools.execute and resume with client re
   }
 });
 
+Deno.test("cloud OpenAI two tool rounds then final text (full transcript)", async () => {
+  cloudClientToolsClearForTests();
+  const usage = { inputTokens: 40, outputTokens: 4, cacheReadTokens: 30, cacheWriteTokens: 2 };
+  let sends = 0;
+  setCustomToolAgentHostForTests({
+    async create({ customTools }: { customTools: SdkCustomToolMap }) {
+      return {
+        agentId: "local-multi-round",
+        async send() {
+          const round = sends++;
+          const wait = (async () => {
+            if (round >= 2) return { text: "humidity 40 after two lookups", usage };
+            const first = Object.keys(customTools)[0];
+            if (!first) return { text: "no-tools", usage };
+            await customTools[first]!.execute({ round }, {});
+            return { text: "should-not-reach", usage };
+          })();
+          return { wait: () => wait, abort() {}, release() {} };
+        },
+        async close() {},
+      };
+    },
+  });
+  const kv = createMemoryKv();
+  const ctx = { kv, upstream: "cloud" as const };
+  const tools = [{ type: "function", function: { name: "lookup", parameters: { type: "object" } } }];
+  const user = { role: "user", content: "weather and humidity?" };
+  try {
+    const chat = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer crsr_test", "content-type": "application/json" },
+        body: JSON.stringify({ model: "composer-2.5", messages: [user], tools }),
+      }),
+      ctx,
+    );
+    if (chat.status !== 200) throw new Error(`chat ${chat.status}: ${await chat.text()}`);
+    const body1 = await chat.json();
+    if (body1?.choices?.[0]?.finish_reason !== "tool_calls") {
+      throw new Error(`expected tool_calls, got ${JSON.stringify(body1)}`);
+    }
+    const tc1 = body1.choices[0].message.tool_calls;
+    const chat2 = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer crsr_test", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          messages: [
+            user,
+            { role: "assistant", content: null, tool_calls: tc1 },
+            { role: "tool", tool_call_id: tc1[0].id, content: '{"temp":22}' },
+          ],
+          tools,
+        }),
+      }),
+      ctx,
+    );
+    if (chat2.status !== 200) throw new Error(`chat2 ${chat2.status}: ${await chat2.text()}`);
+    const body2 = await chat2.json();
+    if (body2?.choices?.[0]?.finish_reason !== "tool_calls") {
+      throw new Error(`expected second tool_calls, got ${JSON.stringify(body2)}`);
+    }
+    if (body2.conversation_id !== body1.conversation_id) {
+      throw new Error(`conversation_id changed: ${body1.conversation_id} -> ${body2.conversation_id}`);
+    }
+    const tc2 = body2.choices[0].message.tool_calls;
+    const chat3 = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer crsr_test", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          messages: [
+            user,
+            { role: "assistant", content: null, tool_calls: tc1 },
+            { role: "tool", tool_call_id: tc1[0].id, content: '{"temp":22}' },
+            { role: "assistant", content: null, tool_calls: tc2 },
+            { role: "tool", tool_call_id: tc2[0].id, content: '{"humidity":40}' },
+          ],
+          tools,
+        }),
+      }),
+      ctx,
+    );
+    if (chat3.status !== 200) throw new Error(`chat3 ${chat3.status}: ${await chat3.text()}`);
+    const body3 = await chat3.json();
+    if (!String(body3?.choices?.[0]?.message?.content || "").includes("humidity 40")) {
+      throw new Error(`expected final text after two tool rounds, got ${JSON.stringify(body3)}`);
+    }
+  } finally {
+    setCustomToolAgentHostForTests(undefined);
+    cloudClientToolsClearForTests();
+  }
+});
+
 Deno.test("cloud tool results continue when the parked execute() is gone", async () => {
   cloudClientToolsClearForTests();
   installFakeCustomToolHost();

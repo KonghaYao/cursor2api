@@ -13,6 +13,7 @@ import { ConnectFrameParser, encodeConnectFrame, type ConnectFrame } from "./byt
 import {
   ALLOWED_TOOLS_HEADER_NAME,
   MCP_ALLOWED_PROTO_TOOLS,
+  clientCancelMessage,
   connectErrorMessage,
   type JsonObject,
 } from "./agent_json.ts";
@@ -22,6 +23,21 @@ export type AgentDuplex = {
   next(): Promise<JsonObject | null>;
   close(): void;
 };
+
+/** Close the duplex without telling Cursor the turn was cancelled. */
+export function closeAgentDuplex(duplex: AgentDuplex): void {
+  duplex.close();
+}
+
+/** Send `cancelAction`, then close the duplex (HTTP abort / stream end). */
+export async function abortAgentDuplex(duplex: AgentDuplex): Promise<void> {
+  try {
+    await duplex.send(clientCancelMessage());
+  } catch {
+    /* already closed */
+  }
+  duplex.close();
+}
 
 export type OpenAgentRun = (opts: {
   accessToken: string;
@@ -213,18 +229,26 @@ class FetchConnectDuplex implements AgentDuplex {
   private readonly inbox = new ConnectInbox();
   private sendQueue: Promise<void> = Promise.resolve();
   private readonly writer: WritableStreamDefaultWriter<Uint8Array>;
+  private readonly reader: ReadableStreamDefaultReader<Uint8Array>;
+  private readonly stopTransport: () => void;
 
-  constructor(writer: WritableStreamDefaultWriter<Uint8Array>, responseBody: ReadableStream<Uint8Array>, httpStatus: number) {
+  constructor(
+    writer: WritableStreamDefaultWriter<Uint8Array>,
+    responseBody: ReadableStream<Uint8Array>,
+    httpStatus: number,
+    stopTransport: () => void,
+  ) {
     this.writer = writer;
+    this.reader = responseBody.getReader();
+    this.stopTransport = stopTransport;
     this.inbox.httpStatus = httpStatus;
-    void this.readResponse(responseBody);
+    void this.readResponse();
   }
 
-  private async readResponse(body: ReadableStream<Uint8Array>): Promise<void> {
-    const reader = body.getReader();
+  private async readResponse(): Promise<void> {
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await this.reader.read();
         if (done) {
           await this.inbox.finish();
           return;
@@ -247,11 +271,18 @@ class FetchConnectDuplex implements AgentDuplex {
   }
 
   close(): void {
+    if (this.inbox.closed) {
+      this.stopTransport();
+      return;
+    }
     this.inbox.closed = true;
-    void this.writer.close().catch(() => {
+    this.inbox.endWaiters();
+    void this.reader.cancel().catch(() => {
       /* empty */
     });
-    this.inbox.endWaiters();
+    void this.writer.close().catch(() => {
+      /* empty */
+    }).finally(() => this.stopTransport());
   }
 }
 
@@ -283,16 +314,25 @@ export async function openFetchAgentRun(opts: {
   }
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   const writer = writable.getWriter();
+  const transport = new AbortController();
+  const onDialAbort = () => transport.abort();
+  opts.signal?.addEventListener("abort", onDialAbort, { once: true });
+  if (opts.signal?.aborted) transport.abort();
   const init: RequestInit = {
     method: "POST",
     headers: agentRunHeaders(opts.accessToken, opts.conversationId),
     body: readable,
-    signal: opts.signal,
+    signal: transport.signal,
   };
   // Deno defaults ReadableStream bodies to duplex:full (response headers
   // arrive while the request is still open). Chromium/undici require
   // duplex:"half", which is NOT full-duplex — do not set it here.
-  const res = await fetchImpl(agentRunUrl(), init);
+  let res: Response;
+  try {
+    res = await fetchImpl(agentRunUrl(), init);
+  } finally {
+    opts.signal?.removeEventListener("abort", onDialAbort);
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     void writer.close().catch(() => {
@@ -306,11 +346,9 @@ export async function openFetchAgentRun(opts: {
     });
     throw new Error("AgentService/Run returned an empty body");
   }
-  const duplex = new FetchConnectDuplex(writer, res.body, res.status);
-  const onAbort = () => duplex.close();
-  opts.signal?.addEventListener("abort", onAbort, { once: true });
-  if (opts.signal?.aborted) duplex.close();
-  return duplex;
+  return new FetchConnectDuplex(writer, res.body, res.status, () => {
+    if (!transport.signal.aborted) transport.abort();
+  });
 }
 
 export async function openHttp2AgentRun(opts: {
@@ -328,12 +366,25 @@ export async function openHttp2AgentRun(opts: {
 
   const url = agentServiceUrl();
   const session = http2.connect(`${url.protocol}//${url.host}`);
-  await new Promise<void>((resolve, reject) => {
-    const onConnect = () => resolve();
-    const onError = (err: unknown) => reject(toError(err));
-    session.once("connect", onConnect as (...args: never[]) => void);
-    session.once("error", onError as (...args: never[]) => void);
-  });
+  const onDialAbort = () => {
+    try {
+      session.close();
+    } catch {
+      /* empty */
+    }
+  };
+  opts.signal?.addEventListener("abort", onDialAbort, { once: true });
+  if (opts.signal?.aborted) onDialAbort();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onConnect = () => resolve();
+      const onError = (err: unknown) => reject(toError(err));
+      session.once("connect", onConnect as (...args: never[]) => void);
+      session.once("error", onError as (...args: never[]) => void);
+    });
+  } finally {
+    opts.signal?.removeEventListener("abort", onDialAbort);
+  }
   const headers: Record<string, string> = {
     ":method": "POST",
     ":scheme": url.protocol.replace(":", "") || "https",
@@ -342,15 +393,11 @@ export async function openHttp2AgentRun(opts: {
     ...agentRunHeaders(opts.accessToken, opts.conversationId),
   };
   const stream = session.request(headers);
-  const duplex = new Http2ConnectDuplex(stream, () => {
+  return new Http2ConnectDuplex(stream, () => {
     try {
       session.close();
     } catch {
       /* empty */
     }
   });
-  const onAbort = () => duplex.close();
-  opts.signal?.addEventListener("abort", onAbort, { once: true });
-  if (opts.signal?.aborted) duplex.close();
-  return duplex;
 }

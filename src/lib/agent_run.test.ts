@@ -3,6 +3,8 @@ import test from "node:test";
 import { encodeConnectFrame } from "./bytes.ts";
 import { MCP_ALLOWED_PROTO_TOOLS } from "./agent_json.ts";
 import {
+  abortAgentDuplex,
+  closeAgentDuplex,
   agentRunHeaders,
   agentRunUrl,
   isDenoRuntime,
@@ -48,4 +50,38 @@ test("fetch transport reads server frames while the request body stays open", as
   assert.deepEqual(await duplex.next(), { interactionUpdate: { textDelta: { text: "hi" } } });
   assert.deepEqual(await duplex.next(), { interactionUpdate: { turnEnded: {} } });
   duplex.close();
+});
+
+test("abortAgentDuplex writes cancelAction before close", async () => {
+  const sent: unknown[] = [];
+  let closed = false;
+  const duplex = {
+    async send(message: Record<string, unknown>) {
+      sent.push(message);
+    },
+    next: async () => null,
+    close() {
+      closed = true;
+    },
+  };
+  await abortAgentDuplex(duplex);
+  assert.deepEqual(sent, [{ conversationAction: { cancelAction: {} } }]);
+  assert.equal(closed, true);
+});
+
+test("closeAgentDuplex does not send cancelAction", () => {
+  const sent: unknown[] = [];
+  let closed = false;
+  const duplex = {
+    async send(message: Record<string, unknown>) {
+      sent.push(message);
+    },
+    next: async () => null,
+    close() {
+      closed = true;
+    },
+  };
+  closeAgentDuplex(duplex);
+  assert.deepEqual(sent, []);
+  assert.equal(closed, true);
 });

@@ -212,7 +212,7 @@ function contentToText(content: unknown): string {
 export type ClientToolResult = { id: string; content: string; isError?: boolean };
 
 export function composeToolResultPrompt(results: ClientToolResult[]): string {
-  const lines = results.map((r) => `- ${r.id}: ${r.content}`);
+  const lines = results.map((r) => (r.isError ? `- ${r.id} ERROR: ${r.content}` : `- ${r.id}: ${r.content}`));
   return [
     "The client executed your custom tools. Results:",
     ...lines,

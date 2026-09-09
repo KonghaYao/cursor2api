@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   MCP_ALLOWED_PROTO_TOOLS,
   buildRunRequest,
+  clientCancelMessage,
   connectErrorMessage,
   gatewayAgentModelId,
   gatewayAgentModelSelection,
@@ -263,6 +264,11 @@ test("mcpSuccessResult is a complete exec client message", () => {
   const exec = msg.execClientMessage as { id: number; mcpResult: { success: { isError: boolean } } };
   assert.equal(exec.id, 3);
   assert.equal(exec.mcpResult.success.isError, false);
+});
+
+test("clientCancelMessage is ConversationAction.cancelAction", () => {
+  const msg = clientCancelMessage();
+  assert.deepEqual(msg, { conversationAction: { cancelAction: {} } });
 });
 
 test("connectErrorMessage reads Connect error envelopes", () => {

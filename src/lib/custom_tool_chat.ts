@@ -13,8 +13,11 @@
  * so the next request can slice only the new suffix.
  *
  * Each HTTP request opens and closes one AgentService/Run. Returning
- * `tool_calls` closes that duplex. The next `role: tool` is a new Run
+ * `tool_calls` closes that duplex **without** `cancelAction` (that would
+ * drop the turn from conversationState). The next `role: tool` is a new Run
  * with the latest tool results flattened into `userMessageAction`.
+ * Client disconnect / SSE cancel sends `conversationAction.cancelAction`
+ * on the in-flight Run, then closes the duplex.
  *
  * Client contract (the normal path, not an edge case): every request carries
  * the full OpenAI/Anthropic transcript, and the client keeps that prefix
@@ -282,6 +285,7 @@ export type AgentStreamDelta = { text?: string; thinking?: string };
 export type CustomToolSendOpts = {
   images?: AgentInlineImage[];
   onDelta?: (chunk: AgentStreamDelta) => void;
+  signal?: AbortSignal;
 };
 
 export type CustomToolAgentHandle = {
@@ -289,7 +293,7 @@ export type CustomToolAgentHandle = {
   send: (
     prompt: string,
     opts?: CustomToolSendOpts,
-  ) => Promise<{ wait: () => Promise<CustomToolTurnResult>; abort?: () => void }>;
+  ) => Promise<{ wait: () => Promise<CustomToolTurnResult>; abort?: () => void; release?: () => void }>;
   close: () => Promise<void>;
 };
 
@@ -389,6 +393,8 @@ type LiveTurn = {
   session: ClientToolSession;
   wait: () => Promise<CustomToolTurnResult>;
   abort?: () => void;
+  release?: () => void;
+  detachClientAbort?: () => void;
   done: boolean;
   text: string;
   thinking?: string;
@@ -397,9 +403,24 @@ type LiveTurn = {
   deltas: TextDeltaHub;
 };
 
-/** Close this HTTP request's AgentService/Run after offering tool_calls. */
+function attachClientAbort(signal: AbortSignal | undefined, abort: () => void): () => void {
+  if (!signal) return () => {};
+  if (signal.aborted) {
+    abort();
+    return () => {};
+  }
+  const onAbort = () => {
+    console.log("  custom_tools client_abort — AgentService cancelAction");
+    abort();
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
+  return () => signal.removeEventListener("abort", onAbort);
+}
+
+/** Close this HTTP request's AgentService/Run after offering tool_calls.
+ * Close-only: `cancelAction` would void the turn and break the next `role: tool`. */
 function releaseUpstreamAfterPark(live: LiveTurn, session: ClientToolSession): void {
-  live.abort?.();
+  (live.release ?? live.abort)?.();
   failParkedClientTools(session, "released: request-scoped AgentService run");
 }
 
@@ -486,9 +507,10 @@ async function settleCustomTools(
   session: ClientToolSession,
   live: LiveTurn,
 ): Promise<{ kind: "tools"; batch: ParkedClientTool[] } | { kind: "text" }> {
-  // Do not subscribe to HTTP request.signal. Deno.serve (legacy) aborts it
-  // after a successful response, which would look like the client hanging up
-  // and would tear down a parked AgentService/Run between tool_calls and role:tool.
+  // HTTP request.signal is bound to this turn's abort() (cancelAction) via
+  // attachClientAbort, not send({ signal }). Detach before returning 200 so
+  // Deno legacy abort after a successful response cannot fire cancel on a
+  // parked or later turn.
   const gate = new AbortController();
   const stop = () => gate.abort();
   void live.wait().then((result) => {
@@ -531,6 +553,7 @@ async function startCustomToolTurn(opts: {
   const session = upsertClientToolSession(tenant, sessionFp, opts.tools);
   const messages = Array.isArray(opts.body.messages) ? opts.body.messages : [];
   const toolResults = extractLatestClientToolResults(messages);
+  const toolFollowUp = lastTurnIsToolResult(messages) && toolResults.length > 0;
   const key = liveKey(tenant, sessionFp);
   const existing = liveTurns.get(key);
 
@@ -540,14 +563,19 @@ async function startCustomToolTurn(opts: {
   };
 
   if (existing && !existing.done) {
-    existing.abort?.();
-    failParkedClientTools(session, "cancelled: new user turn");
+    if (toolFollowUp) {
+      (existing.release ?? existing.abort)?.();
+      if (session.parked.length) failParkedClientTools(session, "released: previous AgentService run");
+    } else {
+      existing.abort?.();
+      failParkedClientTools(session, "cancelled: new user turn");
+    }
     try {
       await existing.wait();
     } catch {
       /* previous AgentService/Run closed */
     }
-  } else if (session.parked.length) {
+  } else if (session.parked.length && !toolFollowUp) {
     failParkedClientTools(session, "cancelled: new user turn");
   }
 
@@ -585,7 +613,6 @@ async function startCustomToolTurn(opts: {
     },
   }));
   const hadPriorTurn = Boolean(existing) || Boolean(binding);
-  const toolFollowUp = lastTurnIsToolResult(messages) && toolResults.length > 0;
   if (toolFollowUp) {
     console.log(
       `  custom_tools follow_tool session=${sessionId.slice(0, 24)} existing=${Boolean(existing)} kv=${Boolean(binding)} — new AgentService/Run`,
@@ -607,13 +634,20 @@ async function startCustomToolTurn(opts: {
   const run = await agent.send(prompt, {
     ...(images.length ? { images } : {}),
     onDelta: (chunk) => deltas.push(chunk),
+    // Do not pass HTTP request.signal into send(): Deno.serve aborts it after
+    // 200, which would cancelAction a parked Run. Client abort is attachClientAbort.
   });
   await persistCommittedLength();
+  const abortRun = () => run.abort?.();
+  const releaseRun = () => (run.release ?? run.abort)?.();
+  const detachClientAbort = attachClientAbort(opts.signal, abortRun);
   const live: LiveTurn = {
     agent,
     session,
     wait: run.wait,
-    abort: run.abort,
+    abort: abortRun,
+    release: releaseRun,
+    detachClientAbort,
     done: false,
     text: "",
     deltas,
@@ -627,6 +661,7 @@ async function startCustomToolTurn(opts: {
     live.error = result.error;
     live.usage = result.usage;
     void persistBinding(checkpoint.state);
+    detachClientAbort();
   });
   const origin = existing ? "follow" : binding ? "kv_hit" : "create";
   console.log(`  custom_tools ${origin} session=${sessionId.slice(0, 24)} agent=${agent.agentId.slice(0, 14)} tools=${opts.tools.length} images=${images.length}`);
@@ -674,6 +709,27 @@ function liveResult(live: LiveTurn): CustomToolTurnResult {
   return { text: live.text, thinking: live.thinking, error: live.error, usage: live.usage };
 }
 
+function trimAgentError(error?: string): string | undefined {
+  const msg = String(error || "").trim();
+  return msg || undefined;
+}
+
+function logCustomToolError(error?: string): void {
+  const msg = trimAgentError(error);
+  if (!msg) return;
+  console.log(`  custom_tools error ${msg.slice(0, 300)}`);
+}
+
+/** Cursor Agent often ignores a lone `error` field; keep the message in visible text too. */
+function agentVisibleText(text?: string, error?: string): string {
+  const t = text || "";
+  const e = trimAgentError(error);
+  if (!e) return t;
+  if (!t) return e;
+  if (t.includes(e)) return t;
+  return `${t}\n${e}`;
+}
+
 function anthropicContentBlocks(opts: { thinking?: string; text?: string; toolUses?: unknown[] }): unknown[] {
   const content: unknown[] = [];
   if (opts.thinking) content.push({ type: "thinking", thinking: opts.thinking });
@@ -693,22 +749,24 @@ function openAiCompletion(opts: {
   toolCalls?: ReturnType<typeof clientToolsToOpenAi>;
 }) {
   const toolCalls = opts.toolCalls?.length ? opts.toolCalls : undefined;
+  const err = trimAgentError(opts.error);
   const message: Record<string, unknown> = {
     role: "assistant",
-    content: opts.text || (toolCalls ? null : ""),
+    content: toolCalls ? opts.text || null : agentVisibleText(opts.text, err),
   };
   if (opts.thinking) message.reasoning_content = opts.thinking;
   if (toolCalls) message.tool_calls = toolCalls;
+  if (err) logCustomToolError(err);
   return {
     id: opts.agentId,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
     model: String(opts.model || "composer-2.5"),
-    choices: [{ index: 0, message, finish_reason: opts.error ? "stop" : toolCalls ? "tool_calls" : "stop" }],
+    choices: [{ index: 0, message, finish_reason: err ? "stop" : toolCalls ? "tool_calls" : "stop" }],
     usage: openaiUsageFromAgent(opts.usage),
     cursor_agent_id: opts.agentId,
     conversation_id: opts.sessionId,
-    error: opts.error ? { message: opts.error, type: "api_error" } : undefined,
+    error: err ? { message: err, type: "api_error" } : undefined,
   };
 }
 
@@ -733,6 +791,7 @@ export async function handleCustomToolChatCompletions(opts: {
     return streamCustomOpenAi({ ...started, model: opts.body.model, agentId, signal: opts.signal });
   }
   const settled = await settleCustomTools(started.session, started.live);
+  started.live.detachClientAbort?.();
   if (settled.kind === "tools") {
     offerClientToolBatch(started.session, settled.batch);
     releaseUpstreamAfterPark(started.live, started.session);
@@ -791,6 +850,7 @@ export async function handleCustomToolMessages(opts: {
     return streamCustomAnthropic({ ...started, model: opts.body.model, agentId, requestId: opts.requestId, signal: opts.signal });
   }
   const settled = await settleCustomTools(started.session, started.live);
+  started.live.detachClientAbort?.();
   if (settled.kind === "tools") {
     offerClientToolBatch(started.session, settled.batch);
     releaseUpstreamAfterPark(started.live, started.session);
@@ -811,12 +871,17 @@ export async function handleCustomToolMessages(opts: {
   const result = started.live.done ? liveResult(started.live) : await started.live.wait();
   logAgentUsage(result.usage);
   ackLiveDeltas(started.live, result.thinking, result.text);
+  const err = trimAgentError(result.error);
+  logCustomToolError(err);
+  if (err && !result.text && !result.thinking) {
+    return jsonResponse(200, toAnthropicError({ message: err, type: "api_error" }, opts.requestId), opts.requestId);
+  }
   return jsonResponse(200, {
     id: `msg_${agentId}`,
     type: "message",
     role: "assistant",
     model: String(opts.body.model || "composer-2.5"),
-    content: anthropicContentBlocks({ thinking: result.thinking, text: result.text || result.error || "" }),
+    content: anthropicContentBlocks({ thinking: result.thinking, text: agentVisibleText(result.text, err) }),
     stop_reason: "end_turn",
     usage: anthropicUsageFromAgent(result.usage),
     cursor_agent_id: agentId,
@@ -892,7 +957,13 @@ function streamCustomOpenAi(opts: {
           return;
         }
         logAgentUsage(live.usage);
-        if (live.error) {
+        const err = trimAgentError(live.error);
+        if (err) {
+          logCustomToolError(err);
+          if (emittedText === 0) {
+            controller.enqueue(chunk({ content: err }));
+            emittedText = err.length;
+          }
           controller.enqueue(
             encodeSseData({
               id: agentId,
@@ -900,7 +971,7 @@ function streamCustomOpenAi(opts: {
               created,
               model: String(model || "composer-2.5"),
               choices: [],
-              error: { message: live.error, type: "api_error" },
+              error: { message: err, type: "api_error" },
             }),
           );
         }
@@ -930,8 +1001,13 @@ function streamCustomOpenAi(opts: {
         );
         controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
       } finally {
+        live.detachClientAbort?.();
         controller.close();
       }
+    },
+    cancel() {
+      live.detachClientAbort?.();
+      live.abort?.();
     },
   });
   return Promise.resolve(sseStreamResponse(stream));
@@ -1060,6 +1136,31 @@ function streamCustomAnthropic(opts: {
           return;
         }
         logAgentUsage(live.usage);
+        const err = trimAgentError(live.error);
+        const hadModelOutput = emittedText > 0 || emittedThinking > 0;
+        if (err) {
+          logCustomToolError(err);
+          if (!hadModelOutput) {
+            controller.enqueue(
+              encodeSseEvent("content_block_start", {
+                type: "content_block_start",
+                index,
+                content_block: { type: "text", text: "" },
+              }),
+            );
+            open = "text";
+            controller.enqueue(
+              encodeSseEvent("content_block_delta", {
+                type: "content_block_delta",
+                index,
+                delta: { type: "text_delta", text: err },
+              }),
+            );
+          }
+          closeOpen();
+          controller.enqueue(encodeSseEvent("error", toAnthropicError({ message: err, type: "api_error" }, requestId)));
+          if (!hadModelOutput) return;
+        }
         controller.enqueue(
           encodeSseEvent("message_delta", {
             type: "message_delta",
@@ -1072,8 +1173,13 @@ function streamCustomAnthropic(opts: {
         const message = err instanceof Error ? err.message : String(err);
         controller.enqueue(encodeSseEvent("error", toAnthropicError({ message, type: "api_error" }, requestId)));
       } finally {
+        live.detachClientAbort?.();
         controller.close();
       }
+    },
+    cancel() {
+      live.detachClientAbort?.();
+      live.abort?.();
     },
   });
   return Promise.resolve(sseStreamResponse(stream, requestId));

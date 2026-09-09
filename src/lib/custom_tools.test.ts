@@ -254,6 +254,9 @@ test("composeToolResultPrompt lists client tool output", () => {
   const text = composeToolResultPrompt([{ id: "call_1", content: '{"temp":22}' }]);
   assert.match(text, /call_1/);
   assert.match(text, /22/);
+  const failed = composeToolResultPrompt([{ id: "call_2", content: "lookup failed", isError: true }]);
+  assert.match(failed, /call_2 ERROR:/);
+  assert.match(failed, /lookup failed/);
 });
 
 test("sdk local agent allowlists only mcp so customTools work and builtins stay off", () => {

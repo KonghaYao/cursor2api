@@ -89,7 +89,11 @@ Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。不要为了半
 
 **2026-09-09 实机**：Deno + `crsr_` + `composer-2.5-fast` 无 tools PONG，`turnEnded` = `inputTokens=3672` `outputTokens=91` `cacheReadTokens=3616` `cacheWriteTokens=0`，OpenAI `usage` 同数。首轮高 Cache Read 是 Composer 前缀缓存。
 
-Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里的 legacy abort）。**不要**把这个 signal 接到 AgentService 双工上。`tool_calls` 返回时网关自己关后向 `Run`；`role: tool` 本来就是新开的一枪，不再依赖跨请求 park。`deno.json` 仍开 `--unstable-no-legacy-abort`。
+Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里的 legacy abort）。**不要**把这个 signal 接到一条已经交过卷的 Run、或下一枪新开的 Run 上。`tool_calls` 返回时网关自己关后向 `Run`；`role: tool` 本来就是新开的一枪，不再依赖跨请求 park。`deno.json` 仍开 `--unstable-no-legacy-abort`。
+
+**交 `tool_calls` ≠ 用户中断：** 返回 OpenAI `tool_calls` / Anthropic `tool_use` 时只 **close 双工**，**不要**发 `cancelAction`，也不要把 park 的 `execute()` 折成 MCP `mcpResult` 错误回给上游。`cancelAction` 会把这一轮作废，Cursor `conversationState` 对不上下一枪只带 tool 结果的 `userMessageAction`，多轮工具会断。HTTP `request.signal` 只通过 `attachClientAbort` 绑到 **cancel**，交卷前摘掉；不要把它传进 `agent.send({ signal })`（Deno 200 后 abort 会误发 cancel）。
+
+**用户端中断（官方 abort）：** 客户端断开 HTTP / 取消 SSE 时，对**这一枪还在飞的** `AgentService/Run` 发 `conversationAction.cancelAction`（proto `CancelAction`），再关双工。不要只停本地 SSE 而让上游继续计费。握手阶段（`fetch` 还没连上）才直接 abort 传输。成功返回 200 之后立刻摘掉 `request.signal`，避免 Deno legacy abort 误发 cancel。`ReadableStream.cancel()`（SSE 客户端丢连接）同样走 `cancelAction`。
 
 **会话 id（Deno isolate / serverless）：** `conversationId` = `tenant:agentRunFp`。`agentRunFp` = model / effort / flags / tools / system / **第一条 user**（不含后续轮次；AgentService 只送最新 delta，上文在 Cursor `conversationState`）。客户端 `x-session-id` / `conversation_id` **忽略**。**每一枪 HTTP 开/关一条 `AgentService/Run`**：返回 `tool_calls` 就关掉双工。`role: tool` 一律新开 Run，把最近一轮 tool 结果写成 `userMessageAction`。KV `agent-run:${tenant}:${fp}` 只存 `{fp, conversationId, agentSessionId, conversationState?}`，TTL 24h，checkpoint 超 `AGENT_RUN_STATE_MAX_BYTES`（24KiB）则丢掉 state 只留 ids。KV `agent-run-len:` 只存上次成功处理的 `messages.length`，TTL **5 分钟**，用来 `slice` 增量；**不要**并进 24h 的 `agent-run`，也**不要**把 messages / canon 写进 KV。
 
@@ -108,7 +112,8 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 - 只把最后一条 user 丢给 AgentService（OpenAI `system` 必须折进 user 文本）
 - 把「客户端只发增量 messages」当成产品场景。常态是 **每轮全量 + 前缀稳定**；网关从全量抽 delta，禁止把整段 history 再叠进 `userMessageAction`
 - 跟进轮次再把 system / 整段 history / 历史 tool results 叠进 `userMessageAction`（Cursor `conversationState` 里已经有上文，会打坏 cache）。park_miss 只送**最近一轮** tool 结果；没有 live/KV 的冷启动才把全部 tool 结果和首条 user 折进去。
-- 把 HTTP `request.signal` 绑到 parked AgentService/Run 上（Deno.serve 成功响应会 abort，第二枪 `role: tool` 变 409）
+- 把 HTTP `request.signal` 绑到**已经返回的**或**下一枪** AgentService/Run 上（Deno.serve 成功响应会 abort）。用户取消**当前还在飞的**那一枪必须发 `cancelAction`，不要只关本地 SSE。
+- 交 `tool_calls` 时对 AgentService 发 `cancelAction` 或回一条失败的 `mcpResult`（那是用户中断，不是关这一枪 HTTP；多轮工具会断）
 - 给 AgentService 只送 `modelId: composer-2.5` 而不带 `parameters.fast=false`（上游默认 Fast，Team Usage 记成 `composer-2.5-fast`）
 - 给 AgentService 的 Grok 只剥 `-fast`、不传 `parameters.effort`（思考强度会掉回上游默认，而不是客户端的 `reasoning_effort` / id 里的 `low|medium|high|xhigh`）
 - 给 AgentService 每轮 `randomId()` 当 conversationId（isolate 一跳就丢 cache；用 `tenant:agentRunFp`，fp **不要**混进整段 pending transcript，只锚第一条 user）

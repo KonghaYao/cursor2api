@@ -177,6 +177,11 @@ export function clientHeartbeatMessage(): JsonObject {
   return { clientHeartbeat: {} };
 }
 
+/** Official in-band stop: `ConversationAction.cancel_action` on the live Run stream. */
+export function clientCancelMessage(): JsonObject {
+  return { conversationAction: { cancelAction: {} } };
+}
+
 function execReply(id: unknown, execId: unknown, body: JsonObject): JsonObject {
   const msg: JsonObject = { ...body };
   if (id !== undefined) msg.id = id;
