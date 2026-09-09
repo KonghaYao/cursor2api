@@ -61,7 +61,7 @@ OpenAI `/v1/chat/completions`：
 - 支持 `tools[].function`、`tool_choice` 和 `parallel_tool_calls`
 - 工具调用通过 `message.tool_calls` 或 **一条完整** `delta.tool_calls` 返回（Cursor Agent 不接受增量分片）
 - 工具结果使用 `role: "tool"` 和 `tool_call_id`；网关 **park** `customTools.execute()`，等客户端回灌后再继续同一条 Agent 流
-- `system` / `developer` 会折进当轮 user 文本（`<system>…</system>`）；**不要**指望上游 `customSystemPrompt`（会被当成 CLI `--system-prompt` 拒掉）
+- `system` / `developer` **只在该 session 首轮**折进 user 文本（`<system>…</system>`）；跟进只送最新一条 user。**不要**指望上游 `customSystemPrompt`（会被当成 CLI `--system-prompt` 拒掉）
 - 流结束标记为 `[DONE]`
 
 Anthropic `/v1/messages`：
@@ -90,7 +90,7 @@ Anthropic `/v1/messages`：
 | Deno 发版 / 重启 | id 仍稳定 | **换轨**，checkpoint 丢失 |
 | 响应里的 Cache Read | `usage.prompt_tokens_details.cached_tokens` | **没有**；`usage` 常为 0。真命中率看 Team Usage CSV |
 
-客户端仍应每轮发送完整 messages（含 tool 历史）。网关跟进只取最新 user（外加折进去的 system），历史靠上游 conversation state。
+客户端仍应每轮发送完整 messages（含 tool 历史）。网关首轮取 system + 最新 user；**跟进只取最新 user**。历史在 Cursor 的 `conversationState` 里，不要再 flatten 整段上文。
 
 ## 运行时
 

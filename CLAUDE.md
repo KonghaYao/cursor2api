@@ -32,7 +32,7 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 - 空头 / 不含 MCP → **`customTools` 也不会出现**
 - 只开 MCP 家族 → customTools 可用，shell/edit/grep/task/webSearch 关掉
 
-**不要**设 `AgentRunRequest.excludeWorkspaceContext = true`（`Workspace context exclusion is not allowed…`），也**不要**设 `customSystemPrompt`（会被当成 CLI `--system-prompt` 打回 `unknown option`）。无 workspace 靠 MCP allowlist + `mcpFileSystemOptions.enabled = false`。客户端 `system` **折进 user 文本**（`<system>…</system>`）。不要把客户端 tools 挂成 HTTP MCP。
+**不要**设 `AgentRunRequest.excludeWorkspaceContext = true`（`Workspace context exclusion is not allowed…`），也**不要**设 `customSystemPrompt`（会被当成 CLI `--system-prompt` 打回 `unknown option`）。无 workspace 靠 MCP allowlist + `mcpFileSystemOptions.enabled = false`。客户端 `system` **只在首轮**折进 user 文本（`<system>…</system>`）；跟进只送最新 user，上文靠 Cursor `conversationState`。不要把客户端 tools 挂成 HTTP MCP。
 
 ### 运行时
 
@@ -47,6 +47,8 @@ Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。官方 SDK 的 
 
 `stream: true` 的 `tool_calls` 仍须 **一条完整 delta**（见 2026-08-31）。会话用稳定 `x-session-id` park `execute()`；`SESSION_MODE=random` 不行。
 
+Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里的 legacy abort）。**不要**把这个 signal 接到 AgentService 双工或 `settleCustomTools` 上，否则第一枪 `tool_calls` 返回后 park 被掐掉，第二枪 `role: tool` 会 409。`deno.json` 开 `--unstable-no-legacy-abort`。若 isolate / 流已经没了，跟进改为把 tool results 写成新 user prompt，而不是 409。
+
 ### 不要做的
 
 - 把 tools 改回 `InferenceService/Stream`
@@ -59,6 +61,8 @@ Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。官方 SDK 的 
 - 设 `excludeWorkspaceContext = true`（Dashboard `crsr_` 会 invalid_argument）
 - 设 `customSystemPrompt`（上游当成 `--system-prompt` 拒掉）
 - 只把最后一条 user 丢给 AgentService（OpenAI `system` 必须折进 user 文本）
+- 跟进轮次再把 system / 整段 history 叠进 `userMessageAction`（Cursor `conversationState` 里已经有上文，会打坏 cache）
+- 把 HTTP `request.signal` 绑到 parked AgentService/Run 上（Deno.serve 成功响应会 abort，第二枪 `role: tool` 变 409）
 
 ---
 

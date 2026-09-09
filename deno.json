@@ -1,8 +1,9 @@
 {
   "tasks": {
-    "start": "deno run --allow-net --allow-env --allow-read --allow-write src/deno.ts",
-    "test": "deno test --allow-net --allow-env --allow-read --allow-write tests/"
+    "start": "deno run --unstable-no-legacy-abort --allow-net --allow-env --allow-read --allow-write src/deno.ts",
+    "test": "deno test --unstable-no-legacy-abort --allow-net --allow-env --allow-read --allow-write tests/"
   },
+  "unstable": ["no-legacy-abort"],
   "compilerOptions": {
     "strict": true,
     "lib": ["deno.window"]

@@ -211,6 +211,15 @@ function contentToText(content: unknown): string {
 
 export type ClientToolResult = { id: string; content: string; isError?: boolean };
 
+export function composeToolResultPrompt(results: ClientToolResult[]): string {
+  const lines = results.map((r) => `- ${r.id}: ${r.content}`);
+  return [
+    "The client executed your custom tools. Results:",
+    ...lines,
+    "Continue from these results. Do not call the same tools again unless you need new data.",
+  ].join("\n");
+}
+
 export function extractClientToolResults(messages: unknown[]): ClientToolResult[] {
   const out: ClientToolResult[] = [];
   for (const m of messages) {

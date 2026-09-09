@@ -636,8 +636,11 @@ function installFakeCustomToolHost(created: string[] = []) {
       created.push(agentId);
       return {
         agentId,
-        async send(_prompt: string) {
+        async send(prompt: string) {
           const wait = (async () => {
+            if (prompt.includes("executed your custom tools")) {
+              return { text: "done:22c from tool results" };
+            }
             const first = names[0];
             if (!first) return { text: "no-tools" };
             const result = await customTools[first]!.execute({ city: "Tokyo" }, {});
@@ -709,6 +712,68 @@ Deno.test("cloud OpenAI tools park customTools.execute and resume with client re
     const chat2Body = await chat2.json();
     if (!String(chat2Body?.choices?.[0]?.message?.content || "").includes("22")) {
       throw new Error(`expected final text from customTools.execute, got ${JSON.stringify(chat2Body)}`);
+    }
+  } finally {
+    setCustomToolAgentHostForTests(undefined);
+    cloudClientToolsClearForTests();
+  }
+});
+
+Deno.test("cloud tool results continue when the parked execute() is gone", async () => {
+  cloudClientToolsClearForTests();
+  installFakeCustomToolHost();
+  const kv = createMemoryKv();
+  const ctx = { kv, upstream: "cloud" as const };
+  const tools = [{ type: "function", function: { name: "get_weather", parameters: { type: "object", properties: { city: { type: "string" } } } } }];
+  try {
+    const chat = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer crsr_test",
+          "content-type": "application/json",
+          "x-session-id": "sess-park-miss",
+        },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          messages: [{ role: "user", content: "weather in tokyo?" }],
+          tools,
+        }),
+      }),
+      ctx,
+    );
+    if (chat.status !== 200) throw new Error(`chat ${chat.status}: ${await chat.text()}`);
+    const chatBody = await chat.json();
+    const tc = chatBody.choices[0].message.tool_calls;
+    cloudClientToolsClearForTests();
+    installFakeCustomToolHost();
+    const chat2 = await handleGatewayRequest(
+      new Request("http://127.0.0.1/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer crsr_test",
+          "content-type": "application/json",
+          "x-session-id": "sess-park-miss",
+        },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          messages: [
+            { role: "user", content: "weather in tokyo?" },
+            { role: "assistant", content: null, tool_calls: tc },
+            { role: "tool", tool_call_id: tc[0].id, content: '{"temp_c":22}' },
+          ],
+          tools,
+        }),
+      }),
+      ctx,
+    );
+    if (chat2.status !== 200) throw new Error(`chat2 ${chat2.status}: ${await chat2.text()}`);
+    const chat2Body = await chat2.json();
+    if (String(chat2Body?.error?.message || "").includes("expired")) {
+      throw new Error(`park miss should not expire: ${JSON.stringify(chat2Body)}`);
+    }
+    if (!String(chat2Body?.choices?.[0]?.message?.content || "").includes("22")) {
+      throw new Error(`expected follow-up text from tool results, got ${JSON.stringify(chat2Body)}`);
     }
   } finally {
     setCustomToolAgentHostForTests(undefined);

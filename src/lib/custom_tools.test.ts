@@ -13,6 +13,7 @@ import {
   resolveClientToolResults,
   toolPolicyPrompt,
   upsertClientToolSession,
+  composeToolResultPrompt,
 } from "./custom_tools.ts";
 import {
   SDK_CUSTOM_ONLY_BUILTIN_TOOLS,
@@ -110,6 +111,33 @@ test("system and Anthropic body.system are folded into the user prompt", () => {
   });
   assert.match(prompt, /<system>\nsecret ALPHA\n<\/system>/);
   assert.match(prompt, /code\?/);
+  const follow = composeCustomToolPrompt({
+    body: {
+      messages: [
+        { role: "system", content: "secret ALPHA" },
+        { role: "user", content: "first" },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "second" },
+      ],
+    },
+    tools: [],
+    messages: [
+      { role: "system", content: "secret ALPHA" },
+      { role: "user", content: "first" },
+      { role: "assistant", content: "ok" },
+      { role: "user", content: "second" },
+    ],
+    followUp: true,
+  });
+  assert.equal(follow, "second");
+  assert.equal(follow.includes("secret ALPHA"), false);
+  assert.equal(follow.includes("first"), false);
+});
+
+test("composeToolResultPrompt lists client tool output", () => {
+  const text = composeToolResultPrompt([{ id: "call_1", content: '{"temp":22}' }]);
+  assert.match(text, /call_1/);
+  assert.match(text, /22/);
 });
 
 test("sdk local agent allowlists only mcp so customTools work and builtins stay off", () => {

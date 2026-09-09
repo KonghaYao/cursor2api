@@ -15,6 +15,7 @@ import { resolveSessionKvId } from "./cloud_session.ts";
 import {
   clientToolsToAnthropic,
   clientToolsToOpenAi,
+  composeToolResultPrompt,
   extractClientToolResults,
   failParkedClientTools,
   lastTurnIsToolResult,
@@ -118,10 +119,15 @@ export function composeCustomToolPrompt(opts: {
   body: Record<string, unknown>;
   tools: CustomToolDef[];
   messages: unknown[];
+  followUp?: boolean;
 }): string {
   const policy = toolPolicyPrompt(opts.body, opts.tools);
-  const system = systemPromptFromClient(opts.body);
   const user = lastUserPrompt(opts.messages);
+  // Follow-ups: Cursor already has system + prior turns in conversationState.
+  // Re-folding system into every userMessageAction looks like a huge new prompt
+  // and fights prompt cache. Only the latest user text is the delta.
+  if (opts.followUp) return [policy, user].filter(Boolean).join("\n\n");
+  const system = systemPromptFromClient(opts.body);
   const wrapped = system ? `<system>\n${system}\n</system>` : "";
   return [policy, wrapped, user].filter(Boolean).join("\n\n");
 }
@@ -201,11 +207,12 @@ async function resolveHost(): Promise<CustomToolAgentHost> {
 async function settleCustomTools(
   session: ClientToolSession,
   live: LiveTurn,
-  signal?: AbortSignal,
 ): Promise<{ kind: "tools"; batch: ParkedClientTool[] } | { kind: "text" }> {
+  // Do not subscribe to HTTP request.signal. Deno.serve (legacy) aborts it
+  // after a successful response, which would look like the client hanging up
+  // and would tear down a parked AgentService/Run between tool_calls and role:tool.
   const gate = new AbortController();
   const stop = () => gate.abort();
-  signal?.addEventListener("abort", stop, { once: true });
   void live.wait().then((result) => {
     live.done = true;
     live.text = result.text;
@@ -213,13 +220,13 @@ async function settleCustomTools(
     stop();
   });
   try {
-    while (!live.done && !signal?.aborted) {
+    while (!live.done) {
       const batch = await waitForClientToolBatch(session, gate.signal);
       if (batch.length) return { kind: "tools", batch };
       if (live.done) break;
     }
-  } finally {
-    signal?.removeEventListener("abort", stop);
+  } catch {
+    /* gate abort when the run finishes */
   }
   const leftover = session.parked.filter((p) => !p.offered);
   if (leftover.length) return { kind: "tools", batch: leftover };
@@ -244,15 +251,16 @@ async function startCustomToolTurn(opts: {
   const toolResults = extractClientToolResults(messages);
   const key = liveKey(tenant, sessionId);
   const existing = liveTurns.get(key);
+  const canResumePark =
+    Boolean(existing) &&
+    !existing!.done &&
+    session.parked.some((p) => p.resolve);
 
-  if (lastTurnIsToolResult(messages) && toolResults.length) {
-    if (!existing || existing.done) {
-      throw new CloudChatError("Custom tool bridge expired (execute() is no longer parked). Retry the user turn with a stable session id.", 409);
-    }
+  if (lastTurnIsToolResult(messages) && toolResults.length && canResumePark) {
     const n = resolveClientToolResults(session, toolResults);
     if (!n) throw new CloudChatError("tool results did not match a parked custom tool call", 400);
-    console.log(`  custom_tools resume session=${sessionId.slice(0, 24)} agent=${existing.agent.agentId.slice(0, 14)}`);
-    return { live: existing, session, sessionId, continued: true };
+    console.log(`  custom_tools resume session=${sessionId.slice(0, 24)} agent=${existing!.agent.agentId.slice(0, 14)}`);
+    return { live: existing!, session, sessionId, continued: true };
   }
 
   if (session.parked.length) failParkedClientTools(session, "cancelled: new user turn");
@@ -260,11 +268,32 @@ async function startCustomToolTurn(opts: {
   const host = await resolveHost();
   const customTools = toSdkCustomTools(session);
   const agent = existing?.agent ?? (await host.create({ apiKey: opts.apiKey, model: opts.body.model, customTools }));
-  const prompt = composeCustomToolPrompt({
-    body: opts.body,
-    tools: opts.tools,
-    messages,
-  });
+  const toolFollowUp = lastTurnIsToolResult(messages) && toolResults.length > 0;
+  if (toolFollowUp) {
+    console.log(
+      `  custom_tools park_miss session=${sessionId.slice(0, 24)} existing=${Boolean(existing)} done=${Boolean(existing?.done)} — continuing as follow-up prompt`,
+    );
+  }
+  const prompt = toolFollowUp
+    ? [
+        existing
+          ? [toolPolicyPrompt(opts.body, opts.tools), lastUserPrompt(messages)].filter(Boolean).join("\n\n")
+          : composeCustomToolPrompt({
+              body: opts.body,
+              tools: opts.tools,
+              messages,
+              followUp: false,
+            }),
+        composeToolResultPrompt(toolResults),
+      ]
+        .filter(Boolean)
+        .join("\n\n")
+    : composeCustomToolPrompt({
+        body: opts.body,
+        tools: opts.tools,
+        messages,
+        followUp: Boolean(existing),
+      });
   const run = await agent.send(prompt);
   const live: LiveTurn = {
     agent,
@@ -322,7 +351,7 @@ export async function handleCustomToolChatCompletions(opts: {
   if (opts.body.stream) {
     return streamCustomOpenAi({ ...started, model: opts.body.model, agentId, signal: opts.signal });
   }
-  const settled = await settleCustomTools(started.session, started.live, opts.signal);
+  const settled = await settleCustomTools(started.session, started.live);
   if (settled.kind === "tools") {
     offerClientToolBatch(started.session, settled.batch);
     const toolCalls = clientToolsToOpenAi(settled.batch);
@@ -364,7 +393,7 @@ export async function handleCustomToolMessages(opts: {
   if (opts.body.stream) {
     return streamCustomAnthropic({ ...started, model: opts.body.model, agentId, requestId: opts.requestId, signal: opts.signal });
   }
-  const settled = await settleCustomTools(started.session, started.live, opts.signal);
+  const settled = await settleCustomTools(started.session, started.live);
   if (settled.kind === "tools") {
     offerClientToolBatch(started.session, settled.batch);
     const toolUses = clientToolsToAnthropic(settled.batch);
@@ -421,7 +450,7 @@ function streamCustomOpenAi(opts: {
         });
       try {
         controller.enqueue(chunk({ role: "assistant" }));
-        const settled = await settleCustomTools(session, live, signal);
+        const settled = await settleCustomTools(session, live);
         if (live.text) controller.enqueue(chunk({ content: live.text }));
         if (settled.kind === "tools") {
           offerClientToolBatch(session, settled.batch);
@@ -486,7 +515,7 @@ function streamCustomAnthropic(opts: {
             message: { id: msgId, type: "message", role: "assistant", model: String(model || "composer-2.5"), content: [] },
           }),
         );
-        const settled = await settleCustomTools(session, live, signal);
+        const settled = await settleCustomTools(session, live);
         let index = 0;
         if (live.text) {
           controller.enqueue(encodeSseEvent("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
