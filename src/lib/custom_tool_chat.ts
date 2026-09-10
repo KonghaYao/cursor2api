@@ -603,12 +603,20 @@ async function startCustomToolTurn(opts: {
   if (priorMessageCount && messages.length > priorMessageCount) {
     console.log(`  custom_tools slice prior=${priorMessageCount} n=${messages.length}`);
   }
+  // Same-process user follow-up: do not overwrite Cursor's checkpoint with a
+  // homemade splice. First shot, isolate hop, and role:tool still splice.
+  const reuseUpstreamState = Boolean(existing) && !toolFollowUp;
+  if (!toolFollowUp && (existing || binding)) {
+    console.log(
+      `  custom_tools follow_user session=${sessionId.slice(0, 24)} existing=${Boolean(existing)} kv=${Boolean(binding)} reuse_state=${reuseUpstreamState} roots=${(spliced.conversationState.rootPromptMessagesJson as unknown[] | undefined)?.length ?? 0}`,
+    );
+  }
   const deltas = createTextDeltaHub();
   const run = await agent.send(spliced.prompt, {
     ...(images.length ? { images } : {}),
     resume: spliced.resume,
-    conversationState: spliced.conversationState,
     blobs: spliced.blobs,
+    ...(reuseUpstreamState ? {} : { conversationState: spliced.conversationState }),
     onDelta: (chunk) => deltas.push(chunk),
     // Do not pass HTTP request.signal into send(): Deno.serve aborts it after
     // 200, which would cancelAction a parked Run. Client abort is attachClientAbort.

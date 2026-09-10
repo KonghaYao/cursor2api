@@ -35,6 +35,10 @@ function bytesToHex(bytes: Uint8Array): string {
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function bytesToB64Url(bytes: Uint8Array): string {
+  return bytesToB64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 export function b64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
@@ -50,10 +54,11 @@ async function sha256(data: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", bytesBody(data)));
 }
 
-/** Index a blob under both proto-JSON base64 and hex ids. */
+/** Index a blob under proto-JSON base64, URL-safe base64, and hex ids. */
 export function indexConversationBlob(store: ConversationBlobStore, idBytes: Uint8Array, dataB64: string): string {
   const id = bytesToB64(idBytes);
   store.set(id, dataB64);
+  store.set(bytesToB64Url(idBytes), dataB64);
   store.set(bytesToHex(idBytes), dataB64);
   return id;
 }
@@ -276,19 +281,9 @@ async function replayMessages(
 }
 
 export function conversationStateFromRoots(rootPromptMessagesJson: string[]): JsonObject {
-  return {
-    rootPromptMessagesJson,
-    turns: [],
-    todos: [],
-    pendingToolCalls: [],
-    previousWorkspaceUris: [],
-    fileStates: {},
-    fileStatesV2: {},
-    summaryArchives: [],
-    turnTimings: [],
-    subagentStates: {},
-    readPaths: [],
-  };
+  // Only roots. Empty `turns: []` / maps tell Cursor this conversation has no
+  // history even when root blobs are present (or fail to hydrate).
+  return { rootPromptMessagesJson };
 }
 
 export function decodeRootPromptText(state: JsonObject, blobs: ConversationBlobStore): string {

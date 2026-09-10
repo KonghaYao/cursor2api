@@ -1353,3 +1353,158 @@ test("SSE cancel aborts the in-flight AgentService run", async () => {
   assert.ok(aborts >= 1, `expected SSE cancel to abort AgentService, got ${aborts}`);
 });
 
+test("three user sentences stay one session: list tools, call, recall first sentence", async () => {
+  const first = "你的工具有什么";
+  const second = "调用一下";
+  const third = "我的第一句话是什么";
+  const catalog = [
+    { type: "function" as const, function: { name: "get_weather", description: "Current weather" } },
+    { type: "function" as const, function: { name: "lookup", description: "Look up a fact" } },
+  ];
+  const tools = openaiToolsToCustom(catalog);
+  const prompts: string[] = [];
+  const sendOpts: Array<CustomToolSendOpts | undefined> = [];
+  let sends = 0;
+  const kv = createMemoryKv();
+  setCustomToolAgentHostForTests({
+    async create({ customTools }) {
+      return {
+        agentId: "agent-three-ask",
+        async send(prompt, opts) {
+          const round = sends++;
+          prompts.push(prompt);
+          sendOpts.push(opts);
+          const wait = (async () => {
+            if (round === 0) return { text: "我有 get_weather 和 lookup。" };
+            if (round === 1) {
+              const tool = customTools.get_weather || Object.values(customTools)[0];
+              if (!tool) return { text: "no-tools" };
+              await tool.execute({ city: "Tokyo" }, {});
+              return { text: "should-not-reach" };
+            }
+            if (round === 2) return { text: "东京 22 度。" };
+            return { text: `你的第一句话是「${first}」。` };
+          })();
+          return { wait: () => wait, abort() {}, release() {} };
+        },
+        async close() {},
+      };
+    },
+  });
+  const headers = new Headers({ authorization: "Bearer crsr_test" });
+  const system = { role: "system", content: "be brief" };
+
+  const r1 = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [system, { role: "user", content: first }], tools: catalog },
+    tools,
+    kv,
+  });
+  assert.equal(r1.status, 200);
+  const b1 = await r1.json();
+  assert.equal(b1.error, undefined);
+  assert.match(String(b1.choices[0].message.content || ""), /get_weather/);
+  assert.equal(prompts[0], first);
+  assert.equal(sendOpts[0]?.resume, false);
+  assert.ok(sendOpts[0]?.conversationState);
+
+  const r2 = await handleCustomToolChatCompletions({
+    headers,
+    body: {
+      model: "composer-2.5",
+      tools: catalog,
+      messages: [
+        system,
+        { role: "user", content: first },
+        { role: "assistant", content: b1.choices[0].message.content },
+        { role: "user", content: second },
+      ],
+    },
+    tools,
+    kv,
+  });
+  assert.equal(r2.status, 200);
+  const b2 = await r2.json();
+  assert.equal(b2.error, undefined);
+  assert.equal(b2.conversation_id, b1.conversation_id);
+  assert.equal(b2.choices[0].finish_reason, "tool_calls");
+  const tc = b2.choices[0].message.tool_calls;
+  assert.equal(tc[0].function.name, "get_weather");
+  assert.equal(prompts[1], second);
+  assert.equal(sendOpts[1]?.conversationState, undefined);
+
+  const afterTool = [
+    system,
+    { role: "user", content: first },
+    { role: "assistant", content: b1.choices[0].message.content },
+    { role: "user", content: second },
+    { role: "assistant", content: null, tool_calls: tc },
+    { role: "tool", tool_call_id: tc[0].id, content: '{"temp":22}' },
+  ];
+  const r2b = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", tools: catalog, messages: afterTool },
+    tools,
+    kv,
+  });
+  assert.equal(r2b.status, 200);
+  const b2b = await r2b.json();
+  assert.equal(b2b.error, undefined);
+  assert.equal(b2b.conversation_id, b1.conversation_id);
+  assert.equal(sendOpts[2]?.resume, true);
+  assert.match(decodeRootPromptText(sendOpts[2]!.conversationState!, sendOpts[2]!.blobs!), /你的工具有什么/);
+
+  const r3 = await handleCustomToolChatCompletions({
+    headers,
+    body: {
+      model: "composer-2.5",
+      tools: catalog,
+      messages: [...afterTool, { role: "assistant", content: b2b.choices[0].message.content }, { role: "user", content: third }],
+    },
+    tools,
+    kv,
+  });
+  assert.equal(r3.status, 200);
+  const b3 = await r3.json();
+  assert.equal(b3.error, undefined);
+  assert.equal(b3.conversation_id, b1.conversation_id);
+  assert.match(String(b3.choices[0].message.content || ""), /你的工具有什么/);
+  assert.equal(prompts[3], third);
+  assert.equal(sendOpts[3]?.conversationState, undefined);
+
+  customToolChatClearForTests();
+  sends = 0;
+  const hopPrompts: string[] = [];
+  const hopOpts: Array<CustomToolSendOpts | undefined> = [];
+  setCustomToolAgentHostForTests({
+    async create() {
+      return {
+        agentId: "agent-three-ask-hop",
+        async send(prompt, opts) {
+          hopPrompts.push(prompt);
+          hopOpts.push(opts);
+          return { wait: async () => ({ text: `你的第一句话是「${first}」。` }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const hop = await handleCustomToolChatCompletions({
+    headers,
+    body: {
+      model: "composer-2.5",
+      tools: catalog,
+      messages: [...afterTool, { role: "assistant", content: b2b.choices[0].message.content }, { role: "user", content: third }],
+    },
+    tools,
+    kv,
+  });
+  assert.equal(hop.status, 200);
+  const hopBody = await hop.json();
+  assert.equal(hopBody.error, undefined);
+  assert.equal(hopBody.conversation_id, b1.conversation_id);
+  assert.equal(hopPrompts[0], third);
+  assert.match(decodeRootPromptText(hopOpts[0]!.conversationState!, hopOpts[0]!.blobs!), /你的工具有什么/);
+  assert.match(String(hopBody.choices[0].message.content || ""), /你的工具有什么/);
+});
+

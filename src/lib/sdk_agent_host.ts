@@ -81,6 +81,14 @@ function contentToText(result: { content?: Array<{ type?: string; text?: string 
   return result.isError ? "custom tool failed" : "";
 }
 
+function lookupBlob(store: Map<string, string>, blobId: string): string | undefined {
+  const hit = store.get(blobId);
+  if (hit) return hit;
+  const std = blobId.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = std.length % 4 === 0 ? std : std + "=".repeat(4 - (std.length % 4));
+  return store.get(std) ?? store.get(padded);
+}
+
 export function createSdkAgentHost(opts?: {
   openRun?: OpenAgentRun;
   exchange?: typeof exchangeApiKey;
@@ -101,6 +109,8 @@ export function createSdkAgentHost(opts?: {
       const tools = specsFromCustomTools(createOpts.customTools);
       const blobs = new Map<string, string>();
       let conversationState: JsonObject | undefined = createOpts.conversationState;
+      let sawCheckpoint = false;
+      let turnsSent = 0;
       let closed = false;
 
       const handle: CustomToolAgentHandle = {
@@ -117,7 +127,18 @@ export function createSdkAgentHost(opts?: {
           if (sendOpts?.blobs) {
             for (const [id, data] of sendOpts.blobs) blobs.set(id, data);
           }
-          if (sendOpts?.conversationState) conversationState = sendOpts.conversationState;
+          const providedState = Boolean(sendOpts && Object.prototype.hasOwnProperty.call(sendOpts, "conversationState"));
+          if (providedState && sendOpts?.conversationState) conversationState = sendOpts.conversationState;
+          // Follow-up user turns omit `conversationState` so we do not overwrite
+          // Cursor's checkpoint with a homemade splice. If no checkpoint arrived
+          // on this handle, omit the field entirely — resending the first-shot
+          // system-only splice would wipe the first user turn.
+          const stateForRun = providedState
+            ? sendOpts?.conversationState
+            : sawCheckpoint || turnsSent === 0
+              ? conversationState
+              : undefined;
+          turnsSent += 1;
           const run = runTurn({
             openRun,
             accessToken,
@@ -133,9 +154,10 @@ export function createSdkAgentHost(opts?: {
             tools,
             customTools: createOpts.customTools,
             blobs,
-            conversationState,
+            conversationState: stateForRun,
             resume: Boolean(sendOpts?.resume),
             onCheckpoint: (state) => {
+              sawCheckpoint = true;
               conversationState = state;
               createOpts.onCheckpoint?.(state);
             },
@@ -300,7 +322,8 @@ async function runTurn(opts: {
       if (parsed.kind === "kv") {
         const kv = parseKvBlob(parsed.kv);
         if (kv.op === "get") {
-          const data = kv.blobId ? opts.blobs.get(kv.blobId) : undefined;
+          const data = kv.blobId ? lookupBlob(opts.blobs, kv.blobId) : undefined;
+          if (!data) console.log(`  agent_kv getBlob miss id=${String(kv.blobId || "").slice(0, 24)}`);
           await duplex.send(kvGetBlobResult(kv.id, data, data === undefined ? "not found" : undefined));
         } else if (kv.op === "set") {
           if (kv.blobId && kv.blobData !== undefined) opts.blobs.set(kv.blobId, kv.blobData);

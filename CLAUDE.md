@@ -40,18 +40,20 @@ AgentService **没有** Chat Completions HTTP。客户端 function tools **是**
 
 ### conversationState（自己拼接，`src/lib/conversation_state.ts`）
 
-Cursor 用 `rootPromptMessagesJson`（Vercel-AI 形 JSON 的 SHA-256 blob id）喂模型；`turns[]` 是 UI 元数据，本网关留空。blob 经同一条 Run 的 `getBlobArgs` 取回。
+Cursor 用 `rootPromptMessagesJson`（Vercel-AI 形 JSON 的 SHA-256 blob id）喂模型；`turns[]` 是 UI 元数据。blob 经同一条 Run 的 `getBlobArgs` 取回。
 
 | 本轮 | `conversationState` | action |
 |------|---------------------|--------|
 | 首轮 | 系统 blob（client system + tool policy；缺省则默认助手句） | `userMessageAction` = 第一条 user 文本。**不要**把 system 再折进 user，**不要**发空 `{}` |
-| 跟进 user | 系统 + 历史（不含本轮新 user） | `userMessageAction` = 新 user（可 slice 多条） |
+| 跟进 user（同进程） | **省略字段**（或回传上一枪 `conversationCheckpointUpdate`）。不要用自制 splice 覆盖 checkpoint，也不要发空 `turns: []` | `userMessageAction` = 新 user（可 slice 多条） |
+| 跟进 user（isolate hop） | 系统 + 历史（不含本轮新 user） | 同上 |
 | `role: tool` | 系统 + **全部**历史含 tool 结果（user 角色 `[Tool Result]`） | **`resumeAction`**。不要把 tool 结果再写成 user 文本 |
 
 - blob id = SHA-256(JSON utf8)，Connect JSON 里是标准 base64；`getBlob` 回 `blobData` = JSON 字节的 base64
 - **禁止**把 OpenAI `messages` / `tool_calls` 原样塞进 `conversationState`
 - **禁止** `conversationState: {}`（等于告诉上游这段对话是空的）
-- KV `agent-run:` **只存 ids**（不存 checkpoint / 不存 transcript）。历史每枪从客户端全量 messages 重拼
+- **禁止** 跟进枪带空 `turns: []` / 空 map 去「补全」state（会把上文抹成空会话）
+- KV `agent-run:` **只存 ids**（不存 checkpoint / 不存 transcript）。isolate hop / `role: tool` 才从客户端全量 messages 重拼 roots
 
 ### 屏蔽自带工具（MCP allowlist 仍开；上游挂 custom-user-tools）
 
