@@ -9,11 +9,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { handleGatewayRequest } from "./lib/handler.ts";
 import { createMemoryKv } from "./lib/kv.ts";
-import type { GatewayUpstream } from "./lib/auth.ts";
 
 const PORT = Number(process.env.PORT || 8789);
 const kv = createMemoryKv();
-const upstream: GatewayUpstream = process.env.GATEWAY_UPSTREAM === "inference" ? "inference" : "cloud";
 
 function bindClientAbort(req: IncomingMessage): AbortController {
   const abort = new AbortController();
@@ -97,7 +95,7 @@ async function onRequest(req: IncomingMessage, res: ServerResponse) {
   const clientAbort = bindClientAbort(req);
   try {
     const request = await incomingToRequest(req, clientAbort.signal);
-    const response = await handleGatewayRequest(request, { kv, upstream });
+    const response = await handleGatewayRequest(request, { kv });
     await writeResponse(res, response, req);
   } catch (err) {
     if (clientAbort.signal.aborted) {
@@ -128,11 +126,7 @@ function listen(host: string) {
 
 listen("127.0.0.1");
 listen("::1");
-console.log(
-  upstream === "cloud"
-    ? "  node  AgentService/Run customTools only (MCP family; no Cloud REST chat)"
-    : "  node  InferenceService/Stream  (dead for Dashboard crsr_ keys)",
-);
+console.log("  node  AgentService/Run customTools only (MCP family; no Cloud REST chat)");
 console.log("  GET  /health");
 console.log("  GET  /v1/models");
 console.log("  POST /v1/chat/completions");

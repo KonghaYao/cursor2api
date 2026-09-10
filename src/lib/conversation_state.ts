@@ -2,11 +2,14 @@
  * Splice Cursor `ConversationStateStructure` from the client's full transcript.
  *
  * AgentService builds the model-visible prompt from `rootPromptMessagesJson`
- * (SHA-256 blob ids of Vercel-AI-SDK-shaped JSON). `turns[]` is UI metadata
- * and is left empty — we are not the IDE. The active user turn stays in
- * `userMessageAction`. A `role: tool` follow-up also uses `userMessageAction`
- * (`composeToolResultPrompt`): we already closed the previous duplex, so
- * empty `resumeAction` has no in-flight MCP exec and the model returns "".
+ * (SHA-256 blob ids of Vercel-AI-SDK-shaped JSON). Client system text is a
+ * synthetic first user root: AgentService ignores `role: system` roots, while
+ * this shape keeps the full prompt visible and stable across HTTP turns.
+ * `turns[]` is UI metadata and must be omitted — we are not the IDE. The active
+ * user turn stays in `userMessageAction`. A `role: tool` follow-up also uses
+ * `userMessageAction` (`composeToolResultPrompt`): we already closed the
+ * previous duplex, so empty `resumeAction` has no in-flight MCP exec and the
+ * model returns "".
  */
 import {
   composeToolResultPrompt,
@@ -203,8 +206,8 @@ function rootAssistantText(text: string): { role: "assistant"; content: Array<{ 
   return { role: "assistant", content: [{ type: "text", text }] };
 }
 
-function rootSystemText(text: string): { role: "system"; content: string } {
-  return { role: "system", content: text };
+function rootClientSystemText(text: string): { role: "user"; content: Array<{ type: "text"; text: string }> } {
+  return rootUserText(`<system>\n${text}\n</system>`);
 }
 
 function toolResultRootText(opts: { id: string; name?: string; content: string; isError?: boolean }): string {
@@ -351,9 +354,7 @@ export async function spliceConversationFromClient(opts: {
   const policy = toolPolicyPrompt(opts.body, opts.tools);
   if (policy.trim()) systems.push(policy.trim());
   if (!systems.length) systems.push(DEFAULT_SYSTEM);
-  for (const text of systems) {
-    await pushRoot(blobs, rootIds, rootSystemText(text));
-  }
+  await pushRoot(blobs, rootIds, rootClientSystemText(systems.join("\n\n")));
 
   const { resume, prompt, historyEnd } = splicedUserPrompt({
     messages: opts.messages,

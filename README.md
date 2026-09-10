@@ -26,7 +26,7 @@ model   = composer-2.5
 
 请求里带 `Authorization: Bearer …` 或 `x-api-key` 都行。不要把换好的 JWT 写进配置。
 
-网关自己根据模型 / 工具 / 系统提示 / **第一条 user** 计算会话，不必传 `x-session-id`。网关不会替你跑工具：模型给出 `tool_calls` 后，你在本地执行，再把结果用 `role: tool` 发回来。每一枪都请带上**完整** `messages`（从第一条 user 起只往后追加、不要改前面的内容）；网关会从这份全量记录里取出本轮要发给模型的部分。
+网关自己根据模型 / 思考档 / Fast / 工具 / 系统提示 / **第一条 user** 计算会话；客户端的 `x-session-id` / `conversation_id` **会被忽略**。网关不会替你跑工具：模型给出 `tool_calls` 后，你在本地执行，再把结果用 `role: tool` 发回来。每一枪都请带上**完整** `messages`（从第一条 user 起只往后追加，不要改前面的内容）。网关把已有上文拼进 Cursor 会话状态，本轮只把**新的** user 文本（或刚回的 tool 结果）发给模型；不要只发最后一条。
 
 ```bash
 curl -sS https://cursor2api.freetavily.deno.net/v1/chat/completions \
@@ -45,7 +45,7 @@ curl -sS https://cursor2api.freetavily.deno.net/v1/chat/completions \
 | 流式 `stream: true` | 可用 | 立刻回 SSE（含 keepalive）；正文/思考在 AgentService 推出 `textDelta`/`thinkingDelta` 时转发。Composer 常在想完后短时间打出全文。工具调用仍是一整块 |
 | 工具调用 | 可用 | 和 OpenAI / Anthropic 一样：先拿到 `tool_calls` / `tool_use`，本地执行后再回传结果 |
 | `system` 提示 | 部分可用 | 会随会话进 Cursor 的对话 roots，**叠在** Cursor 自带助手设定上面，换不掉「Composer / 工作区 / 文件工具」那套身份。官方 SDK 的 `systemPrompt` 能整段替换，但要账号开门，而且只给 SDK 本机 agent；Dashboard `crsr_` 一发仍是 `unknown option '--system-prompt'`。同一会话里改 system 会开成新对话 |
-| 上下文缓存 | 部分可用 | 同一条对话（第一条 user + 模型 / 工具 / 系统提示不变）会复用 Cursor 会话。不必传 `x-session-id`。Deno Deploy 用 KV 只记会话 id（不存聊天正文），换实例也能续上。每一枪都会开关到 Cursor 的后向连接；你跑完工具再 POST `role: tool` 时是**新的一轮**，不是把结果塞回上一枪还开着的那条流 |
+| 上下文缓存 | 部分可用 | 同一条对话（**第一条 user** + 模型 / 思考档 / Fast / 工具 / 系统提示不变）会复用 Cursor 会话。传 `x-session-id` / `conversation_id` 没用。Deno Deploy 的 KV 只记会话 id（24h）和上次处理到第几条 message（5 分钟），**不存聊天正文**；换实例也能续上。每一枪都会开关到 Cursor 的后向连接；你跑完工具再 POST `role: tool` 时是**新的一轮**，不是把结果塞回上一枪还开着的那条流 |
 | `usage` 用量 | 可用 | 响应里有 token 数。OpenAI 看 `prompt_tokens`、`completion_tokens`、`prompt_tokens_details.cached_tokens`；Anthropic 看 `input_tokens`、`output_tokens`、`cache_read_input_tokens`。模型正在等你跑工具时，这一枪的 usage 经常是 0，最终回复那一枪才带上整轮。**缓存命中率**请用 `CR/(CR+未命中 input)`（与 Team Usage 一致）；不要用 `cache_read_input_tokens / input_tokens`（Anthropic 的 `input_tokens` 只是未缓存部分，会算成 300%+）。多枪 usage 汇总用 `aggregatePromptCacheHitPercent`（`agent_json.ts`） |
 | Fast 档 | 可用 | 模型名带 `-fast`，或请求体写 `"fast": true`。`composer-2.5`、`grok-4.6` 默认是标准档，不是 Fast |
 | 思考强度 effort | 可用（仅 Grok） | 用 `reasoning_effort`（`low` / `medium` / `high` / `max`）。不写则按 `high`。Composer 没有这个档位 |
@@ -102,6 +102,6 @@ curl -sS https://cursor2api.freetavily.deno.net/v1/chat/completions \
 
 | 日期 | 说明 | 状态 |
 |------|------|------|
-| 2026-09-09 | Cursor 把旧版聊天接口整条删了，本网关已改到现行接口 | 已绕开 |
+| 2026-09-09 | Cursor 把旧版 `InferenceService/Stream` 整条删了；网关聊天只走 AgentService，该路径已从入口移除 | 已移除 |
 | 2026-09-01 | 会话 id 每轮随机，长对话缓存全灭 | 已修 |
 | 2026-09-05 | 当天全局缓存命中略低于目标，本身不是缓存坏了 | 已关闭 |

@@ -1,8 +1,8 @@
 # 模型 id 与 Cursor 路由
 
-网关把客户端的 **OpenAI 风格 `model` 名** 映射为 Cursor `GetUsableModels` / `InferenceService/Stream` 使用的 **flat route id**（写入 `modelId` 与 `requestedModel.modelId`）。
+网关把客户端的 **OpenAI 风格 `model` 名** 映射为 Cursor AgentService 的家族 id + `requestedModel.parameters`。旧的 `InferenceService/Stream` **flat route id** 已从网关移除，只留在事故记录和转换单测里。
 
-实现：`src/lib/inference.ts` 中的 `resolveCursorModelRoute`、`extractFastMode`、`extractReasoningEffort`、`mapGrokEffort`。单测：`src/lib/inference.model.test.ts`。
+实现：AgentService 走 `gatewayAgentModelSelection`（`src/lib/agent_json.ts`）。`src/lib/inference.ts` 里的 `resolveCursorModelRoute` / Grok `-fast` 升级只服务残留转换与单测，**不是**聊天路径。
 
 ## `GET /v1/models`
 

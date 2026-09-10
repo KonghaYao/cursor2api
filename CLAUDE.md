@@ -16,7 +16,7 @@
 
 **是什么：** 网关进程内对 `POST https://api2.cursor.sh/agent.v1.AgentService/Run` 的 Connect JSON 客户端；MCP 家族 allowlist 请求头压掉默认 shell/edit；客户端 function tools → 合成 MCP `custom-user-tools`（`mcpTools` + `requestContext` / `mcpState`），`customTools.execute()` 在本进程 park，返回 OpenAI `tool_calls`。每一枪 HTTP 开/关一条 Run（交 `tool_calls` 时 **close 双工、不发 `cancelAction`**）。**每一枪都要带** `conversationState`（缺字段 → `invalid_argument: Conversation state is required`）。从全量 transcript 拼 `rootPromptMessagesJson`（SHA-256 JSON blob + `getBlob`），对象里 **只** 放 roots，**不要**空 `turns: []`。`role: tool` 走 **`userMessageAction` + `composeToolResultPrompt`**（双工已关，空 `resumeAction` 会空白结束）。cwd 默认 `/tmp`（`GATEWAY_AGENT_CWD`）。默认不发 `customSystemPrompt`。模型仍是 Cursor 托管推理，**不在** Cursor sandbox VM。
 
-**日志里的 `cloud`：** `GATEWAY_UPSTREAM` 只有 `"inference"` 或 `"cloud"`，默认 `"cloud"` = 不走 Inference。`cloud_openai.ts` / `CloudChatError` / 测试名 `cloud OpenAI…` 同此。**不是** Cloud Agents。`GET /health` 的 `rpc` 才是真实路径。
+**日志里的 `cloud`：** 只是旧名：`cloud_openai.ts` / `CloudChatError` / 测试名 `cloud OpenAI…` 指 AgentService 聊天路径，**不是** Cloud Agents。`GATEWAY_UPSTREAM=inference` **已从入口移除**，聊天固定走 AgentService。`GET /health` 的 `rpc` 才是真实路径。
 
 `sdkLocalAgentCreateOptions()` 只是 MCP allowlist 的形状备忘（单测用），**运行时不会** `Agent.create({ local })`。
 
@@ -126,7 +126,7 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 - 把客户端 tools 挂成 HTTP MCP 让 Cloud VM 反调
 - 用 `GetUsableModels` / `/v1/models` 判断 Inference 是否还能打
 - 再加回 `@cursor/sdk`、SDK 平台二进制、或本机 agent 可执行文件来跑聊天
-- 把 `GATEWAY_UPSTREAM=cloud` 理解成 Cloud Agents / `Agent.create({ cloud })`
+- 把日志/`cloud_openai.ts` 里的 `cloud` 理解成 Cloud Agents / `Agent.create({ cloud })`（旧名；`GATEWAY_UPSTREAM` 已从入口移除）
 - 指纹路径每轮 `randomId()` 当 conversationId（9/1 cache 事故）
 - 设 `excludeWorkspaceContext = true`（Dashboard `crsr_` 会 invalid_argument）
 - 给 Dashboard `crsr_` 发 `customSystemPrompt`（9/10 仍 `unknown option '--system-prompt'`；SDK 文档里的 `systemPrompt` 是同一字段 + 同一门禁，不是网关漏接）

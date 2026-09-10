@@ -5,16 +5,8 @@ import { kvGetJwt, kvSetJwt, type Kv } from "./kv.ts";
 export const CURSOR_BASE = "https://api2.cursor.sh";
 export const CLIENT_VERSION = "sdk-1.0.30";
 
-export type GatewayUpstream = "inference" | "cloud";
-
 export type GatewayCtx = {
   kv: Kv;
-  /**
-   * `"cloud"` is a leftover name: chat is AgentService/Run + in-process customTools,
-   * not Cloud Agents VM (`POST /v1/agents`) and not `@cursor/sdk`. `"inference"` is
-   * legacy Stream (dead for Dashboard `crsr_` keys).
-   */
-  upstream?: GatewayUpstream;
 };
 
 export function sdkHeaders(accessToken: string, requestId = randomId()): Record<string, string> {

@@ -38,6 +38,6 @@ function kvFor(env: CfEnv): Kv {
 
 export default {
   async fetch(request: Request, env: CfEnv): Promise<Response> {
-    return handleGatewayRequest(request, { kv: kvFor(env), upstream: "cloud" });
+    return handleGatewayRequest(request, { kv: kvFor(env) });
   },
 };

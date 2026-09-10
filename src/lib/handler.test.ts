@@ -52,7 +52,7 @@ test("missing Authorization on /v1/chat/completions is 401 JSON", async () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ model: "composer-2.5-fast", messages: [{ role: "user", content: "hi" }] }),
     }),
-    { kv: createMemoryKv(), upstream: "cloud" },
+    { kv: createMemoryKv() },
   );
   assert.equal(res.status, 401);
   const body = await res.json();
@@ -67,7 +67,7 @@ test("empty Authorization: Bearer on /v1/chat/completions is 401 JSON", async ()
       headers: { authorization: "Bearer", "content-type": "application/json" },
       body: JSON.stringify({ model: "composer-2.5-fast", messages: [{ role: "user", content: "hi" }] }),
     }),
-    { kv: createMemoryKv(), upstream: "cloud" },
+    { kv: createMemoryKv() },
   );
   assert.equal(res.status, 401);
 });
@@ -98,7 +98,7 @@ test("stream=true returns SSE headers before the AgentService turn finishes", as
         messages: [{ role: "user", content: "hi" }],
       }),
     }),
-    { kv: createMemoryKv(), upstream: "cloud" },
+    { kv: createMemoryKv() },
   );
   assert.equal(res.status, 200);
   assert.match(String(res.headers.get("content-type") || ""), /text\/event-stream/);
@@ -134,7 +134,7 @@ test("Anthropic follow-up can echo unsigned thinking from the previous turn", as
         ],
       }),
     }),
-    { kv: createMemoryKv(), upstream: "cloud" },
+    { kv: createMemoryKv() },
   );
   assert.equal(res.status, 200, await res.clone().text());
   const body = await res.json();

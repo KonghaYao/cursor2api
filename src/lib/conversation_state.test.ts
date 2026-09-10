@@ -14,7 +14,7 @@ const tools = openaiToolsToCustom([
   { type: "function", function: { name: "search", parameters: { type: "object", properties: { q: { type: "string" } } } } },
 ]);
 
-test("first shot puts system in root blobs and user in the action prompt", async () => {
+test("first shot puts system in a model-visible root and user in the action prompt", async () => {
   const messages = [
     { role: "system", content: "be brief" },
     { role: "user", content: "weather in tokyo?" },
@@ -28,12 +28,13 @@ test("first shot puts system in root blobs and user in the action prompt", async
   assert.equal(spliced.prompt, "weather in tokyo?");
   assert.doesNotMatch(spliced.prompt, /<system>/);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
-  assert.match(roots, /"role":"system"/);
-  assert.match(roots, /be brief/);
+  assert.match(roots, /"role":"user"/);
+  assert.match(roots, /<system>\\nbe brief/);
   assert.match(roots, /get_weather/);
+  assert.doesNotMatch(roots, /"role":"system"/);
   assert.doesNotMatch(roots, /weather in tokyo/);
   const ids = spliced.conversationState.rootPromptMessagesJson as string[];
-  assert.ok(ids.length >= 2);
+  assert.equal(ids.length, 1);
   for (const id of ids) assert.ok(spliced.blobs.has(id));
 });
 

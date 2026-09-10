@@ -8,7 +8,6 @@
  * Does not print credentials. Pass CURSOR_API_KEY in the environment.
  *
  * Inference (usage.cached_tokens):
- *   GATEWAY_UPSTREAM=inference bun src/node.ts
  *
  * Cloud Agents (Dashboard crsr_ keys). Session id is computed internally
  * from model / tools / system / first user — do not send x-session-id.

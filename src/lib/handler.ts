@@ -1,4 +1,4 @@
-import { connectUnary, getAccessToken, modelsFrom, AuthError, type GatewayCtx } from "./auth.ts";
+import { AuthError, type GatewayCtx } from "./auth.ts";
 import { corsResponse, jsonResponse, randomId } from "./bytes.ts";
 import { CloudAgentsError } from "./cloud_agents.ts";
 import {
@@ -8,83 +8,7 @@ import {
   handleCloudMessages,
   handleCloudModels,
 } from "./cloud_openai.ts";
-import {
-  anthropicToCursor,
-  anthropicToolsToCursor,
-  countCursorMediaParts,
-  cursorBodyFromClient,
-  extractFastMode,
-  extractReasoningEffort,
-  resolveCursorModelRoute,
-  upgradeGrokRouteForTools,
-  openaiProviderDefinedTools,
-  inferenceStream,
-  ImageInputError,
-  openaiMessagesToCursor,
-  openaiToolsToCursor,
-  streamOpenAiChatCompletion,
-  streamAnthropicMessage,
-  toAnthropicError,
-  toAnthropicMessage,
-  toOpenAICompletion,
-  toolCallsToOpenAI,
-  type CursorMessage,
-  type CursorTool,
-} from "./inference.ts";
-import { resolveSessionForRequest } from "./session.ts";
-
-type PreparedChat = {
-  messages: CursorMessage[];
-  tools: CursorTool[];
-  conversationId: string;
-  conversationGroupId: string;
-  sessionId: string;
-  clientId: string;
-  messagesPipelined: boolean;
-};
-
-async function prepareChatTurn(
-  body: Record<string, unknown>,
-  tenant: string,
-  rawMessages: unknown[],
-  tools: CursorTool[],
-  preconvertedMessages?: CursorMessage[],
-): Promise<PreparedChat> {
-  const session = await resolveSessionForRequest(tenant, rawMessages, {
-    body,
-    tools,
-    preconvertedMessages,
-  });
-
-  if (session.mode === "fingerprint") {
-    console.log(
-      `  session_mode=fingerprint session_fp=${session.session_fp.slice(0, 16)}… canon_len=${session.canon_len}`,
-    );
-    const cursorId = `${tenant}:${session.session_fp}`;
-    return {
-      messages: session.canon,
-      tools: session.tools,
-      conversationId: cursorId,
-      conversationGroupId: cursorId,
-      sessionId: cursorId,
-      clientId: session.session_fp,
-      messagesPipelined: true,
-    };
-  }
-
-  const messages = preconvertedMessages ?? (await openaiMessagesToCursor(rawMessages));
-  console.log(`  session_mode=random id=${session.clientId.slice(0, 8)}…`);
-  const cursorId = `${tenant}:${session.clientId}`;
-  return {
-    messages,
-    tools,
-    conversationId: cursorId,
-    conversationGroupId: cursorId,
-    sessionId: cursorId,
-    clientId: session.clientId,
-    messagesPipelined: false,
-  };
-}
+import { ImageInputError, toAnthropicError } from "./inference.ts";
 
 class RequestInputError extends Error {
   status: number;
@@ -117,19 +41,6 @@ async function readJson(request: Request, maxBytes?: number): Promise<Record<str
     if (err instanceof RequestInputError) throw err;
     throw new RequestInputError("Request body contains invalid JSON");
   }
-}
-
-function anthropicReasoningEffort(body: Record<string, unknown>): string | undefined {
-  const thinking = body.thinking as Record<string, unknown> | undefined;
-  if (!thinking || thinking.type === "disabled") return undefined;
-  const configured = extractReasoningEffort(body);
-  if (configured != null) return String(configured);
-  const budget = Number(thinking.budget_tokens ?? thinking.budgetTokens);
-  if (!Number.isFinite(budget)) return thinking.type === "enabled" || thinking.type === "adaptive" ? "high" : undefined;
-  if (budget < 4_096) return "low";
-  if (budget < 12_000) return "medium";
-  if (budget < 32_000) return "high";
-  return "xhigh";
 }
 
 export function validateAnthropicRequest(body: Record<string, unknown>): void {
@@ -186,9 +97,9 @@ export function validateAnthropicRequest(body: Record<string, unknown>): void {
     }
   }
   if (body.n != null) throw new RequestInputError("n is not a valid Anthropic Messages API field");
-  if (body.top_k != null) throw new RequestInputError("top_k is not supported by Cursor Inference");
+  if (body.top_k != null) throw new RequestInputError("top_k is not supported");
   for (const key of ["container", "context_management", "service_tier"] as const) {
-    if (body[key] != null) throw new RequestInputError(`${key} is not supported by Cursor Inference`);
+    if (body[key] != null) throw new RequestInputError(`${key} is not supported`);
   }
   for (const [index, raw] of body.messages.entries()) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new RequestInputError(`messages.${index} must be an object`);
@@ -211,7 +122,7 @@ export function validateAnthropicRequest(body: Record<string, unknown>): void {
         ? ["text", "tool_use", "thinking", "redacted_thinking"]
         : ["text", "image", "document", "tool_result"];
       if (!allowed.includes(type)) {
-        throw new RequestInputError(`${path} type ${type || "<missing>"} is not supported by Cursor Inference`);
+        throw new RequestInputError(`${path} type ${type || "<missing>"} is not supported`);
       }
       if (type === "text" && typeof block.text !== "string") throw new RequestInputError(`${path}.text is required`);
       if (type === "tool_use") {
@@ -235,7 +146,7 @@ export function validateAnthropicRequest(body: Record<string, unknown>): void {
             const innerType = String(inner.type || "");
             const innerPath = `${path}.content.${innerIndex}`;
             if (!["text", "image", "document"].includes(innerType)) {
-              throw new RequestInputError(`${innerPath} type ${innerType || "<missing>"} is not supported by Cursor Inference`);
+              throw new RequestInputError(`${innerPath} type ${innerType || "<missing>"} is not supported`);
             }
             if (innerType === "text" && typeof inner.text !== "string") throw new RequestInputError(`${innerPath}.text is required`);
             if ((innerType === "image" || innerType === "document") && (!inner.source || typeof inner.source !== "object" || Array.isArray(inner.source))) {
@@ -286,213 +197,24 @@ export function validateAnthropicRequest(body: Record<string, unknown>): void {
   }
 }
 
-function anthropicErrorStatus(error: unknown, fallbackStatus: number): number {
-  if (fallbackStatus !== 200) return fallbackStatus;
-  const mapped = toAnthropicError(error).error.type;
-  if (mapped === "rate_limit_error") return 429;
-  if (mapped === "authentication_error") return 401;
-  if (mapped === "permission_error") return 403;
-  if (mapped === "not_found_error") return 404;
-  if (mapped === "conflict_error") return 409;
-  if (mapped === "request_too_large") return 413;
-  return 502;
-}
-
 function rejectUnsupportedChatOptions(body: Record<string, unknown>): Response | null {
   const n = Number(body.n);
   if (Number.isFinite(n) && n > 1) {
     return jsonResponse(400, {
-      error: { message: "n > 1 is not supported; Cursor Inference returns a single completion", type: "invalid_request_error" },
+      error: { message: "n > 1 is not supported; the gateway returns a single completion", type: "invalid_request_error" },
     });
   }
   return null;
 }
 
-function anthropicModelsResponse(ids: string[], url: URL) {
-  const limitRaw = url.searchParams.get("limit");
-  const limit = limitRaw == null ? 20 : Number(limitRaw);
-  if (!Number.isInteger(limit) || limit < 1 || limit > 1_000) {
-    throw new RequestInputError("limit must be an integer between 1 and 1000");
-  }
-  const afterId = url.searchParams.get("after_id");
-  const beforeId = url.searchParams.get("before_id");
-  if (afterId && beforeId) throw new RequestInputError("after_id and before_id cannot be used together");
-  let start = 0;
-  let end = ids.length;
-  if (afterId) {
-    const index = ids.indexOf(afterId);
-    if (index >= 0) start = index + 1;
-  } else if (beforeId) {
-    const index = ids.indexOf(beforeId);
-    if (index >= 0) end = index;
-    start = Math.max(0, end - limit);
-  }
-  const page = ids.slice(start, Math.min(end, start + limit));
-  return {
-    data: page.map((id) => ({
-      id,
-      created_at: "1970-01-01T00:00:00Z",
-      display_name: id,
-      type: "model",
-    })),
-    first_id: page[0] ?? null,
-    has_more: beforeId ? start > 0 : start + page.length < end,
-    last_id: page.at(-1) ?? null,
-  };
-}
-
-function modelsUpstreamError(status: number, text: string, anthropic: boolean, requestId: string): Response {
-  const message = text || `Cursor model discovery failed (${status})`;
-  if (anthropic) return jsonResponse(status, toAnthropicError({ message, type: "api_error" }, requestId), requestId);
-  return jsonResponse(status, { error: { message, type: "server_error" } });
-}
-
 function notImplemented(feature: string): Response {
   return jsonResponse(501, {
     error: {
-      message: `${feature} is not available on Cursor InferenceService/Stream`,
+      message: `${feature} is not available on this gateway`,
       type: "invalid_request_error",
       code: "not_implemented",
     },
   });
-}
-
-async function runInference(
-  ctx: GatewayCtx,
-  headers: Headers,
-  body: Record<string, unknown>,
-  {
-    tools,
-    rawMessages,
-    preconvertedMessages,
-  }: { tools: CursorTool[]; rawMessages: unknown[]; preconvertedMessages?: CursorMessage[] },
-) {
-  const { accessToken, tenant } = await getAccessToken(ctx, headers);
-  const prepared = await prepareChatTurn(body, tenant, rawMessages, tools, preconvertedMessages);
-  const turn = await inferenceStream(
-    accessToken,
-    cursorBodyFromClient(body, {
-      messages: prepared.messages,
-      tools: prepared.tools,
-      conversationId: prepared.conversationId,
-      conversationGroupId: prepared.conversationGroupId,
-      messagesPipelined: prepared.messagesPipelined,
-    }),
-    { sessionId: prepared.sessionId },
-  );
-  return { turn, conversationId: prepared.clientId, sessionId: prepared.clientId };
-}
-
-async function handleInferenceChatCompletions(
-  ctx: GatewayCtx,
-  request: Request,
-  body: Record<string, unknown>,
-): Promise<Response> {
-  const messages = await openaiMessagesToCursor((body.messages as unknown[]) || []);
-  const tools = openaiToolsToCursor(body.tools);
-  const route = resolveCursorModelRoute(body.model, {
-    fast: extractFastMode(body),
-    reasoningEffort: extractReasoningEffort(body),
-  });
-  const media = countCursorMediaParts(messages);
-  const hasTools = tools.length > 0 || openaiProviderDefinedTools(body.tools).length > 0;
-  const cursorRoute = upgradeGrokRouteForTools(route.routeId, hasTools);
-  console.log(
-    `  chat n=${messages.length} tools=${tools.length} images=${media.images} files=${media.files} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${cursorRoute}`,
-  );
-  if (body.stream) {
-    const { accessToken, tenant } = await getAccessToken(ctx, request.headers);
-    const prepared = await prepareChatTurn(body, tenant, (body.messages as unknown[]) || [], tools);
-    return streamOpenAiChatCompletion({
-      accessToken,
-      body: cursorBodyFromClient(body, {
-        messages: prepared.messages,
-        tools: prepared.tools,
-        conversationId: prepared.conversationId,
-        conversationGroupId: prepared.conversationGroupId,
-        messagesPipelined: prepared.messagesPipelined,
-      }),
-      model: body.model,
-      conversationId: prepared.clientId,
-      sessionId: prepared.sessionId,
-      tools: prepared.tools,
-      signal: request.signal,
-    });
-  }
-  const { turn, conversationId } = await runInference(ctx, request.headers, body, {
-    tools,
-    rawMessages: (body.messages as unknown[]) || [],
-  });
-  if (turn.error) console.log(`  infer error ${JSON.stringify(turn.error).slice(0, 200)}`);
-  if (turn.toolCalls?.length) {
-    for (const c of toolCallsToOpenAI(turn.toolCalls, tools)) {
-      console.log(`  ${c.function.name} ${c.function.arguments.slice(0, 280)}`);
-    }
-  }
-  return jsonResponse(
-    turn.status === 200 ? 200 : turn.status,
-    toOpenAICompletion({ model: body.model, turn, conversationId, tools }),
-  );
-}
-
-async function handleInferenceMessages(
-  ctx: GatewayCtx,
-  request: Request,
-  body: Record<string, unknown>,
-  requestId: string,
-): Promise<Response> {
-  const messages = await anthropicToCursor(body);
-  const tools = anthropicToolsToCursor(body.tools);
-  body.reasoning_effort = anthropicReasoningEffort(body);
-  const route = resolveCursorModelRoute(body.model, {
-    fast: extractFastMode(body),
-    reasoningEffort: extractReasoningEffort(body),
-  });
-  const media = countCursorMediaParts(messages);
-  const cursorRoute = upgradeGrokRouteForTools(route.routeId, tools.length > 0);
-  console.log(
-    `  messages n=${messages.length} tools=${tools.length} images=${media.images} files=${media.files} stream=${Boolean(body.stream)} model=${route.clientModel || route.routeId} cursorRoute=${cursorRoute}`,
-  );
-  if (body.stream) {
-    const { accessToken, tenant } = await getAccessToken(ctx, request.headers);
-    const prepared = await prepareChatTurn(body, tenant, (body.messages as unknown[]) || [], tools, messages);
-    return streamAnthropicMessage({
-      accessToken,
-      body: cursorBodyFromClient(body, {
-        messages: prepared.messages,
-        tools: prepared.tools,
-        conversationId: prepared.conversationId,
-        conversationGroupId: prepared.conversationGroupId,
-        messagesPipelined: prepared.messagesPipelined,
-      }),
-      model: body.model,
-      conversationId: prepared.clientId,
-      sessionId: prepared.sessionId,
-      tools: prepared.tools,
-      signal: request.signal,
-      requestId,
-    });
-  }
-  const { turn, conversationId } = await runInference(ctx, request.headers, body, {
-    tools,
-    rawMessages: (body.messages as unknown[]) || [],
-    preconvertedMessages: messages,
-  });
-  if (turn.error) console.log(`  infer error ${JSON.stringify(turn.error).slice(0, 200)}`);
-  if (turn.toolCalls?.length) {
-    for (const c of toolCallsToOpenAI(turn.toolCalls, tools)) {
-      console.log(`  ${c.function.name} ${c.function.arguments.slice(0, 280)}`);
-    }
-  }
-  if (turn.error || turn.status !== 200) {
-    const error = turn.error || { message: `Inference request failed (${turn.status})`, type: "api_error" };
-    return jsonResponse(anthropicErrorStatus(error, turn.status), toAnthropicError(error, requestId), requestId);
-  }
-  return jsonResponse(
-    turn.status,
-    toAnthropicMessage({ model: body.model, turn, conversationId, tools, maxTokens: body.max_tokens }),
-    requestId,
-  );
 }
 
 function mapGatewayError(err: unknown, anthropicRequest: boolean, requestId: string): Response {
@@ -538,31 +260,11 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
     if (method === "OPTIONS") return corsResponse();
 
     if (method === "GET" && url.pathname === "/health") {
-      if (ctx.upstream === "cloud") return jsonResponse(200, cloudHealthBody());
-      return jsonResponse(200, {
-        ok: true,
-        rpc: "/aiserver.v1.InferenceService/Stream",
-        modes: ["/v1/chat/completions", "/v1/messages"],
-        auth: "Authorization Bearer crsr_… / JWT or x-api-key",
-        tools: "client executes tool_calls",
-      });
+      return jsonResponse(200, cloudHealthBody());
     }
 
     if (method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
-      if (ctx.upstream === "cloud") {
-        return await handleCloudModels(request.headers, anthropicModelsRequest, requestId, request.signal);
-      }
-      const { accessToken } = await getAccessToken(ctx, request.headers);
-      const r = await connectUnary("/agent.v1.AgentService/GetUsableModels", accessToken, {});
-      if (!r.ok) return modelsUpstreamError(r.status, r.text, anthropicModelsRequest, requestId);
-      const ids = modelsFrom(r.json);
-      if (anthropicModelsRequest) return jsonResponse(200, anthropicModelsResponse(ids, url), requestId);
-      const data = ids.map((id) => ({
-        id,
-        object: "model",
-        owned_by: "cursor",
-      }));
-      return jsonResponse(200, { object: "list", data });
+      return await handleCloudModels(request.headers, anthropicModelsRequest, requestId, request.signal);
     }
 
     if (method === "POST" && (url.pathname === "/v1/embeddings" || url.pathname === "/embeddings")) {
@@ -580,7 +282,7 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       method === "POST" &&
       (url.pathname === "/v1/images/generations" || url.pathname === "/v1/images/edits" || url.pathname === "/v1/images/variations")
     ) {
-      return notImplemented("Images API (use chat tools / generate_image tool_call; Inference does not return pixels)");
+      return notImplemented("Images API (use chat tools / generate_image tool_call)");
     }
     if (method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
       return notImplemented("OpenAI Responses API");
@@ -591,29 +293,23 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       validateAnthropicRequest(body);
       const unsupported = rejectUnsupportedChatOptions(body);
       if (unsupported) return unsupported;
-      if (ctx.upstream === "cloud") {
-        // Do not `return await` a streaming Response: Deno.serve treats the
-        // handler as finished and legacy-aborts request.signal, which
-        // cancelAction's the in-flight SSE. Adopt the promise; map errors
-        // without buffering the body. Stream path must not bind request.signal
-        // to cancelAction (legacy abort after 200); SSE cancel() owns abort.
-        return handleCloudMessages(request.headers, body, requestId, ctx.kv, {
-          signal: body.stream ? undefined : request.signal,
-        }).catch((err) => mapGatewayError(err, anthropicRequest, requestId));
-      }
-      return handleInferenceMessages(ctx, request, body, requestId).catch((err) => mapGatewayError(err, anthropicRequest, requestId));
+      // Do not `return await` a streaming Response: Deno.serve treats the
+      // handler as finished and legacy-aborts request.signal, which
+      // cancelAction's the in-flight SSE. Adopt the promise; map errors
+      // without buffering the body. Stream path must not bind request.signal
+      // to cancelAction (legacy abort after 200); SSE cancel() owns abort.
+      return handleCloudMessages(request.headers, body, requestId, ctx.kv, {
+        signal: body.stream ? undefined : request.signal,
+      }).catch((err) => mapGatewayError(err, anthropicRequest, requestId));
     }
 
     if (method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
       const body = await readJson(request);
       const unsupported = rejectUnsupportedChatOptions(body);
       if (unsupported) return unsupported;
-      if (ctx.upstream === "cloud") {
-        return handleCloudChatCompletions(request.headers, body, ctx.kv, {
-          signal: body.stream ? undefined : request.signal,
-        }).catch((err) => mapGatewayError(err, anthropicRequest, requestId));
-      }
-      return handleInferenceChatCompletions(ctx, request, body).catch((err) => mapGatewayError(err, anthropicRequest, requestId));
+      return handleCloudChatCompletions(request.headers, body, ctx.kv, {
+        signal: body.stream ? undefined : request.signal,
+      }).catch((err) => mapGatewayError(err, anthropicRequest, requestId));
     }
 
     console.log("  -> 404");

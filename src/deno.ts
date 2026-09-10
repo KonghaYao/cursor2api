@@ -5,12 +5,11 @@
  *   deno task start
  *
  * Chat uses AgentService/Run + in-process customTools. Deno fetch is
- * full-duplex (HTTP/2). InferenceService is dead for Dashboard keys.
+ * full-duplex (HTTP/2). InferenceService/Stream is removed.
  */
 
 import { handleGatewayRequest } from "./lib/handler.ts";
 import { createDenoKv, createMemoryKv, type Kv } from "./lib/kv.ts";
-import type { GatewayUpstream } from "./lib/auth.ts";
 
 declare const Deno: {
   env: { get(key: string): string | undefined };
@@ -27,7 +26,6 @@ declare const Deno: {
 };
 
 const PORT = Number(Deno.env.get("PORT") || 8789);
-const upstream: GatewayUpstream = Deno.env.get("GATEWAY_UPSTREAM") === "inference" ? "inference" : "cloud";
 const isDeploy = Boolean(Deno.env.get("DENO_DEPLOYMENT_ID"));
 
 const kv: Kv = await (async () => {
@@ -37,7 +35,7 @@ const kv: Kv = await (async () => {
     return createMemoryKv();
   }
 })();
-const ctx = { kv, upstream };
+const ctx = { kv };
 
 const handler = (request: Request) => handleGatewayRequest(request, ctx);
 
@@ -56,13 +54,9 @@ if (isDeploy) {
   );
 }
 
-if (upstream === "cloud") {
-  console.log("  deno  chat → AgentService/Run customTools (MCP family; spliced conversationState)");
-  console.log("  models GET https://api.cursor.com/v1/models");
-  console.log("  tools    MCP family header + in-process custom-user-tools; no customSystemPrompt");
-} else {
-  console.log("  deno  InferenceService/Stream  (dead for Dashboard crsr_ keys)");
-}
+console.log("  deno  chat → AgentService/Run customTools (MCP family; spliced conversationState)");
+console.log("  models GET https://api.cursor.com/v1/models");
+console.log("  tools    MCP family header + in-process custom-user-tools; no customSystemPrompt");
 console.log("  GET  /health");
 console.log("  GET  /v1/models");
 console.log("  POST /v1/chat/completions");
