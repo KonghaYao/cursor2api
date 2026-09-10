@@ -32,8 +32,13 @@ test("aggregatePromptCacheHitPercent avoids cache_read/input_tokens session bug"
 test("mergeAgentTurnUsage replaces cumulative snapshots", () => {
   const a = { inputTokens: 40, outputTokens: 4, cacheReadTokens: 30 };
   const b = { inputTokens: 40, outputTokens: 4, cacheReadTokens: 30 };
-  assert.deepEqual(mergeAgentTurnUsage(a, b), b);
-  assert.deepEqual(mergeAgentTurnUsage(a, b)?.cacheReadTokens, 30);
+  assert.deepEqual(mergeAgentTurnUsage(a, b), {
+    inputTokens: 40,
+    outputTokens: 4,
+    cacheReadTokens: 30,
+    cacheWriteTokens: undefined,
+    reasoningTokens: undefined,
+  });
 });
 
 test("mergeAgentTurnUsage adds segment deltas", () => {
@@ -44,6 +49,18 @@ test("mergeAgentTurnUsage adds segment deltas", () => {
     outputTokens: 8,
     cacheReadTokens: 40,
     cacheWriteTokens: undefined,
+    reasoningTokens: undefined,
+  });
+});
+
+test("mergeAgentTurnUsage keeps cache when a later snapshot omits it", () => {
+  const snap = { inputTokens: 3672, outputTokens: 80, cacheReadTokens: 3616, cacheWriteTokens: 0 };
+  const ended = { inputTokens: 3672, outputTokens: 91 };
+  assert.deepEqual(mergeAgentTurnUsage(snap, ended), {
+    inputTokens: 3672,
+    outputTokens: 91,
+    cacheReadTokens: 3616,
+    cacheWriteTokens: 0,
     reasoningTokens: undefined,
   });
 });
@@ -155,6 +172,19 @@ test("buildRunRequest does not send customSystemPrompt", () => {
     tools: [],
   });
   assert.equal(req.customSystemPrompt, undefined);
+});
+
+test("buildRunRequest sends trimmed customSystemPrompt when provided", () => {
+  const req = buildRunRequest({
+    prompt: "hi",
+    modelId: "composer-2.5",
+    conversationId: "c1",
+    runId: "r1",
+    agentSessionId: "a1",
+    tools: [],
+    customSystemPrompt: "  You are ProbeOverride.  ",
+  });
+  assert.equal(req.customSystemPrompt, "You are ProbeOverride.");
 });
 
 test("buildRunRequest omits empty conversationState and uses resumeAction", () => {

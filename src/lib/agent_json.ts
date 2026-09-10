@@ -119,6 +119,12 @@ export function buildRunRequest(opts: {
   images?: AgentInlineImage[];
   /** Tool-result follow-up: history is already in conversationState roots. */
   resume?: boolean;
+  /**
+   * Replaces Cursor's harness system prompt (SDK `AgentOptions.systemPrompt`).
+   * Dashboard `crsr_` is access-gated: without it, AgentService returns
+   * `unknown option '--system-prompt'`. Omit unless the caller opted in.
+   */
+  customSystemPrompt?: string;
 }): JsonObject {
   const messageId = crypto.randomUUID();
   const mcpTools = mcpToolDefinitions(opts.tools);
@@ -152,10 +158,9 @@ export function buildRunRequest(opts: {
     mcpTools: { mcpTools },
     conversationId: opts.conversationId,
     conversationGroupId: opts.conversationGroupId || opts.conversationId,
-    // Do not set excludeWorkspaceContext or customSystemPrompt: Dashboard
-    // crsr_ rejects both (`Workspace context exclusion is not allowed…` /
-    // `unknown option '--system-prompt'`). Client system lives in spliced
-    // rootPromptMessagesJson. Builtins stay off via MCP-only allowlist.
+    // Do not set excludeWorkspaceContext: Dashboard crsr_ rejects it
+    // (`Workspace context exclusion is not allowed…`). Builtins stay off
+    // via MCP-only allowlist. `customSystemPrompt` is opt-in (account gate).
     runId: opts.runId,
     agentSessionId: opts.agentSessionId,
     mcpFileSystemOptions: {
@@ -166,6 +171,8 @@ export function buildRunRequest(opts: {
   if (opts.conversationState && Object.keys(opts.conversationState).length > 0) {
     req.conversationState = opts.conversationState;
   }
+  const customSystem = typeof opts.customSystemPrompt === "string" ? opts.customSystemPrompt.trim() : "";
+  if (customSystem) req.customSystemPrompt = customSystem;
   // Cursor only honours SelectedImage.data when this is true.
   if (images.length) req.clientSupportsInlineImages = true;
   return req;
@@ -467,18 +474,33 @@ export function addAgentTurnUsage(a?: AgentTurnUsage, b?: AgentTurnUsage): Agent
   };
 }
 
-/** AgentService may emit cumulative usage snapshots or per-segment deltas. */
+function tokenAtLeast(next: number | undefined, prev: number | undefined): boolean {
+  if (next == null) return true;
+  return next >= (prev ?? 0);
+}
+
+/**
+ * AgentService may emit cumulative snapshots or per-segment deltas.
+ * A later snapshot often omits cache/reasoning — treat missing optional
+ * fields as "unchanged", not 0, or we add the same prompt twice.
+ */
 export function mergeAgentTurnUsage(prev?: AgentTurnUsage, next?: AgentTurnUsage): AgentTurnUsage | undefined {
   if (!next) return prev;
   if (!prev) return next;
-  const prevCr = prev.cacheReadTokens ?? 0;
-  const nextCr = next.cacheReadTokens ?? 0;
   const cumulative =
     next.inputTokens >= prev.inputTokens &&
     next.outputTokens >= prev.outputTokens &&
-    nextCr >= prevCr &&
-    (next.cacheWriteTokens ?? 0) >= (prev.cacheWriteTokens ?? 0);
-  if (cumulative) return next;
+    tokenAtLeast(next.cacheReadTokens, prev.cacheReadTokens) &&
+    tokenAtLeast(next.cacheWriteTokens, prev.cacheWriteTokens);
+  if (cumulative) {
+    return {
+      inputTokens: next.inputTokens,
+      outputTokens: next.outputTokens,
+      cacheReadTokens: next.cacheReadTokens ?? prev.cacheReadTokens,
+      cacheWriteTokens: next.cacheWriteTokens ?? prev.cacheWriteTokens,
+      reasoningTokens: next.reasoningTokens ?? prev.reasoningTokens,
+    };
+  }
   return addAgentTurnUsage(prev, next);
 }
 

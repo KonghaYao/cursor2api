@@ -72,7 +72,7 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 
 **不要**设 `AgentRunRequest.excludeWorkspaceContext = true`（`Workspace context exclusion is not allowed…`）。无 workspace 靠 MCP allowlist + `mcpFileSystemOptions.enabled = false`。
 
-**`customSystemPrompt` / `--system-prompt`：** Dashboard `crsr_` 仍会把该字段当成 CLI `unknown option '--system-prompt'`（9/9 实机）。产品 **不发** 该字段。系统进 `rootPromptMessagesJson` blob，不要折进 `userMessageAction`。
+**`customSystemPrompt` / `--system-prompt`：** `@cursor/sdk` 的 `AgentOptions.systemPrompt` **就是**每枪 `customSystemPrompt`，语义是 **整段替换** Cursor harness（身份 / 工具协议 / 沟通规则）。只给 SDK **local**，且 **账号门禁**：没开门时第一枪 `invalid_argument: unknown option '--system-prompt'`。Dashboard `crsr_` **9/9 与 9/10 实机仍拒**（`scripts/probe-system-override.ts`）。产品 **不发** 该字段。客户端 `system` 进 `rootPromptMessagesJson`，**叠在 harness 上面，换不掉** Composer 身份和「Read/Write/终端」话术。不要折进 `userMessageAction`。不要为了覆盖去装 `@cursor/sdk` 或 `Agent.create({ local })`。缺 `conversationState` 时上游先报 `Conversation state is required`，会误判成字段本身坏了。
 
 ### 客户端合约（常态）：全量 `messages` + 前缀稳定
 
@@ -129,7 +129,8 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 - 把 `GATEWAY_UPSTREAM=cloud` 理解成 Cloud Agents / `Agent.create({ cloud })`
 - 指纹路径每轮 `randomId()` 当 conversationId（9/1 cache 事故）
 - 设 `excludeWorkspaceContext = true`（Dashboard `crsr_` 会 invalid_argument）
-- 给 Dashboard `crsr_` 发 `customSystemPrompt`（会 `unknown option '--system-prompt'`；系统进 root blobs）
+- 给 Dashboard `crsr_` 发 `customSystemPrompt`（9/10 仍 `unknown option '--system-prompt'`；SDK 文档里的 `systemPrompt` 是同一字段 + 同一门禁，不是网关漏接）
+- 把 root blob 里的客户端 `system` 当成「已替换 harness」（模型仍会自称 Composer、报 `/tmp`、列出 Read/Write；那是 harness 话术，不是 MCP allowlist 漏了 shell/edit）
 - 发空 `conversationState: {}`（会抹掉上文）
 - 跟进枪省略 `conversationState`（Cursor Agent 大 system 上会 `Conversation state is required`；短 system 探针测不出来）
 - Anthropic `/v1/messages` 发出无 `signature` 的 `thinking` 又在跟进枪拒收（400）。AgentService 没有真签名：下发 `signature: ""` 并接受回放，**不要**为了避 400 把 thinking SSE 整段掐掉（Composer 会长时间只在想，界面像没在流）
@@ -199,6 +200,43 @@ BASE=http://127.0.0.1:8793 node --experimental-strip-types scripts/probe-session
 | 自制 roots | 只放 `rootPromptMessagesJson` |
 | 产品验收 | Cursor Agent 大 system + 上面三句；短探针不能替代 |
 | `/tmp` | 默认 cwd；不要为此重开 shell/edit |
+
+---
+
+## 2026-09-10：SDK `systemPrompt` 换不掉本网关的 harness
+
+官方 `@cursor/sdk`（1.0.31，[TypeScript 文档](https://cursor.com/docs/sdk/typescript)）已有 `AgentOptions.systemPrompt`：
+
+| 项 | 事实 |
+|----|------|
+| 语义 | **替换**主循环 harness，不是往上叠一句。调用方要自己重写工具协议；schema / rules / skills 仍在；`task` 子代理用自己的 prompt |
+| 线协议 | 每枪 `AgentService/Run.customSystemPrompt`（`executor-types`：*sent as `customSystemPrompt` on every turn*） |
+| 范围 | **local only**；和 `cloud` 一起用 SDK 会 `ConfigurationError` |
+| 门禁 | 账号没开权限 → `InvalidArgument` 文案带 `--system-prompt` |
+| 持久化 | 不跟 agent 走；`Agent.resume` 要再传 |
+
+本网关走同一条 RPC，但 **不是** SDK local runtime。产品路径 **不发** `customSystemPrompt`。
+
+### 实机（本仓库 `crsr_` + `composer-2.5-fast`，`scripts/probe-system-override.ts`）
+
+system = 「只回 `OVERRIDE-OK`，不要提 Cursor / 工具 / `/tmp`」；user = 「你是谁？列出工具和工作区」。
+
+| 路径 | 结果 |
+|------|------|
+| HTTP 网关：system 只进 root blob | 200。**不是** `OVERRIDE-OK`。自称 Composer，工作区 `/tmp`，列出 Read / Write / StrReplace / …（harness 话术） |
+| 直连 Run：`customSystemPrompt`、无 `conversationState` | `Conversation state is required`（先撞缺字段，测不出门禁） |
+| 直连 Run：`customSystemPrompt` + 自拼 roots | `invalid_argument: unknown option '--system-prompt'`（与 9/9 相同门禁） |
+
+`buildRunRequest` 仍可 **opt-in** 带该字段（探针用）；聊天 handler **默认不传**。
+
+### 约束
+
+| 内容 | 策略 |
+|------|------|
+| 产品 `system` | 只进 `rootPromptMessagesJson`；接受叠在 harness 上 |
+| `customSystemPrompt` | `crsr_` 上禁止当产品默认；开门前再发也会炸 |
+| 模型口中的 Read/Write | 当 harness 话术，不要为此重开默认 toolset |
+| `@cursor/sdk` | 仍禁止装进本仓库来「覆盖 system」 |
 
 ---
 
@@ -449,7 +487,7 @@ python3 scripts/analyze_team_usage.py team-usage-events-*.csv -o reports/usage-<
 | 证据 | 实机 `scripts/probe-session-memory.ts`（修后 `composer-2.5-fast` 第三句复述「你的工具有什么」）；单测 `three user sentences stay one session` |
 | 根因结论 | **网关**：① 自制 state 带空 `turns: []` 抹上文；② `5c5218e` 跟进枪省略字段 → Cursor Agent 大 system 报 `Conversation state is required`。短 system / 假 host 测不出来。 |
 | 状态 | **mitigated**：每枪必带自拼 roots；禁止省略。短 system 绿不算过关。 |
-| 续记 | `/tmp` 是默认 cwd。`Prompt cache 4%` 常见于大 system 首轮。2026-09-10：本机 `8793` + `PROBE_PAD_CHARS=24000` 三句 3/3。同日对抗测试：OpenAI 大 system / stream / 三工具 / 并行会话过关；**Anthropic 跟进枪 400**（发出无 signature 的 thinking 又拒收）；**缺 Authorization 明文 500**（cloud handler 未 `await`）。 |
+| 续记 | `/tmp` 是默认 cwd。`Prompt cache 4%` 常见于大 system 首轮。2026-09-10：本机 `8793` + `PROBE_PAD_CHARS=24000` 三句 3/3。同日对抗测试：OpenAI 大 system / stream / 三工具 / 并行会话过关；**Anthropic 跟进枪 400**（发出无 signature 的 thinking 又拒收）；**缺 Authorization 明文 500**（cloud handler 未 `await`）。同日稍后：`@cursor/sdk` `systemPrompt` = `customSystemPrompt`，本账号 `crsr_` 仍拒 `--system-prompt`；root blob 盖不住 harness（`scripts/probe-system-override.ts`）。 |
 
 ### 成本归因（简表）
 

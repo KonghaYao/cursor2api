@@ -267,6 +267,7 @@ export type CustomToolSendOpts = {
   conversationState?: Record<string, unknown>;
   blobs?: Map<string, string>;
   resume?: boolean;
+  customSystemPrompt?: string;
 };
 
 export type CustomToolAgentHandle = {
@@ -288,6 +289,7 @@ export type CustomToolAgentCreateOpts = {
   conversationId?: string;
   agentSessionId?: string;
   conversationState?: Record<string, unknown>;
+  customSystemPrompt?: string;
   onCheckpoint?: (state: Record<string, unknown>) => void;
 };
 

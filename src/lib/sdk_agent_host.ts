@@ -120,7 +120,7 @@ export function createSdkAgentHost(opts?: {
 
       const handle: CustomToolAgentHandle = {
         agentId,
-        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void; signal?: AbortSignal; conversationState?: JsonObject; blobs?: Map<string, string>; resume?: boolean }) {
+        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void; signal?: AbortSignal; conversationState?: JsonObject; blobs?: Map<string, string>; resume?: boolean; customSystemPrompt?: string }) {
           if (closed) throw new Error("agent is closed");
           const abort = new AbortController();
           const onClientAbort = () => abort.abort();
@@ -150,6 +150,7 @@ export function createSdkAgentHost(opts?: {
             blobs,
             conversationState,
             resume: Boolean(sendOpts?.resume),
+            customSystemPrompt: sendOpts?.customSystemPrompt ?? createOpts.customSystemPrompt,
             onCheckpoint: (state) => {
               conversationState = unwrapCheckpointState(state);
               createOpts.onCheckpoint?.(conversationState);
@@ -212,6 +213,7 @@ async function runTurn(opts: {
   blobs: Map<string, string>;
   conversationState?: JsonObject;
   resume?: boolean;
+  customSystemPrompt?: string;
   onCheckpoint: (state: JsonObject) => void;
 }): Promise<{ text: string; thinking?: string; error?: string; usage?: AgentTurnUsage }> {
   let duplex: Awaited<ReturnType<OpenAgentRun>> | undefined;
@@ -270,6 +272,7 @@ async function runTurn(opts: {
           cwd: opts.cwd,
           images: opts.images,
           resume: opts.resume,
+          customSystemPrompt: opts.customSystemPrompt,
         }),
       ),
     );
