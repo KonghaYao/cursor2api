@@ -6,6 +6,8 @@
 import { exchangeApiKey } from "./auth.ts";
 import { randomId } from "./bytes.ts";
 import {
+  asObject,
+  field,
   mergeAgentTurnUsage,
   buildRunRequest,
   clientHeartbeatMessage,
@@ -81,6 +83,11 @@ function contentToText(result: { content?: Array<{ type?: string; text?: string 
   return result.isError ? "custom tool failed" : "";
 }
 
+function unwrapCheckpointState(state: JsonObject): JsonObject {
+  const inner = asObject(field(state, "conversationState", "conversation_state"));
+  return inner ?? state;
+}
+
 function lookupBlob(store: Map<string, string>, blobId: string): string | undefined {
   const hit = store.get(blobId);
   if (hit) return hit;
@@ -109,8 +116,6 @@ export function createSdkAgentHost(opts?: {
       const tools = specsFromCustomTools(createOpts.customTools);
       const blobs = new Map<string, string>();
       let conversationState: JsonObject | undefined = createOpts.conversationState;
-      let sawCheckpoint = false;
-      let turnsSent = 0;
       let closed = false;
 
       const handle: CustomToolAgentHandle = {
@@ -127,18 +132,7 @@ export function createSdkAgentHost(opts?: {
           if (sendOpts?.blobs) {
             for (const [id, data] of sendOpts.blobs) blobs.set(id, data);
           }
-          const providedState = Boolean(sendOpts && Object.prototype.hasOwnProperty.call(sendOpts, "conversationState"));
-          if (providedState && sendOpts?.conversationState) conversationState = sendOpts.conversationState;
-          // Follow-up user turns omit `conversationState` so we do not overwrite
-          // Cursor's checkpoint with a homemade splice. If no checkpoint arrived
-          // on this handle, omit the field entirely — resending the first-shot
-          // system-only splice would wipe the first user turn.
-          const stateForRun = providedState
-            ? sendOpts?.conversationState
-            : sawCheckpoint || turnsSent === 0
-              ? conversationState
-              : undefined;
-          turnsSent += 1;
+          if (sendOpts?.conversationState) conversationState = sendOpts.conversationState;
           const run = runTurn({
             openRun,
             accessToken,
@@ -154,12 +148,11 @@ export function createSdkAgentHost(opts?: {
             tools,
             customTools: createOpts.customTools,
             blobs,
-            conversationState: stateForRun,
+            conversationState,
             resume: Boolean(sendOpts?.resume),
             onCheckpoint: (state) => {
-              sawCheckpoint = true;
-              conversationState = state;
-              createOpts.onCheckpoint?.(state);
+              conversationState = unwrapCheckpointState(state);
+              createOpts.onCheckpoint?.(conversationState);
             },
           });
           void run.finally(() => clientSignal?.removeEventListener("abort", onClientAbort));

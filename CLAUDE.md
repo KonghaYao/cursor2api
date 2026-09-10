@@ -14,7 +14,7 @@
 | **不要二进制依赖** | 不要 SDK 平台包（`@cursor/sdk--*`）、不要本机 agent 可执行文件、不要为 `local: { cwd }` 拉 sandbox / ripgrep。Deno Deploy 跑不了这些 |
 | **不要 Cloud 托管 sandbox VM** | 不要 `Agent.create({ cloud })`，不要 `POST https://api.cursor.com/v1/agents` 开 `bc-…` 对话。VM 自带 shell/edit，没有 OpenAI 式 park `tool_calls` |
 
-**是什么：** 网关进程内对 `POST https://api2.cursor.sh/agent.v1.AgentService/Run` 的 Connect JSON 客户端；MCP 家族 allowlist 请求头压掉默认 shell/edit；客户端 function tools → 合成 MCP `custom-user-tools`（`mcpTools` + `requestContext` / `mcpState`），`customTools.execute()` 在本进程 park，返回 OpenAI `tool_calls`。每一枪 HTTP 开/关一条 Run（交 `tool_calls` 时 **close 双工、不发 `cancelAction`**）。跟进轮次由网关从全量 transcript **自己拼接** `conversationState.rootPromptMessagesJson`（SHA-256 JSON blob + `getBlob`），`role: tool` 走 `resumeAction`。默认不发 `customSystemPrompt`。模型仍是 Cursor 托管推理，**不在** Cursor sandbox VM。
+**是什么：** 网关进程内对 `POST https://api2.cursor.sh/agent.v1.AgentService/Run` 的 Connect JSON 客户端；MCP 家族 allowlist 请求头压掉默认 shell/edit；客户端 function tools → 合成 MCP `custom-user-tools`（`mcpTools` + `requestContext` / `mcpState`），`customTools.execute()` 在本进程 park，返回 OpenAI `tool_calls`。每一枪 HTTP 开/关一条 Run（交 `tool_calls` 时 **close 双工、不发 `cancelAction`**）。**每一枪都要带** `conversationState`（缺字段 → `invalid_argument: Conversation state is required`）。从全量 transcript 拼 `rootPromptMessagesJson`（SHA-256 JSON blob + `getBlob`），对象里 **只** 放 roots，**不要**空 `turns: []`。`role: tool` 走 `resumeAction`。cwd 默认 `/tmp`（`GATEWAY_AGENT_CWD`）。默认不发 `customSystemPrompt`。模型仍是 Cursor 托管推理，**不在** Cursor sandbox VM。
 
 **日志里的 `cloud`：** `GATEWAY_UPSTREAM` 只有 `"inference"` 或 `"cloud"`，默认 `"cloud"` = 不走 Inference。`cloud_openai.ts` / `CloudChatError` / 测试名 `cloud OpenAI…` 同此。**不是** Cloud Agents。`GET /health` 的 `rpc` 才是真实路径。
 
@@ -45,15 +45,17 @@ Cursor 用 `rootPromptMessagesJson`（Vercel-AI 形 JSON 的 SHA-256 blob id）�
 | 本轮 | `conversationState` | action |
 |------|---------------------|--------|
 | 首轮 | 系统 blob（client system + tool policy；缺省则默认助手句） | `userMessageAction` = 第一条 user 文本。**不要**把 system 再折进 user，**不要**发空 `{}` |
-| 跟进 user（同进程） | **省略字段**（或回传上一枪 `conversationCheckpointUpdate`）。不要用自制 splice 覆盖 checkpoint，也不要发空 `turns: []` | `userMessageAction` = 新 user（可 slice 多条） |
-| 跟进 user（isolate hop） | 系统 + 历史（不含本轮新 user） | 同上 |
+| 跟进 user | **必须带字段**：系统 + 历史（不含本轮新 user）。**禁止省略**（上游 `Conversation state is required`） | `userMessageAction` = 新 user（可 slice 多条） |
 | `role: tool` | 系统 + **全部**历史含 tool 结果（user 角色 `[Tool Result]`） | **`resumeAction`**。不要把 tool 结果再写成 user 文本 |
 
 - blob id = SHA-256(JSON utf8)，Connect JSON 里是标准 base64；`getBlob` 回 `blobData` = JSON 字节的 base64
 - **禁止**把 OpenAI `messages` / `tool_calls` 原样塞进 `conversationState`
 - **禁止** `conversationState: {}`（等于告诉上游这段对话是空的）
-- **禁止** 跟进枪带空 `turns: []` / 空 map 去「补全」state（会把上文抹成空会话）
-- KV `agent-run:` **只存 ids**（不存 checkpoint / 不存 transcript）。isolate hop / `role: tool` 才从客户端全量 messages 重拼 roots
+- **禁止** 跟进枪省略 `conversationState`（`invalid_argument: Conversation state is required`）
+- **禁止** 跟进枪带空 `turns: []` / 空 map / 空 `{}`（会把上文抹成空会话）
+- **不要**把上一枪 checkpoint 的 `rootPromptMessagesJson` 当可信历史（上游回显常把历史 user 换成空占位）
+- KV `agent-run:` **只存 ids**（不存 checkpoint / 不存 transcript）。每枪从客户端全量 messages 重拼 roots
+- cwd /「工作区路径」默认 **`/tmp`**（`mcpFileSystemOptions.workspaceProjectDir`）。模型说工作区是 `/tmp` 是预期，不是会话丢了。要改用 `GATEWAY_AGENT_CWD`
 
 ### 屏蔽自带工具（MCP allowlist 仍开；上游挂 custom-user-tools）
 
@@ -66,6 +68,7 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 - 不设该头 → 默认 toolset（shell / edit / grep / …）会回来 — **禁止**
 - 只开 MCP 家族 → 压掉 shell/edit/grep/task/webSearch；Connect body 送 `mcpTools: [custom-user-tools-…]`
 - **跨轮次工具**：单测必须覆盖「`get_weather` → `lookup` → `search` → 终轮文本」（用户工具 ×3）；`conversation_id` 不变；跟进枪 `resumeAction` + roots 含上文。改第一条 user = 新对话。不要用「只发最后一条」当产品场景。
+- **跨轮次用户话（产品验收，假 host 不够）**：同一会话三句「你的工具有什么」→「调用一下」→「我的第一句话是什么」，第三句必须能复述第一句、无异常信封。见 **2026-09-10** / `scripts/probe-session-memory.ts`。只绿 `get_weather→lookup→search` 协议单测 **不算** 过关。
 
 **不要**设 `AgentRunRequest.excludeWorkspaceContext = true`（`Workspace context exclusion is not allowed…`）。无 workspace 靠 MCP allowlist + `mcpFileSystemOptions.enabled = false`。
 
@@ -80,12 +83,12 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 | **全量传递** | 每轮 `messages` = 从第一条 user 到当前的全部 user / assistant / `tool_calls` / `role: tool`（Anthropic 则是 `tool_use` / `tool_result`）。**不要**假设客户端只发 delta。 |
 | **前缀稳定** | 只 append。不改第一条 user、不改已出现的 assistant/tool 前缀、不改 `system` / tools catalog。改了 = 新对话（`agentRunFp` 变）。 |
 
-网关职责是 **从全量里抽出本轮 delta** 再打 AgentService（上文在我们拼接的 `conversationState`）：
+网关职责是 **从全量里抽出本轮 delta** 再打 AgentService（上文在每枪自拼的 roots，字段不能缺）：
 
 | 本轮 | 送给 AgentService |
 |------|-------------------|
 | 首轮 | roots = 系统 blob；`userMessageAction` = 第一条 user |
-| 跟进 user | roots = 系统 + 历史；`userMessageAction` = 新 user |
+| 跟进 user | roots = 系统 + 历史（**必须带** `conversationState`）；`userMessageAction` = 新 user |
 | `role: tool` | roots = 系统 + 全部历史含 tool 结果；**`resumeAction`** |
 
 `agentRunFp` 锚 **第一条 user** 成立，正是因为客户端保证这条前缀不变。单测多轮必须用**全量 transcript** 复现，不要用「只发最后一条」当产品场景。
@@ -113,7 +116,7 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 
 **用户端中断（官方 abort）：** 客户端断开 HTTP / 取消 SSE 时，对**这一枪还在飞的** `AgentService/Run` 发 `conversationAction.cancelAction`（proto `CancelAction`），再关双工。不要只停本地 SSE 而让上游继续计费。握手阶段（`fetch` 还没连上）才直接 abort 传输。成功返回 200 之后立刻摘掉 `request.signal`，避免 Deno legacy abort 误发 cancel。`ReadableStream.cancel()`（SSE 客户端丢连接）同样走 `cancelAction`。
 
-**会话 id（Deno isolate / serverless）：** `conversationId` = `tenant:agentRunFp`。`agentRunFp` = model / effort / flags / tools / system / **第一条 user**（不含后续轮次）。客户端 `x-session-id` / `conversation_id` **忽略**。**每一枪 HTTP 开/关一条 `AgentService/Run`**：返回 `tool_calls` 就关掉双工。`role: tool` 一律新开 Run + 自拼 `conversationState` + `resumeAction`。KV `agent-run:${tenant}:${fp}` 只存 `{fp, conversationId, agentSessionId}`，TTL 24h，**不要**把 checkpoint / messages 写进 KV。KV `agent-run-len:` 只存上次成功处理的 `messages.length`，TTL **5 分钟**，用来 slice 新 user；**不要**并进 24h 的 `agent-run`。
+**会话 id（Deno isolate / serverless）：** `conversationId` = `tenant:agentRunFp`。`agentRunFp` = model / effort / flags / tools / system / **第一条 user**（不含后续轮次）。客户端 `x-session-id` / `conversation_id` **忽略**。**每一枪 HTTP 开/关一条 `AgentService/Run`**：返回 `tool_calls` 就关掉双工。跟进枪 **必须**带自拼 roots（缺字段会 `Conversation state is required`）。`role: tool` 用 `resumeAction`。KV `agent-run:${tenant}:${fp}` 只存 `{fp, conversationId, agentSessionId}`，TTL 24h，**不要**把 checkpoint / messages 写进 KV。KV `agent-run-len:` 只存上次成功处理的 `messages.length`，TTL **5 分钟**，用来 slice 新 user；**不要**并进 24h 的 `agent-run`。
 
 ### 不要做的
 
@@ -128,9 +131,14 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 - 设 `excludeWorkspaceContext = true`（Dashboard `crsr_` 会 invalid_argument）
 - 给 Dashboard `crsr_` 发 `customSystemPrompt`（会 `unknown option '--system-prompt'`；系统进 root blobs）
 - 发空 `conversationState: {}`（会抹掉上文）
+- 跟进枪省略 `conversationState`（Cursor Agent 大 system 上会 `Conversation state is required`；短 system 探针测不出来）
+- Anthropic `/v1/messages` 发出无 `signature` 的 `thinking` 块（AgentService `thinkingDelta` 没有签名；客户端回放会 400）。无签名就不要发 thinking，跟进枪也不要因此拒收
+- `handleGatewayRequest` 里 `return handleCloud…` 不 `await`（`AuthError` 逃出 try/catch，Deno 变成明文 500 而不是 401）
+- 跟进枪带空 `turns: []` / 空 `{}`（9/10：第三句忘了第一句）
+- 用假 host 或短 system 探针代替 Cursor Agent 大 system 的三句实机验收
 - 把 OpenAI `messages` / `tool_calls` JSON 直接塞进 `conversationState`（必须是 blob id + `rootPromptMessagesJson`）
-- 只把最后一条 user 丢给 AgentService、却不拼 roots
-- 把「客户端只发增量 messages」当成产品场景。常态是 **每轮全量 + 前缀稳定**；网关从全量拼 state，禁止把整段 history 再叠进 `userMessageAction`
+- 只把最后一条 user 丢给 AgentService、却不拼 roots（isolate hop / `role: tool`）
+- 把「客户端只发增量 messages」当成产品场景。常态是 **每轮全量 + 前缀稳定**；禁止把整段 history 再叠进 `userMessageAction`
 - 跟进轮次再把 system / 工具目录 / 整段 history / 历史 tool results 叠进 `userMessageAction`（应在 spliced roots / `resumeAction`）
 - 把 HTTP `request.signal` 绑到**已经返回的**或**下一枪** AgentService/Run 上（Deno.serve 成功响应会 abort）。用户取消**当前还在飞的**那一枪必须发 `cancelAction`，不要只关本地 SSE。
 - 交 `tool_calls` 时对 AgentService 发 `cancelAction`（那是用户中断，不是关这一枪 HTTP；多轮工具会断）
@@ -139,6 +147,56 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 - 给 AgentService 每轮 `randomId()` 当 conversationId（isolate 一跳就丢 cache；用 `tenant:agentRunFp`，fp **不要**混进整段 pending transcript，只锚第一条 user）
 - 再用客户端 `x-session-id` / `conversation_id` 当会话键（已废弃；session 完全内部计算）
 - 把 messages / canon / 整段 transcript 写进 KV（`agent-run:` 只允许 ids + 可选小 checkpoint；`agent-run-len:` 只允许整数长度，TTL 5min，不要并进 24h 绑定）
+
+---
+
+## 2026-09-10：conversationState 两头都错（空 turns 抹上文 / 省略字段被拒）
+
+台账：**INC-2026-09-10**。先是 `b97f6d7` 每枪自拼 state 带空 `turns: []`，三句用户话忘上文。接着 `5c5218e` **省略**跟进枪的 `conversationState`，短 system 探针能绿，**Cursor Agent（~10k system）跟进枪直接 `invalid_argument: Conversation state is required`**。
+
+### 验收（假 host + 短 system 都不够）
+
+同一 `conversation_id`、全量 transcript、无 `Conversation state is required`、第三句能复述第一句：
+
+1. 「你的工具有什么」
+2. 「调用一下」
+3. 「我的第一句话是什么」
+
+```bash
+set -a && source .env && set +a
+# 默认 PAD≈24k 字符，对齐 Cursor Agent 大 system；短 system 测不出缺字段
+BASE=http://127.0.0.1:8793 node --experimental-strip-types scripts/probe-session-memory.ts
+```
+
+单测必须断言：**跟进 user 的 `send()` 带非空 `conversationState`**，且 roots 含第一句。只绿三轮 MCP park **不算**过关。
+
+模型说「当前工作区路径是 `/tmp`」是 `mcpFileSystemOptions.workspaceProjectDir` 默认值，不是会话丢了。
+
+### 根因（两步）
+
+1. **空 `turns: []`**：Cursor 当成「这段对话没有 turns」，历史被抹。和发 `{}` 同类。
+2. **省略字段**：AgentService 跟进枪 **要求** `conversationState`。短 system / 假 host 不报这个错。Cursor 回显的 checkpoint `rootPromptMessagesJson` 还可能是空占位，不能当历史源。
+
+`Prompt cache coverage 4%`（如 cached 448 / input 10381）常见于 **大 system 首轮**（Composer 前缀只有一点 cache），不要单独当成会话 id 事故。
+
+### 正确做法
+
+| 本轮 | `conversationState` |
+|------|---------------------|
+| 每一枪 | **必须带**。从客户端全量 transcript 拼 `rootPromptMessagesJson`（不含本轮新 user；tool 轮含 `[Tool Result]`） |
+| 形状 | **只** 放 `rootPromptMessagesJson`。禁止省略、禁止 `{}`、禁止空 `turns: []` |
+| `role: tool` | 同上 + `resumeAction` |
+
+`getBlob` 按标准 base64 / URL-safe / hex 索引。KV 仍只存 ids。
+
+### 约束
+
+| 内容 | 策略 |
+|------|------|
+| 跟进枪 | **必须**带自拼 roots；不要省略、不要只回传 checkpoint roots |
+| 自制 roots | 只放 `rootPromptMessagesJson` |
+| 产品验收 | Cursor Agent 大 system + 上面三句；短探针不能替代 |
+| `/tmp` | 默认 cwd；不要为此重开 shell/edit |
 
 ---
 
@@ -375,7 +433,21 @@ python3 scripts/analyze_team_usage.py team-usage-events-*.csv -o reports/usage-<
 | 证据 | 本机探针 Stream 信封 `ERROR_NOT_LOGGED_IN`；同 key `GET https://api.cursor.com/v1/models` 200；`AgentService/Run` 可聊 |
 | 根因结论 | **Cursor 上游**：Inference 这条 RPC 对 Dashboard API key 不再当已登录会话。不是网关把 model id / session_fp 弄丢。 |
 | 状态 | **mitigated**：聊天改 `agent.v1.AgentService/Run` + 进程内 customTools（`684da64` / `454122d`）。Inference 仍死，禁止加回。 |
-| 续记 | 2026-09-09：实机 Deno `8789` OpenAI probe 7/7、Anthropic `system`、`grok-4.6-fast` PONG。上游另拒 `excludeWorkspaceContext` 与 `customSystemPrompt`（`--system-prompt`）。同日稍后：废弃客户端 `x-session-id`，`conversationId` = `tenant:agentRunFp`（model/tools/system/第一条 user）；KV `agent-run:` 按 fp 绑 ids。当时 `execute()` park 仍必须同 isolate。Team Usage Cache Read 尚未用 CSV 验证。 **2026-09-09 夜：曾改文本 `<gw_tool_call>`（`mcpTools: []`）。2026-09-10：回到 custom-user-tools + 自拼 `conversationState.rootPromptMessagesJson` / `resumeAction`；禁止空 `{}`。** |
+| 续记 | 2026-09-09：实机 Deno `8789` OpenAI probe 7/7、Anthropic `system`、`grok-4.6-fast` PONG。上游另拒 `excludeWorkspaceContext` 与 `customSystemPrompt`（`--system-prompt`）。同日稍后：废弃客户端 `x-session-id`，`conversationId` = `tenant:agentRunFp`（model/tools/system/第一条 user）；KV `agent-run:` 按 fp 绑 ids。当时 `execute()` park 仍必须同 isolate。Team Usage Cache Read 尚未用 CSV 验证。 **2026-09-09 夜：曾改文本 `<gw_tool_call>`（`mcpTools: []`）。2026-09-10 早：回到 custom-user-tools + 自拼 roots / `resumeAction`（`b97f6d7`）；禁止空 `{}`。同日稍后：自制 splice 带空 `turns: []` 盖掉 checkpoint，三句用户话忘上文 → **INC-2026-09-10**（`5c5218e`）。** |
+
+###### INC-2026-09-10 — 【S】跟进 user 覆盖 checkpoint，第三句忘了第一句
+
+| 字段 | 内容 |
+|------|------|
+| 分级 | **S（小事故）**（产品语义，非 M1/M5 cache SLO） |
+| 观测窗 (CST) | **2026-09-10** 凌晨发 `b97f6d7` 后；09:08 起按三句用户话复现 |
+| 主要坏段 (CST) | 同一会话：「你的工具有什么」→「调用一下」→「我的第一句话是什么」；第三句看不到第一句（假 host 的三轮 MCP park 仍绿） |
+| 触发指标 | 产品验收失败（非 M1/M5）；`conversation_id` 往往仍稳定 |
+| 用户/团队 | 走本网关的 Cursor Agent / OpenAI 客户端 |
+| 证据 | 实机 `scripts/probe-session-memory.ts`（修后 `composer-2.5-fast` 第三句复述「你的工具有什么」）；单测 `three user sentences stay one session` |
+| 根因结论 | **网关**：① 自制 state 带空 `turns: []` 抹上文；② `5c5218e` 跟进枪省略字段 → Cursor Agent 大 system 报 `Conversation state is required`。短 system / 假 host 测不出来。 |
+| 状态 | **mitigated**：每枪必带自拼 roots；禁止省略。短 system 绿不算过关。 |
+| 续记 | `/tmp` 是默认 cwd。`Prompt cache 4%` 常见于大 system 首轮。2026-09-10：本机 `8793` + `PROBE_PAD_CHARS=24000` 三句 3/3。同日对抗测试：OpenAI 大 system / stream / 三工具 / 并行会话过关；**Anthropic 跟进枪 400**（发出无 signature 的 thinking 又拒收）；**缺 Authorization 明文 500**（cloud handler 未 `await`）。 |
 
 ### 成本归因（简表）
 

@@ -433,6 +433,20 @@ Deno.test("POST /v1/messages validates request before calling upstream", async (
   }
 });
 
+Deno.test("POST /v1/chat/completions without Authorization is 401 JSON", async () => {
+  const res = await handleGatewayRequest(
+    new Request("http://127.0.0.1/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "composer-2.5-fast", messages: [{ role: "user", content: "hi" }] }),
+    }),
+    { kv: createMemoryKv(), upstream: "cloud" },
+  );
+  if (res.status !== 401) throw new Error(`expected 401, got ${res.status}: ${await res.text()}`);
+  const body = await res.json();
+  if (body?.error?.type !== "authentication_error") throw new Error(`unexpected body ${JSON.stringify(body)}`);
+});
+
 Deno.test("POST /v1/messages returns malformed JSON as Anthropic 400", async () => {
   const res = await handleGatewayRequest(
     new Request("http://127.0.0.1/v1/messages", {

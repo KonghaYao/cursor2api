@@ -602,7 +602,10 @@ export function parseServerMessage(raw: unknown): ServerCase {
   }
 
   const checkpoint = asObject(field(wrapped, "conversationCheckpointUpdate", "conversation_checkpoint_update"));
-  if (checkpoint) return { kind: "checkpoint", state: checkpoint };
+  if (checkpoint) {
+    const inner = asObject(field(checkpoint, "conversationState", "conversation_state"));
+    return { kind: "checkpoint", state: inner ?? checkpoint };
+  }
 
   const kv = asObject(field(wrapped, "kvServerMessage", "kv_server_message"));
   if (kv) return { kind: "kv", kv: asObject(field(kv, "message")) ?? kv };

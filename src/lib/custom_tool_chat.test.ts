@@ -75,7 +75,7 @@ test("OpenAI chat returns reasoning_content and forwards image bytes", async () 
   assert.match(sent?.prompt || "", /what is this\?/);
 });
 
-test("Anthropic messages return a thinking content block", async () => {
+test("Anthropic messages omit unsigned thinking (AgentService has no signature)", async () => {
   setCustomToolAgentHostForTests({
     async create() {
       return {
@@ -99,8 +99,7 @@ test("Anthropic messages return a thinking content block", async () => {
   });
   assert.equal(res.status, 200);
   const body = await res.json();
-  assert.deepEqual(body.content[0], { type: "thinking", thinking: "17*19" });
-  assert.deepEqual(body.content[1], { type: "text", text: "42" });
+  assert.deepEqual(body.content, [{ type: "text", text: "42" }]);
 });
 
 test("Anthropic image blocks are forwarded as AgentService selectedImages", async () => {
@@ -345,6 +344,51 @@ test("same session follow-up reuses the in-process agent", async () => {
   assert.equal(creates, 1);
 });
 
+test("follow-up user always sends conversationState (upstream requires it)", async () => {
+  const sendOpts: Array<CustomToolSendOpts | undefined> = [];
+  setCustomToolAgentHostForTests({
+    async create() {
+      return {
+        agentId: "agent-state-required",
+        async send(_prompt, opts) {
+          sendOpts.push(opts);
+          return { wait: async () => ({ text: "ok" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const kv = createMemoryKv();
+  const headers = new Headers({ authorization: "Bearer crsr_test" });
+  const first = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [{ role: "user", content: "你的工具有什么" }] },
+    tools: [],
+    kv,
+  });
+  assert.equal(first.status, 200);
+  const second = await handleCustomToolChatCompletions({
+    headers,
+    body: {
+      model: "composer-2.5",
+      messages: [
+        { role: "user", content: "你的工具有什么" },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "调用一下" },
+      ],
+    },
+    tools: [],
+    kv,
+  });
+  assert.equal(second.status, 200);
+  assert.equal(sendOpts.length, 2);
+  assert.ok(sendOpts[0]?.conversationState);
+  assert.ok(sendOpts[1]?.conversationState, "omitting conversationState yields invalid_argument: Conversation state is required");
+  const roots = decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!);
+  assert.match(roots, /你的工具有什么/);
+  assert.doesNotMatch(JSON.stringify(sendOpts[1]!.conversationState), /"turns":\[\]/);
+});
+
 test("park_miss with a full transcript splices tool history into conversationState", async () => {
   const kv = createMemoryKv();
   const prompts: string[] = [];
@@ -560,7 +604,7 @@ test("OpenAI stream=true forwards AgentService thinking and text deltas", async 
   assert.match(sse, /"finish_reason":"stop"/);
 });
 
-test("Anthropic stream=true forwards thinking then text deltas", async () => {
+test("Anthropic stream=true omits unsigned thinking and forwards text deltas", async () => {
   let onDelta: ((chunk: { text?: string; thinking?: string }) => void) | undefined;
   let finish!: (result: { text: string; thinking: string }) => void;
   const finished = new Promise<{ text: string; thinking: string }>((resolve) => {
@@ -600,8 +644,7 @@ test("Anthropic stream=true forwards thinking then text deltas", async () => {
     },
     (buf) => buf.includes("message_stop"),
   );
-  assert.match(sse, /thinking_delta/);
-  assert.match(sse, /"thinking":"plan"/);
+  assert.equal(sse.includes("thinking_delta"), false, sse);
   assert.match(sse, /text_delta/);
   assert.match(sse, /"text":"ok"/);
 });
@@ -1431,7 +1474,8 @@ test("three user sentences stay one session: list tools, call, recall first sent
   const tc = b2.choices[0].message.tool_calls;
   assert.equal(tc[0].function.name, "get_weather");
   assert.equal(prompts[1], second);
-  assert.equal(sendOpts[1]?.conversationState, undefined);
+  assert.ok(sendOpts[1]?.conversationState, "follow-up user must send conversationState (upstream requires it)");
+  assert.match(decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!), /你的工具有什么/);
 
   const afterTool = [
     system,
@@ -1470,7 +1514,8 @@ test("three user sentences stay one session: list tools, call, recall first sent
   assert.equal(b3.conversation_id, b1.conversation_id);
   assert.match(String(b3.choices[0].message.content || ""), /你的工具有什么/);
   assert.equal(prompts[3], third);
-  assert.equal(sendOpts[3]?.conversationState, undefined);
+  assert.ok(sendOpts[3]?.conversationState, "third user turn must send conversationState");
+  assert.match(decodeRootPromptText(sendOpts[3]!.conversationState!, sendOpts[3]!.blobs!), /你的工具有什么/);
 
   customToolChatClearForTests();
   sends = 0;

@@ -87,9 +87,11 @@ async function prepareChatTurn(
 }
 
 class RequestInputError extends Error {
-  constructor(message: string, readonly status = 400) {
+  status: number;
+  constructor(message: string, status = 400) {
     super(message);
     this.name = "RequestInputError";
+    this.status = status;
   }
 }
 
@@ -245,8 +247,13 @@ export function validateAnthropicRequest(body: Record<string, unknown>): void {
       if ((type === "image" || type === "document") && (!block.source || typeof block.source !== "object" || Array.isArray(block.source))) {
         throw new RequestInputError(`${path}.source is required`);
       }
-      if (type === "thinking" && (typeof block.thinking !== "string" || typeof block.signature !== "string")) {
-        throw new RequestInputError(`${path} must include thinking and signature strings`);
+      if (type === "thinking") {
+        if (typeof block.thinking !== "string") throw new RequestInputError(`${path}.thinking is required`);
+        // AgentService thinkingDelta has no signature. Clients echo whatever we
+        // returned; requiring signature here 400s the next /v1/messages turn.
+        if (block.signature != null && typeof block.signature !== "string") {
+          throw new RequestInputError(`${path}.signature must be a string`);
+        }
       }
       if (type === "redacted_thinking" && typeof block.data !== "string") throw new RequestInputError(`${path}.data is required`);
     }
@@ -513,7 +520,7 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
 
     if (method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
       if (ctx.upstream === "cloud") {
-        return handleCloudModels(request.headers, anthropicModelsRequest, requestId, request.signal);
+        return await handleCloudModels(request.headers, anthropicModelsRequest, requestId, request.signal);
       }
       const { accessToken } = await getAccessToken(ctx, request.headers);
       const r = await connectUnary("/agent.v1.AgentService/GetUsableModels", accessToken, {});
@@ -555,11 +562,11 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       const unsupported = rejectUnsupportedChatOptions(body);
       if (unsupported) return unsupported;
       if (ctx.upstream === "cloud") {
-        return handleCloudMessages(request.headers, body, requestId, ctx.kv, {
+        return await handleCloudMessages(request.headers, body, requestId, ctx.kv, {
           signal: request.signal,
         });
       }
-      return handleInferenceMessages(ctx, request, body, requestId);
+      return await handleInferenceMessages(ctx, request, body, requestId);
     }
 
     if (method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
@@ -567,11 +574,11 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       const unsupported = rejectUnsupportedChatOptions(body);
       if (unsupported) return unsupported;
       if (ctx.upstream === "cloud") {
-        return handleCloudChatCompletions(request.headers, body, ctx.kv, {
+        return await handleCloudChatCompletions(request.headers, body, ctx.kv, {
           signal: request.signal,
         });
       }
-      return handleInferenceChatCompletions(ctx, request, body);
+      return await handleInferenceChatCompletions(ctx, request, body);
     }
 
     console.log("  -> 404");

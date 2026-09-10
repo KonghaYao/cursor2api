@@ -31,7 +31,7 @@ export function sdkHeaders(accessToken: string, requestId = randomId()): Record<
 
 export function incomingCredential(headers: Headers): string | undefined {
   const auth = headers.get("authorization") || "";
-  const bearer = auth.replace(/^Bearer\s+/i, "").trim();
+  const bearer = auth.replace(/^Bearer\s*/i, "").trim();
   const xApi = (headers.get("x-api-key") || headers.get("x-cursor-api-key") || "").trim();
   const raw = bearer || xApi;
   if (!raw || isPlaceholder(raw)) return undefined;
@@ -75,7 +75,11 @@ export async function exchangeApiKey(apiKey: string): Promise<{ accessToken: str
   } catch {
     json = { _raw: text.slice(0, 500) };
   }
-  if (!res.ok) throw new Error(`exchange_user_api_key ${res.status}: ${text.slice(0, 400)}`);
+  if (!res.ok) {
+    const detail = `exchange_user_api_key ${res.status}: ${text.slice(0, 400)}`;
+    if (res.status === 401 || res.status === 403) throw new AuthError(detail);
+    throw new Error(detail);
+  }
   const accessToken = String(json?.accessToken || json?.access_token || "");
   if (!accessToken) throw new Error("exchange_user_api_key returned no accessToken");
   return {

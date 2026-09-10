@@ -12,6 +12,8 @@
 const BASE = (process.env.BASE || "http://127.0.0.1:8789").replace(/\/$/, "");
 const MODEL = process.env.PROBE_MODEL || "composer-2.5-fast";
 const TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS || 180_000);
+/** Cursor Agent system prompts are ~10k tokens. Short system hides `Conversation state is required`. */
+const PAD_CHARS = Math.max(0, Number(process.env.PROBE_PAD_CHARS || 24_000));
 
 const FIRST = "你的工具有什么";
 const SECOND = "调用一下";
@@ -43,7 +45,15 @@ function record(row: Row): void {
 
 function errOf(json: ChatJson): string | undefined {
   const m = json.error?.message;
+  const text = contentOf(json);
+  const blob = `${m || ""} ${text}`;
+  if (/Conversation state is required/i.test(blob)) return "invalid_argument: Conversation state is required";
   return m ? String(m).slice(0, 400) : undefined;
+}
+
+function paddedSystem(): string {
+  const pad = "workspace notes. ".repeat(Math.ceil(PAD_CHARS / 17)).slice(0, PAD_CHARS);
+  return `用简体中文回答。工具在时先用工具，不要编造。\n${pad}`;
 }
 
 function contentOf(json: ChatJson): string {
@@ -144,9 +154,10 @@ async function main(): Promise<void> {
   if (!health || health.status !== 200) throw new Error(`gateway not healthy at ${BASE}`);
 
   let messages: unknown[] = [
-    { role: "system", content: "用简体中文回答。工具在时先用工具，不要编造。" },
+    { role: "system", content: paddedSystem() },
     { role: "user", content: FIRST },
   ];
+  console.log(`  system_pad_chars=${PAD_CHARS} (Cursor Agent-sized; 0 skips pad)`);
 
   const t1 = await completeTurn(key, messages, "turn1");
   messages = t1.messages;

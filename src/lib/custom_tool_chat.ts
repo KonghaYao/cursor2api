@@ -603,12 +603,10 @@ async function startCustomToolTurn(opts: {
   if (priorMessageCount && messages.length > priorMessageCount) {
     console.log(`  custom_tools slice prior=${priorMessageCount} n=${messages.length}`);
   }
-  // Same-process user follow-up: do not overwrite Cursor's checkpoint with a
-  // homemade splice. First shot, isolate hop, and role:tool still splice.
-  const reuseUpstreamState = Boolean(existing) && !toolFollowUp;
+  const rootCount = (spliced.conversationState.rootPromptMessagesJson as unknown[] | undefined)?.length ?? 0;
   if (!toolFollowUp && (existing || binding)) {
     console.log(
-      `  custom_tools follow_user session=${sessionId.slice(0, 24)} existing=${Boolean(existing)} kv=${Boolean(binding)} reuse_state=${reuseUpstreamState} roots=${(spliced.conversationState.rootPromptMessagesJson as unknown[] | undefined)?.length ?? 0}`,
+      `  custom_tools follow_user session=${sessionId.slice(0, 24)} existing=${Boolean(existing)} kv=${Boolean(binding)} resume=${spliced.resume} roots=${rootCount}`,
     );
   }
   const deltas = createTextDeltaHub();
@@ -616,7 +614,11 @@ async function startCustomToolTurn(opts: {
     ...(images.length ? { images } : {}),
     resume: spliced.resume,
     blobs: spliced.blobs,
-    ...(reuseUpstreamState ? {} : { conversationState: spliced.conversationState }),
+    // AgentService follow-ups reject a missing field (`Conversation state is
+    // required`). Always send spliced roots — never omit, never `{}`, never
+    // empty `turns: []`. Do not rely on an in-memory checkpoint: Cursor's
+    // echoed roots can be empty placeholders.
+    conversationState: spliced.conversationState,
     onDelta: (chunk) => deltas.push(chunk),
     // Do not pass HTTP request.signal into send(): Deno.serve aborts it after
     // 200, which would cancelAction a parked Run. Client abort is attachClientAbort.
@@ -714,9 +716,14 @@ function agentVisibleText(text?: string, error?: string): string {
   return `${t}\n${e}`;
 }
 
-function anthropicContentBlocks(opts: { thinking?: string; text?: string; toolUses?: unknown[] }): unknown[] {
+function anthropicContentBlocks(opts: { thinking?: string; thinkingSignature?: string; text?: string; toolUses?: unknown[] }): unknown[] {
   const content: unknown[] = [];
-  if (opts.thinking) content.push({ type: "thinking", thinking: opts.thinking });
+  // AgentService thinkingDelta has no signature. Unsigned thinking cannot be
+  // echoed on the next /v1/messages turn (Anthropic clients send the block
+  // back). Same rule as toAnthropicMessage / Inference SSE: omit it.
+  if (opts.thinking && opts.thinkingSignature) {
+    content.push({ type: "thinking", thinking: opts.thinking, signature: opts.thinkingSignature });
+  }
   if (opts.text) content.push({ type: "text", text: opts.text });
   if (opts.toolUses?.length) content.push(...opts.toolUses);
   return content.length ? content : [{ type: "text", text: "" }];
@@ -1011,7 +1018,7 @@ function streamCustomAnthropic(opts: {
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let index = 0;
-      let open: "thinking" | "text" | null = null;
+      let open: "text" | null = null;
       let emittedThinking = live.deltas.ackedThinking;
       let emittedText = live.deltas.ackedText;
       const closeOpen = () => {
@@ -1023,27 +1030,9 @@ function streamCustomAnthropic(opts: {
       const flush = () => {
         const thinking = longerText(live.thinking, live.deltas.streamedThinking);
         const text = longerText(live.text, live.deltas.streamedText);
-        if (thinking.length > emittedThinking) {
-          if (open !== "thinking") {
-            closeOpen();
-            controller.enqueue(
-              encodeSseEvent("content_block_start", {
-                type: "content_block_start",
-                index,
-                content_block: { type: "thinking", thinking: "" },
-              }),
-            );
-            open = "thinking";
-          }
-          controller.enqueue(
-            encodeSseEvent("content_block_delta", {
-              type: "content_block_delta",
-              index,
-              delta: { type: "thinking_delta", thinking: thinking.slice(emittedThinking) },
-            }),
-          );
-          emittedThinking = thinking.length;
-        }
+        // AgentService thinkingDelta has no signature — do not open an
+        // unsigned thinking block (Inference SSE already omits these).
+        if (thinking.length > emittedThinking) emittedThinking = thinking.length;
         if (text.length > emittedText) {
           if (open !== "text") {
             closeOpen();
