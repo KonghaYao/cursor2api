@@ -495,6 +495,36 @@ async function handleInferenceMessages(
   );
 }
 
+function mapGatewayError(err: unknown, anthropicRequest: boolean, requestId: string): Response {
+  const message = String((err as Error)?.message || err);
+  const status =
+    err instanceof AuthError
+      ? 401
+      : err instanceof CloudAgentsError
+        ? err.status
+        : err instanceof CloudChatError
+          ? err.status
+          : err instanceof RequestInputError
+            ? err.status
+            : err instanceof ImageInputError
+              ? 400
+              : 500;
+  console.log(`  -> ${status} ${message}`);
+  const error = {
+    message,
+    type:
+      status === 401
+        ? "authentication_error"
+        : status === 400 || status === 409
+          ? "invalid_request_error"
+          : status === 413
+            ? "request_too_large"
+            : "server_error",
+  };
+  const payload = anthropicRequest ? { ...toAnthropicError(error, requestId) } : { error };
+  return jsonResponse(status, payload, anthropicRequest ? requestId : undefined);
+}
+
 export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): Promise<Response> {
   const url = new URL(request.url);
   const method = request.method.toUpperCase();
@@ -562,11 +592,15 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       const unsupported = rejectUnsupportedChatOptions(body);
       if (unsupported) return unsupported;
       if (ctx.upstream === "cloud") {
-        return await handleCloudMessages(request.headers, body, requestId, ctx.kv, {
+        // Do not `return await` a streaming Response: Deno.serve treats the
+        // handler as finished and legacy-aborts request.signal, which
+        // cancelAction's the in-flight SSE. Adopt the promise; map errors
+        // without buffering the body.
+        return handleCloudMessages(request.headers, body, requestId, ctx.kv, {
           signal: request.signal,
-        });
+        }).catch((err) => mapGatewayError(err, anthropicRequest, requestId));
       }
-      return await handleInferenceMessages(ctx, request, body, requestId);
+      return handleInferenceMessages(ctx, request, body, requestId).catch((err) => mapGatewayError(err, anthropicRequest, requestId));
     }
 
     if (method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
@@ -574,42 +608,16 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       const unsupported = rejectUnsupportedChatOptions(body);
       if (unsupported) return unsupported;
       if (ctx.upstream === "cloud") {
-        return await handleCloudChatCompletions(request.headers, body, ctx.kv, {
+        return handleCloudChatCompletions(request.headers, body, ctx.kv, {
           signal: request.signal,
-        });
+        }).catch((err) => mapGatewayError(err, anthropicRequest, requestId));
       }
-      return await handleInferenceChatCompletions(ctx, request, body);
+      return handleInferenceChatCompletions(ctx, request, body).catch((err) => mapGatewayError(err, anthropicRequest, requestId));
     }
 
     console.log("  -> 404");
     return jsonResponse(404, { error: { message: `Unknown ${method} ${url.pathname}`, type: "invalid_request_error" } });
   } catch (err) {
-    const message = String((err as Error)?.message || err);
-    const status =
-      err instanceof AuthError
-        ? 401
-        : err instanceof CloudAgentsError
-          ? err.status
-          : err instanceof CloudChatError
-            ? err.status
-            : err instanceof RequestInputError
-              ? err.status
-              : err instanceof ImageInputError
-                ? 400
-                : 500;
-    console.log(`  -> ${status} ${message}`);
-    const error = {
-      message,
-      type:
-        status === 401
-          ? "authentication_error"
-          : status === 400 || status === 409
-            ? "invalid_request_error"
-            : status === 413
-              ? "request_too_large"
-              : "server_error",
-    };
-    const payload = anthropicRequest ? { ...toAnthropicError(error, requestId) } : { error };
-    return jsonResponse(status, payload, anthropicRequest ? requestId : undefined);
+    return mapGatewayError(err, anthropicRequest, requestId);
   }
 }

@@ -265,17 +265,17 @@ function assistantHasToolCalls(message: unknown): boolean {
   });
 }
 
-/**
- * Clients (Cursor Agent) resend the full transcript every turn.
- * Only the tool results after the latest assistant tool_calls / tool_use
- * belong to the current park; older rounds already live in conversationState.
- */
-export function extractLatestClientToolResults(messages: unknown[]): ClientToolResult[] {
+/** Index of the first tool result after the latest assistant tool_calls / tool_use. */
+export function latestToolResultStart(messages: unknown[]): number {
   let from = 0;
   for (let i = 0; i < messages.length; i++) {
     if (assistantHasToolCalls(messages[i])) from = i + 1;
   }
-  return extractClientToolResults(messages.slice(from));
+  return from;
+}
+
+export function extractLatestClientToolResults(messages: unknown[]): ClientToolResult[] {
+  return extractClientToolResults(messages.slice(latestToolResultStart(messages)));
 }
 
 export function lastTurnIsToolResult(messages: unknown[]): boolean {

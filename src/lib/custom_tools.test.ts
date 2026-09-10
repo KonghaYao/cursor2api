@@ -166,7 +166,7 @@ test("system and Anthropic body.system are read but not folded into the user pro
   assert.equal(follow.includes("first"), false);
 });
 
-test("composeCustomToolTurnPrompt leaves tool history off the user action", () => {
+test("composeCustomToolTurnPrompt puts latest tool results on the user action", () => {
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "lookup" } }]);
   const messages = [
     { role: "system", content: "be brief" },
@@ -186,9 +186,11 @@ test("composeCustomToolTurnPrompt leaves tool history off the user action", () =
   ];
   const body = { model: "composer-2.5", messages };
   const warm = composeCustomToolTurnPrompt({ body, tools, messages, hadPriorTurn: true });
-  assert.equal(warm, "");
+  assert.match(warm, /call_2/);
+  assert.match(warm, /40/);
+  assert.doesNotMatch(warm, /call_1/);
   const cold = composeCustomToolTurnPrompt({ body, tools, messages, hadPriorTurn: false });
-  assert.equal(cold, "");
+  assert.match(cold, /call_2/);
 
   const nextUser = composeCustomToolTurnPrompt({
     body,

@@ -16,8 +16,10 @@
  * `tool_calls` closes that duplex **without** `cancelAction`. The next
  * `role: tool` is a new Run: the gateway splices `conversationState`
  * (`rootPromptMessagesJson` blobs) from the full client transcript and
- * sends `resumeAction`. Follow-up user turns send only the new user text
- * in `userMessageAction`. Client disconnect / SSE cancel sends
+ * sends `userMessageAction` = `composeToolResultPrompt` (the previous
+ * duplex is already closed; empty `resumeAction` ends with blank text).
+ * Follow-up user turns send only the new user text in `userMessageAction`.
+ * Client disconnect / SSE cancel sends
  * `conversationAction.cancelAction` on the in-flight Run, then closes
  * the duplex.
  *
@@ -47,6 +49,7 @@ import { computeAgentRunFp } from "./session_fingerprint.ts";
 import {
   clientToolsToAnthropic,
   clientToolsToOpenAi,
+  composeToolResultPrompt,
   extractLatestClientToolResults,
   failParkedClientTools,
   lastTurnIsToolResult,
@@ -243,7 +246,7 @@ export function composeCustomToolTurnPrompt(opts: {
   void opts.tools;
   void opts.hadPriorTurn;
   const latest = extractLatestClientToolResults(opts.messages);
-  if (lastTurnIsToolResult(opts.messages) && latest.length > 0) return "";
+  if (lastTurnIsToolResult(opts.messages) && latest.length > 0) return composeToolResultPrompt(latest);
   const prior = opts.priorMessageCount;
   const canSlice = prior != null && Number.isInteger(prior) && prior > 0 && opts.messages.length > prior;
   if (canSlice) {
@@ -716,13 +719,19 @@ function agentVisibleText(text?: string, error?: string): string {
   return `${t}\n${e}`;
 }
 
+/** AgentService thinkingDelta has no real signature. Use "" so clients can echo the block. */
+const AGENT_THINKING_SIGNATURE = "";
+
 function anthropicContentBlocks(opts: { thinking?: string; thinkingSignature?: string; text?: string; toolUses?: unknown[] }): unknown[] {
   const content: unknown[] = [];
-  // AgentService thinkingDelta has no signature. Unsigned thinking cannot be
-  // echoed on the next /v1/messages turn (Anthropic clients send the block
-  // back). Same rule as toAnthropicMessage / Inference SSE: omit it.
-  if (opts.thinking && opts.thinkingSignature) {
-    content.push({ type: "thinking", thinking: opts.thinking, signature: opts.thinkingSignature });
+  // Keep thinking on the wire (Composer streams thinking for a long time
+  // before text). Empty signature is echo-safe; inbound validator accepts it.
+  if (opts.thinking) {
+    content.push({
+      type: "thinking",
+      thinking: opts.thinking,
+      signature: opts.thinkingSignature ?? AGENT_THINKING_SIGNATURE,
+    });
   }
   if (opts.text) content.push({ type: "text", text: opts.text });
   if (opts.toolUses?.length) content.push(...opts.toolUses);
@@ -1018,11 +1027,20 @@ function streamCustomAnthropic(opts: {
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let index = 0;
-      let open: "text" | null = null;
+      let open: "thinking" | "text" | null = null;
       let emittedThinking = live.deltas.ackedThinking;
       let emittedText = live.deltas.ackedText;
       const closeOpen = () => {
         if (!open) return;
+        if (open === "thinking") {
+          controller.enqueue(
+            encodeSseEvent("content_block_delta", {
+              type: "content_block_delta",
+              index,
+              delta: { type: "signature_delta", signature: AGENT_THINKING_SIGNATURE },
+            }),
+          );
+        }
         controller.enqueue(encodeSseEvent("content_block_stop", { type: "content_block_stop", index }));
         index += 1;
         open = null;
@@ -1030,9 +1048,27 @@ function streamCustomAnthropic(opts: {
       const flush = () => {
         const thinking = longerText(live.thinking, live.deltas.streamedThinking);
         const text = longerText(live.text, live.deltas.streamedText);
-        // AgentService thinkingDelta has no signature — do not open an
-        // unsigned thinking block (Inference SSE already omits these).
-        if (thinking.length > emittedThinking) emittedThinking = thinking.length;
+        if (thinking.length > emittedThinking) {
+          if (open !== "thinking") {
+            closeOpen();
+            controller.enqueue(
+              encodeSseEvent("content_block_start", {
+                type: "content_block_start",
+                index,
+                content_block: { type: "thinking", thinking: "", signature: AGENT_THINKING_SIGNATURE },
+              }),
+            );
+            open = "thinking";
+          }
+          controller.enqueue(
+            encodeSseEvent("content_block_delta", {
+              type: "content_block_delta",
+              index,
+              delta: { type: "thinking_delta", thinking: thinking.slice(emittedThinking) },
+            }),
+          );
+          emittedThinking = thinking.length;
+        }
         if (text.length > emittedText) {
           if (open !== "text") {
             closeOpen();

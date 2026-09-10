@@ -14,7 +14,7 @@
 | **不要二进制依赖** | 不要 SDK 平台包（`@cursor/sdk--*`）、不要本机 agent 可执行文件、不要为 `local: { cwd }` 拉 sandbox / ripgrep。Deno Deploy 跑不了这些 |
 | **不要 Cloud 托管 sandbox VM** | 不要 `Agent.create({ cloud })`，不要 `POST https://api.cursor.com/v1/agents` 开 `bc-…` 对话。VM 自带 shell/edit，没有 OpenAI 式 park `tool_calls` |
 
-**是什么：** 网关进程内对 `POST https://api2.cursor.sh/agent.v1.AgentService/Run` 的 Connect JSON 客户端；MCP 家族 allowlist 请求头压掉默认 shell/edit；客户端 function tools → 合成 MCP `custom-user-tools`（`mcpTools` + `requestContext` / `mcpState`），`customTools.execute()` 在本进程 park，返回 OpenAI `tool_calls`。每一枪 HTTP 开/关一条 Run（交 `tool_calls` 时 **close 双工、不发 `cancelAction`**）。**每一枪都要带** `conversationState`（缺字段 → `invalid_argument: Conversation state is required`）。从全量 transcript 拼 `rootPromptMessagesJson`（SHA-256 JSON blob + `getBlob`），对象里 **只** 放 roots，**不要**空 `turns: []`。`role: tool` 走 `resumeAction`。cwd 默认 `/tmp`（`GATEWAY_AGENT_CWD`）。默认不发 `customSystemPrompt`。模型仍是 Cursor 托管推理，**不在** Cursor sandbox VM。
+**是什么：** 网关进程内对 `POST https://api2.cursor.sh/agent.v1.AgentService/Run` 的 Connect JSON 客户端；MCP 家族 allowlist 请求头压掉默认 shell/edit；客户端 function tools → 合成 MCP `custom-user-tools`（`mcpTools` + `requestContext` / `mcpState`），`customTools.execute()` 在本进程 park，返回 OpenAI `tool_calls`。每一枪 HTTP 开/关一条 Run（交 `tool_calls` 时 **close 双工、不发 `cancelAction`**）。**每一枪都要带** `conversationState`（缺字段 → `invalid_argument: Conversation state is required`）。从全量 transcript 拼 `rootPromptMessagesJson`（SHA-256 JSON blob + `getBlob`），对象里 **只** 放 roots，**不要**空 `turns: []`。`role: tool` 走 **`userMessageAction` + `composeToolResultPrompt`**（双工已关，空 `resumeAction` 会空白结束）。cwd 默认 `/tmp`（`GATEWAY_AGENT_CWD`）。默认不发 `customSystemPrompt`。模型仍是 Cursor 托管推理，**不在** Cursor sandbox VM。
 
 **日志里的 `cloud`：** `GATEWAY_UPSTREAM` 只有 `"inference"` 或 `"cloud"`，默认 `"cloud"` = 不走 Inference。`cloud_openai.ts` / `CloudChatError` / 测试名 `cloud OpenAI…` 同此。**不是** Cloud Agents。`GET /health` 的 `rpc` 才是真实路径。
 
@@ -36,7 +36,7 @@
 | `https://api.cursor.com/v1/agents` Cloud REST | 能用 | **仅** `GET /v1/models`；不要用它跑对话（VM 会自带 shell/edit，且没有 OpenAI 那种 park `tool_calls`） |
 | `POST https://api2.cursor.sh/agent.v1.AgentService/Run` | 能用（先 `exchange_user_api_key`） | **全部** `/v1/chat/completions` 与 `/v1/messages` |
 
-AgentService **没有** Chat Completions HTTP。客户端 function tools **是**合成 MCP `custom-user-tools`（Connect `mcpTools` + exec `requestContext` / `mcpState`）。模型走 MCP `mcpArgs`；网关 park `execute()`、对客户端返回 OpenAI `tool_calls`，然后 **close 双工（不 `cancelAction`）**。调用方 POST `role: tool` 时**新开** Run：从全量 transcript 拼接 `conversationState.rootPromptMessagesJson`（系统 + 历史 user/assistant + `[Tool Result]`），action 为 `resumeAction`。这不是 HTTP `/mcp`，Cloud VM 不会回调本网关。
+AgentService **没有** Chat Completions HTTP。客户端 function tools **是**合成 MCP `custom-user-tools`（Connect `mcpTools` + exec `requestContext` / `mcpState`）。模型走 MCP `mcpArgs`；网关 park `execute()`、对客户端返回 OpenAI `tool_calls`，然后 **close 双工（不 `cancelAction`）**。调用方 POST `role: tool` 时**新开** Run：roots = 系统 + 历史（不含本轮最新 tool 结果）；action 为 `userMessageAction` = `composeToolResultPrompt`。空 `resumeAction` 在新双工上没有可续的 MCP exec，会 `finish=stop` 空正文。这不是 HTTP `/mcp`，Cloud VM 不会回调本网关。
 
 ### conversationState（自己拼接，`src/lib/conversation_state.ts`）
 
@@ -46,7 +46,7 @@ Cursor 用 `rootPromptMessagesJson`（Vercel-AI 形 JSON 的 SHA-256 blob id）�
 |------|---------------------|--------|
 | 首轮 | 系统 blob（client system + tool policy；缺省则默认助手句） | `userMessageAction` = 第一条 user 文本。**不要**把 system 再折进 user，**不要**发空 `{}` |
 | 跟进 user | **必须带字段**：系统 + 历史（不含本轮新 user）。**禁止省略**（上游 `Conversation state is required`） | `userMessageAction` = 新 user（可 slice 多条） |
-| `role: tool` | 系统 + **全部**历史含 tool 结果（user 角色 `[Tool Result]`） | **`resumeAction`**。不要把 tool 结果再写成 user 文本 |
+| `role: tool` | 系统 + 历史（**不含**本轮最新 tool 结果） | **`userMessageAction`** = `composeToolResultPrompt`。双工已关，空 `resumeAction` 会空白 `stop` |
 
 - blob id = SHA-256(JSON utf8)，Connect JSON 里是标准 base64；`getBlob` 回 `blobData` = JSON 字节的 base64
 - **禁止**把 OpenAI `messages` / `tool_calls` 原样塞进 `conversationState`
@@ -67,7 +67,7 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 
 - 不设该头 → 默认 toolset（shell / edit / grep / …）会回来 — **禁止**
 - 只开 MCP 家族 → 压掉 shell/edit/grep/task/webSearch；Connect body 送 `mcpTools: [custom-user-tools-…]`
-- **跨轮次工具**：单测必须覆盖「`get_weather` → `lookup` → `search` → 终轮文本」（用户工具 ×3）；`conversation_id` 不变；跟进枪 `resumeAction` + roots 含上文。改第一条 user = 新对话。不要用「只发最后一条」当产品场景。
+- **跨轮次工具**：单测必须覆盖「`get_weather` → `lookup` → `search` → 终轮文本」（用户工具 ×3）；`conversation_id` 不变；跟进枪 `userMessageAction` 带本轮工具结果，roots 含上文。改第一条 user = 新对话。不要用「只发最后一条」当产品场景。**工具结果回来后正文不能空。**
 - **跨轮次用户话（产品验收，假 host 不够）**：同一会话三句「你的工具有什么」→「调用一下」→「我的第一句话是什么」，第三句必须能复述第一句、无异常信封。见 **2026-09-10** / `scripts/probe-session-memory.ts`。只绿 `get_weather→lookup→search` 协议单测 **不算** 过关。
 
 **不要**设 `AgentRunRequest.excludeWorkspaceContext = true`（`Workspace context exclusion is not allowed…`）。无 workspace 靠 MCP allowlist + `mcpFileSystemOptions.enabled = false`。
@@ -89,7 +89,7 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 |------|-------------------|
 | 首轮 | roots = 系统 blob；`userMessageAction` = 第一条 user |
 | 跟进 user | roots = 系统 + 历史（**必须带** `conversationState`）；`userMessageAction` = 新 user |
-| `role: tool` | roots = 系统 + 全部历史含 tool 结果；**`resumeAction`** |
+| `role: tool` | roots = 系统 + 历史（不含本轮最新 tool 结果）；**`userMessageAction`** = 工具结果摘要 |
 
 `agentRunFp` 锚 **第一条 user** 成立，正是因为客户端保证这条前缀不变。单测多轮必须用**全量 transcript** 复现，不要用「只发最后一条」当产品场景。
 
@@ -112,11 +112,11 @@ Cloudflare Workers 的 fetch 仍是半双工，聊天会失败。不要为了半
 
 Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里的 legacy abort）。**不要**把这个 signal 接到一条已经交过卷的 Run、或下一枪新开的 Run 上。`tool_calls` 返回时网关自己关后向 `Run`；`role: tool` 本来就是新开的一枪，不再依赖跨请求 park。`deno.json` 仍开 `--unstable-no-legacy-abort`。
 
-**交 `tool_calls` ≠ 用户中断：** 返回 OpenAI `tool_calls` / Anthropic `tool_use` 时只 **close 双工**，**不要**发 `cancelAction`。`cancelAction` 会把这一轮作废，下一枪 `resumeAction` 对不上。HTTP `request.signal` 只通过 `attachClientAbort` 绑到 **cancel**，交卷前摘掉；不要把它传进 `agent.send({ signal })`（Deno 200 后 abort 会误发 cancel）。
+**交 `tool_calls` ≠ 用户中断：** 返回 OpenAI `tool_calls` / Anthropic `tool_use` 时只 **close 双工**，**不要**发 `cancelAction`。`cancelAction` 会把这一轮作废，下一枪对不上。HTTP `request.signal` 只通过 `attachClientAbort` 绑到 **cancel**，交卷前摘掉；不要把它传进 `agent.send({ signal })`（Deno 200 后 abort 会误发 cancel）。
 
 **用户端中断（官方 abort）：** 客户端断开 HTTP / 取消 SSE 时，对**这一枪还在飞的** `AgentService/Run` 发 `conversationAction.cancelAction`（proto `CancelAction`），再关双工。不要只停本地 SSE 而让上游继续计费。握手阶段（`fetch` 还没连上）才直接 abort 传输。成功返回 200 之后立刻摘掉 `request.signal`，避免 Deno legacy abort 误发 cancel。`ReadableStream.cancel()`（SSE 客户端丢连接）同样走 `cancelAction`。
 
-**会话 id（Deno isolate / serverless）：** `conversationId` = `tenant:agentRunFp`。`agentRunFp` = model / effort / flags / tools / system / **第一条 user**（不含后续轮次）。客户端 `x-session-id` / `conversation_id` **忽略**。**每一枪 HTTP 开/关一条 `AgentService/Run`**：返回 `tool_calls` 就关掉双工。跟进枪 **必须**带自拼 roots（缺字段会 `Conversation state is required`）。`role: tool` 用 `resumeAction`。KV `agent-run:${tenant}:${fp}` 只存 `{fp, conversationId, agentSessionId}`，TTL 24h，**不要**把 checkpoint / messages 写进 KV。KV `agent-run-len:` 只存上次成功处理的 `messages.length`，TTL **5 分钟**，用来 slice 新 user；**不要**并进 24h 的 `agent-run`。
+**会话 id（Deno isolate / serverless）：** `conversationId` = `tenant:agentRunFp`。`agentRunFp` = model / effort / flags / tools / system / **第一条 user**（不含后续轮次）。客户端 `x-session-id` / `conversation_id` **忽略**。**每一枪 HTTP 开/关一条 `AgentService/Run`**：返回 `tool_calls` 就关掉双工。跟进枪 **必须**带自拼 roots（缺字段会 `Conversation state is required`）。`role: tool` 用 `userMessageAction` 送工具结果，**不要**空 `resumeAction`。KV `agent-run:${tenant}:${fp}` 只存 `{fp, conversationId, agentSessionId}`，TTL 24h，**不要**把 checkpoint / messages 写进 KV。KV `agent-run-len:` 只存上次成功处理的 `messages.length`，TTL **5 分钟**，用来 slice 新 user；**不要**并进 24h 的 `agent-run`。
 
 ### 不要做的
 
@@ -132,14 +132,16 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 - 给 Dashboard `crsr_` 发 `customSystemPrompt`（会 `unknown option '--system-prompt'`；系统进 root blobs）
 - 发空 `conversationState: {}`（会抹掉上文）
 - 跟进枪省略 `conversationState`（Cursor Agent 大 system 上会 `Conversation state is required`；短 system 探针测不出来）
-- Anthropic `/v1/messages` 发出无 `signature` 的 `thinking` 块（AgentService `thinkingDelta` 没有签名；客户端回放会 400）。无签名就不要发 thinking，跟进枪也不要因此拒收
+- Anthropic `/v1/messages` 发出无 `signature` 的 `thinking` 又在跟进枪拒收（400）。AgentService 没有真签名：下发 `signature: ""` 并接受回放，**不要**为了避 400 把 thinking SSE 整段掐掉（Composer 会长时间只在想，界面像没在流）
+- `handleGatewayRequest` 对聊天 `return await` 流式 Response（Deno.serve 会当 handler 已结束并 legacy-abort `request.signal`，SSE 被 cancelAction 掐死）。流式路径要 `return promise.catch(...)`，不要 await 掉 body
 - `handleGatewayRequest` 里 `return handleCloud…` 不 `await`（`AuthError` 逃出 try/catch，Deno 变成明文 500 而不是 401）
 - 跟进枪带空 `turns: []` / 空 `{}`（9/10：第三句忘了第一句）
 - 用假 host 或短 system 探针代替 Cursor Agent 大 system 的三句实机验收
 - 把 OpenAI `messages` / `tool_calls` JSON 直接塞进 `conversationState`（必须是 blob id + `rootPromptMessagesJson`）
 - 只把最后一条 user 丢给 AgentService、却不拼 roots（isolate hop / `role: tool`）
 - 把「客户端只发增量 messages」当成产品场景。常态是 **每轮全量 + 前缀稳定**；禁止把整段 history 再叠进 `userMessageAction`
-- 跟进轮次再把 system / 工具目录 / 整段 history / 历史 tool results 叠进 `userMessageAction`（应在 spliced roots / `resumeAction`）
+- 跟进轮次再把 system / 工具目录 / 整段 history / **历史** tool results 叠进 `userMessageAction`（应在 spliced roots；本轮最新 tool 结果除外，那是 `composeToolResultPrompt`）
+- `role: tool` 发空 `resumeAction`（新双工上没有 in-flight MCP exec，实机 `finish=stop` 空正文）
 - 把 HTTP `request.signal` 绑到**已经返回的**或**下一枪** AgentService/Run 上（Deno.serve 成功响应会 abort）。用户取消**当前还在飞的**那一枪必须发 `cancelAction`，不要只关本地 SSE。
 - 交 `tool_calls` 时对 AgentService 发 `cancelAction`（那是用户中断，不是关这一枪 HTTP；多轮工具会断）
 - 给 AgentService 只送 `modelId: composer-2.5` 而不带 `parameters.fast=false`（上游默认 Fast，Team Usage 记成 `composer-2.5-fast`）
@@ -185,7 +187,7 @@ BASE=http://127.0.0.1:8793 node --experimental-strip-types scripts/probe-session
 |------|---------------------|
 | 每一枪 | **必须带**。从客户端全量 transcript 拼 `rootPromptMessagesJson`（不含本轮新 user；tool 轮含 `[Tool Result]`） |
 | 形状 | **只** 放 `rootPromptMessagesJson`。禁止省略、禁止 `{}`、禁止空 `turns: []` |
-| `role: tool` | 同上 + `resumeAction` |
+| `role: tool` | roots 不含本轮最新 tool 结果；`userMessageAction` = `composeToolResultPrompt` |
 
 `getBlob` 按标准 base64 / URL-safe / hex 索引。KV 仍只存 ids。
 

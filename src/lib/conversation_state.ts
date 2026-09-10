@@ -4,10 +4,18 @@
  * AgentService builds the model-visible prompt from `rootPromptMessagesJson`
  * (SHA-256 blob ids of Vercel-AI-SDK-shaped JSON). `turns[]` is UI metadata
  * and is left empty — we are not the IDE. The active user turn stays in
- * `userMessageAction`; a `role: tool` follow-up uses `resumeAction` with the
- * tool results already in the root blobs.
+ * `userMessageAction`. A `role: tool` follow-up also uses `userMessageAction`
+ * (`composeToolResultPrompt`): we already closed the previous duplex, so
+ * empty `resumeAction` has no in-flight MCP exec and the model returns "".
  */
-import { lastTurnIsToolResult, toolPolicyPrompt, type CustomToolDef } from "./custom_tools.ts";
+import {
+  composeToolResultPrompt,
+  extractLatestClientToolResults,
+  lastTurnIsToolResult,
+  latestToolResultStart,
+  toolPolicyPrompt,
+  type CustomToolDef,
+} from "./custom_tools.ts";
 import { bytesBody } from "./bytes.ts";
 import type { JsonObject } from "./agent_json.ts";
 
@@ -299,7 +307,8 @@ export function decodeRootPromptText(state: JsonObject, blobs: ConversationBlobS
 
 /**
  * Prompt for `userMessageAction` once history lives in root blobs.
- * Tool follow-ups are empty (caller sends `resumeAction`).
+ * Latest tool results stay off the roots and go in this prompt — a new Run
+ * cannot `resumeAction` a duplex we already closed.
  */
 export function splicedUserPrompt(opts: {
   messages: unknown[];
@@ -307,7 +316,12 @@ export function splicedUserPrompt(opts: {
 }): { resume: boolean; prompt: string; historyEnd: number } {
   const latestToolFollowUp = lastTurnIsToolResult(opts.messages);
   if (latestToolFollowUp) {
-    return { resume: true, prompt: "", historyEnd: opts.messages.length };
+    const latest = extractLatestClientToolResults(opts.messages);
+    return {
+      resume: false,
+      prompt: composeToolResultPrompt(latest),
+      historyEnd: latestToolResultStart(opts.messages),
+    };
   }
   const prior = opts.priorMessageCount;
   const canSlice = prior != null && Number.isInteger(prior) && prior > 0 && opts.messages.length > prior;

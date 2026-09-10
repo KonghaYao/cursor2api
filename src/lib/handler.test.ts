@@ -72,6 +72,41 @@ test("empty Authorization: Bearer on /v1/chat/completions is 401 JSON", async ()
   assert.equal(res.status, 401);
 });
 
+test("stream=true returns SSE headers before the AgentService turn finishes", async () => {
+  let finish!: (result: { text: string; thinking: string }) => void;
+  const finished = new Promise<{ text: string; thinking: string }>((resolve) => {
+    finish = resolve;
+  });
+  setCustomToolAgentHostForTests({
+    async create() {
+      return {
+        agentId: "agent-sse-early",
+        async send() {
+          return { wait: () => finished };
+        },
+        async close() {},
+      };
+    },
+  });
+  const res = await handleGatewayRequest(
+    new Request("http://127.0.0.1/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer crsr_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "composer-2.5-fast",
+        stream: true,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    }),
+    { kv: createMemoryKv(), upstream: "cloud" },
+  );
+  assert.equal(res.status, 200);
+  assert.match(String(res.headers.get("content-type") || ""), /text\/event-stream/);
+  finish({ text: "ok", thinking: "" });
+  const sse = await res.text();
+  assert.match(sse, /data: \[DONE\]/);
+});
+
 test("Anthropic follow-up can echo unsigned thinking from the previous turn", async () => {
   setCustomToolAgentHostForTests({
     async create() {
@@ -102,5 +137,6 @@ test("Anthropic follow-up can echo unsigned thinking from the previous turn", as
   );
   assert.equal(res.status, 200, await res.clone().text());
   const body = await res.json();
-  assert.deepEqual(body.content, [{ type: "text", text: "second" }]);
+  assert.equal(body.content?.[1]?.type, "text");
+  assert.equal(body.content?.[1]?.text, "second");
 });

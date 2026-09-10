@@ -37,7 +37,7 @@ test("first shot puts system in root blobs and user in the action prompt", async
   for (const id of ids) assert.ok(spliced.blobs.has(id));
 });
 
-test("tool follow-up is resumeAction with prior user and tool results in roots", async () => {
+test("tool follow-up puts latest results in userMessageAction, not empty resume", async () => {
   const messages = [
     { role: "system", content: "be brief" },
     { role: "user", content: "weather in tokyo then humidity then news" },
@@ -53,15 +53,12 @@ test("tool follow-up is resumeAction with prior user and tool results in roots",
     tools,
     messages,
   });
-  assert.equal(spliced.resume, true);
-  assert.equal(spliced.prompt, "");
+  assert.equal(spliced.resume, false);
+  assert.match(spliced.prompt, /call_1/);
+  assert.match(spliced.prompt, /22/);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
   assert.match(roots, /weather in tokyo then humidity then news/);
-  assert.match(roots, /call_1/);
-  assert.match(roots, /get_weather/);
-  assert.match(roots, /temp/);
-  assert.match(roots, /22/);
-  assert.match(roots, /\[Tool Result\]/);
+  assert.doesNotMatch(roots, /"temp":22/);
 });
 
 test("three sequential user tool rounds keep the full catalog history in roots", async () => {
@@ -91,16 +88,15 @@ test("three sequential user tool rounds keep the full catalog history in roots",
     tools,
     messages,
   });
-  assert.equal(spliced.resume, true);
+  assert.equal(spliced.resume, false);
+  assert.match(spliced.prompt, /rain later/);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
   assert.match(roots, /tokyo weather, humidity, then a headline/);
   assert.match(roots, /call_wx/);
   assert.match(roots, /call_hum/);
-  assert.match(roots, /call_news/);
-  assert.match(roots, /get_weather/);
-  assert.match(roots, /lookup/);
-  assert.match(roots, /search/);
-  assert.match(roots, /rain later/);
+  assert.match(roots, /22/);
+  assert.match(roots, /40/);
+  assert.doesNotMatch(roots, /rain later/);
 });
 
 test("three user turns keep the first sentence in roots for the last question", async () => {

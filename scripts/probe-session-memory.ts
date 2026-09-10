@@ -174,10 +174,11 @@ async function main(): Promise<void> {
   messages = t2.messages;
   const called = messages.some((m) => m && typeof m === "object" && Array.isArray((m as { tool_calls?: unknown[] }).tool_calls));
   const sameId2 = t2.conversationId === t1.conversationId;
+  const afterTool = contentOf(t2.json).trim();
   record({
-    name: "turn2 calls a tool in the same session",
-    pass: Boolean(sameId2 && called && !errOf(t2.json)),
-    detail: { conversation_id: t2.conversationId, same: sameId2, called, text: contentOf(t2.json).slice(0, 180) },
+    name: "turn2 calls a tool then continues with text",
+    pass: Boolean(sameId2 && called && afterTool && !errOf(t2.json)),
+    detail: { conversation_id: t2.conversationId, same: sameId2, called, textLen: afterTool.length, text: afterTool.slice(0, 180) },
   });
 
   messages = [...messages, { role: "user", content: THIRD }];

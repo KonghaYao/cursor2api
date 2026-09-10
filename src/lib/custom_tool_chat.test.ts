@@ -75,7 +75,7 @@ test("OpenAI chat returns reasoning_content and forwards image bytes", async () 
   assert.match(sent?.prompt || "", /what is this\?/);
 });
 
-test("Anthropic messages omit unsigned thinking (AgentService has no signature)", async () => {
+test("Anthropic messages emit thinking with an empty echo-safe signature", async () => {
   setCustomToolAgentHostForTests({
     async create() {
       return {
@@ -99,7 +99,8 @@ test("Anthropic messages omit unsigned thinking (AgentService has no signature)"
   });
   assert.equal(res.status, 200);
   const body = await res.json();
-  assert.deepEqual(body.content, [{ type: "text", text: "42" }]);
+  assert.deepEqual(body.content[0], { type: "thinking", thinking: "17*19", signature: "" });
+  assert.deepEqual(body.content[1], { type: "text", text: "42" });
 });
 
 test("Anthropic image blocks are forwarded as AgentService selectedImages", async () => {
@@ -450,13 +451,17 @@ test("park_miss with a full transcript splices tool history into conversationSta
   });
   assert.equal(res.status, 200);
   assert.equal(prompts.length, 2);
-  assert.equal(prompts[1], "");
-  assert.equal(sends[1]?.opts?.resume, true);
+  assert.equal(sends[1]?.opts?.resume, false);
+  assert.match(prompts[1], /The client executed your custom tools/);
+  assert.match(prompts[1], /call_2/);
+  assert.match(prompts[1], /40/);
+  assert.doesNotMatch(prompts[1], /call_1/);
   const roots = decodeRootPromptText(sends[1]!.opts!.conversationState!, sends[1]!.opts!.blobs!);
   assert.match(roots, /weather in tokyo/);
   assert.match(roots, /call_1/);
-  assert.match(roots, /call_2/);
-  assert.match(roots, /humidity/);
+  assert.match(roots, /22/);
+  assert.doesNotMatch(roots, /call_2/);
+  assert.doesNotMatch(roots, /humidity/);
 });
 
 test("KV message length cursor forwards every new user after an isolate hop", async () => {
@@ -604,7 +609,7 @@ test("OpenAI stream=true forwards AgentService thinking and text deltas", async 
   assert.match(sse, /"finish_reason":"stop"/);
 });
 
-test("Anthropic stream=true omits unsigned thinking and forwards text deltas", async () => {
+test("Anthropic stream=true forwards thinking then text deltas", async () => {
   let onDelta: ((chunk: { text?: string; thinking?: string }) => void) | undefined;
   let finish!: (result: { text: string; thinking: string }) => void;
   const finished = new Promise<{ text: string; thinking: string }>((resolve) => {
@@ -644,7 +649,9 @@ test("Anthropic stream=true omits unsigned thinking and forwards text deltas", a
     },
     (buf) => buf.includes("message_stop"),
   );
-  assert.equal(sse.includes("thinking_delta"), false, sse);
+  assert.match(sse, /thinking_delta/);
+  assert.match(sse, /"thinking":"plan"/);
+  assert.match(sse, /signature_delta/);
   assert.match(sse, /text_delta/);
   assert.match(sse, /"text":"ok"/);
 });
@@ -662,7 +669,7 @@ test("role:tool opens a new send; tool_calls closes the previous AgentService ru
           prompts.push(prompt);
           sendOpts.push(opts);
           const wait = (async () => {
-            if (opts?.resume) return { text: "22c" };
+            if (String(prompt).includes("The client executed your custom tools")) return { text: "22c" };
             const tool = Object.values(customTools)[0];
             if (!tool) return { text: "no-tools" };
             await tool.execute({}, {});
@@ -711,10 +718,11 @@ test("role:tool opens a new send; tool_calls closes the previous AgentService ru
   const body2 = await second.json();
   assert.equal(body2.choices[0].message.content, "22c");
   assert.equal(prompts.length, 2);
-  assert.equal(prompts[1], "");
-  assert.equal(sendOpts[1]?.resume, true);
+  assert.equal(sendOpts[1]?.resume, false);
+  assert.match(prompts[1], /The client executed your custom tools/);
+  assert.match(prompts[1], /22/);
   assert.match(decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!), /weather\?/);
-  assert.match(decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!), /22/);
+  assert.doesNotMatch(decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!), /"temp":22/);
   assert.equal(aborts, 0);
 });
 
@@ -801,11 +809,12 @@ test("three sequential catalog tools: get_weather then lookup then search then t
   assert.equal(tc2[0].function.name, "lookup");
   assert.equal(releases, 2);
   assert.equal(body2.conversation_id, body1.conversation_id);
-  assert.equal(prompts[1], "");
-  assert.equal(sendOpts[1]?.resume, true);
+  assert.equal(sendOpts[1]?.resume, false);
+  assert.match(prompts[1], /The client executed your custom tools/);
+  assert.match(prompts[1], /22/);
   const roots2 = decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!);
   assert.match(roots2, /tokyo weather, humidity, then a headline/);
-  assert.match(roots2, /temp/);
+  assert.doesNotMatch(roots2, /"temp":22/);
 
   const third = await handleCustomToolChatCompletions({
     headers,
@@ -829,10 +838,11 @@ test("three sequential catalog tools: get_weather then lookup then search then t
   const tc3 = body3.choices[0].message.tool_calls;
   assert.equal(tc3[0].function.name, "search");
   assert.equal(releases, 3);
-  assert.equal(prompts[2], "");
+  assert.equal(sendOpts[2]?.resume, false);
+  assert.match(prompts[2], /40/);
   const roots3 = decodeRootPromptText(sendOpts[2]!.conversationState!, sendOpts[2]!.blobs!);
-  assert.match(roots3, /humidity/);
   assert.match(roots3, /temp/);
+  assert.doesNotMatch(roots3, /"humidity":40/);
 
   const fourth = await handleCustomToolChatCompletions({
     headers,
@@ -857,10 +867,12 @@ test("three sequential catalog tools: get_weather then lookup then search then t
   assert.equal(body4.choices[0].message.content, "all three tools done");
   assert.equal(body4.conversation_id, body1.conversation_id);
   assert.equal(prompts.length, 4);
-  assert.equal(prompts[3], "");
+  assert.equal(sendOpts[3]?.resume, false);
+  assert.match(prompts[3], /rain later/);
   const roots4 = decodeRootPromptText(sendOpts[3]!.conversationState!, sendOpts[3]!.blobs!);
-  assert.match(roots4, /rain later/);
-  assert.match(roots4, /search/);
+  assert.match(roots4, /humidity/);
+  assert.match(roots4, /temp/);
+  assert.doesNotMatch(roots4, /rain later/);
   assert.equal(aborts, 0);
 });
 
@@ -926,7 +938,8 @@ test("stream=true two tool rounds emit complete tool_calls then final text", asy
   assert.match(sse2, /"finish_reason":"tool_calls"/);
   const tc2 = lastOpenAiSseToolCalls(sse2);
   assert.equal(releases, 2);
-  assert.equal(prompts[1], "");
+  assert.match(prompts[1], /The client executed your custom tools/);
+  assert.match(prompts[1], /22/);
   assert.doesNotMatch(prompts[1] || "", /weather\?/);
 
   const third = await handleCustomToolChatCompletions({
@@ -948,7 +961,8 @@ test("stream=true two tool rounds emit complete tool_calls then final text", asy
   assert.match(sse3, /done-sse/);
   assert.match(sse3, /"finish_reason":"stop"/);
   assert.equal(prompts.length, 3);
-  assert.equal(prompts[2], "");
+  assert.match(prompts[2], /The client executed your custom tools/);
+  assert.match(prompts[2], /40/);
 });
 
 test("Anthropic two tool_use rounds then end_turn", async () => {
@@ -1017,7 +1031,8 @@ test("Anthropic two tool_use rounds then end_turn", async () => {
   assert.ok(use2);
   assert.equal(releases, 2);
   assert.equal(body2.conversation_id, body1.conversation_id);
-  assert.equal(prompts[1], "");
+  assert.match(prompts[1], /The client executed your custom tools/);
+  assert.match(prompts[1], /22/);
   assert.doesNotMatch(prompts[1] || "", /weather\?/);
 
   const third = await handleCustomToolMessages({
@@ -1039,7 +1054,8 @@ test("Anthropic two tool_use rounds then end_turn", async () => {
   const body3 = await third.json();
   assert.equal(body3.stop_reason, "end_turn");
   assert.equal(body3.content.find((b: { type?: string; text?: string }) => b.type === "text")?.text, "40 percent");
-  assert.equal(prompts[2], "");
+  assert.match(prompts[2], /The client executed your custom tools/);
+  assert.match(prompts[2], /40/);
 });
 
 class ChatInteractiveDuplex implements AgentDuplex {
@@ -1170,8 +1186,9 @@ test("in-repo host: three sequential MCP parks then text; resume splices convers
   assert.equal(tc2[0].function.name, "lookup");
   assert.equal(duplexes.length, 2);
   assert.equal(duplexSentCancel(duplexes[1]!), false);
-  assert.equal(duplexIsResume(duplexes[1]!), true);
-  assert.equal(duplexUserText(duplexes[1]!), "");
+  assert.equal(duplexIsResume(duplexes[1]!), false);
+  assert.match(duplexUserText(duplexes[1]!), /The client executed your custom tools/);
+  assert.match(duplexUserText(duplexes[1]!), /22/);
   const spliced2 = await spliceConversationFromClient({ body: { messages: secondMessages }, tools, messages: secondMessages });
   assert.deepEqual(
     duplexRunRequest(duplexes[1]!)?.conversationState,
@@ -1179,7 +1196,7 @@ test("in-repo host: three sequential MCP parks then text; resume splices convers
   );
   const roots2 = decodeRootPromptText(spliced2.conversationState, spliced2.blobs);
   assert.match(roots2, /tokyo weather, humidity, then a headline/);
-  assert.match(roots2, /temp/);
+  assert.doesNotMatch(roots2, /"temp":22/);
   assert.equal(body2.conversation_id, body1.conversation_id);
 
   const thirdMessages = [
@@ -1197,7 +1214,8 @@ test("in-repo host: three sequential MCP parks then text; resume splices convers
   assert.equal(body3.choices[0].finish_reason, "tool_calls");
   const tc3 = body3.choices[0].message.tool_calls;
   assert.equal(tc3[0].function.name, "search");
-  assert.equal(duplexIsResume(duplexes[2]!), true);
+  assert.equal(duplexIsResume(duplexes[2]!), false);
+  assert.match(duplexUserText(duplexes[2]!), /40/);
 
   const fourthMessages = [
     ...thirdMessages,
@@ -1213,10 +1231,12 @@ test("in-repo host: three sequential MCP parks then text; resume splices convers
   const body4 = await fourth.json();
   assert.equal(body4.choices[0].message.content, "all done");
   assert.equal(duplexes.length, 4);
-  assert.equal(duplexIsResume(duplexes[3]!), true);
+  assert.equal(duplexIsResume(duplexes[3]!), false);
+  assert.match(duplexUserText(duplexes[3]!), /rain later/);
   const spliced4 = await spliceConversationFromClient({ body: { messages: fourthMessages }, tools, messages: fourthMessages });
   assert.deepEqual(duplexRunRequest(duplexes[3]!)?.conversationState, spliced4.conversationState);
-  assert.match(decodeRootPromptText(spliced4.conversationState, spliced4.blobs), /rain later/);
+  assert.doesNotMatch(decodeRootPromptText(spliced4.conversationState, spliced4.blobs), /rain later/);
+  assert.match(decodeRootPromptText(spliced4.conversationState, spliced4.blobs), /humidity/);
   assert.equal(duplexSentCancel(duplexes[3]!), false);
 });
 
@@ -1495,7 +1515,8 @@ test("three user sentences stay one session: list tools, call, recall first sent
   const b2b = await r2b.json();
   assert.equal(b2b.error, undefined);
   assert.equal(b2b.conversation_id, b1.conversation_id);
-  assert.equal(sendOpts[2]?.resume, true);
+  assert.equal(sendOpts[2]?.resume, false);
+  assert.match(prompts[2], /The client executed your custom tools/);
   assert.match(decodeRootPromptText(sendOpts[2]!.conversationState!, sendOpts[2]!.blobs!), /你的工具有什么/);
 
   const r3 = await handleCustomToolChatCompletions({

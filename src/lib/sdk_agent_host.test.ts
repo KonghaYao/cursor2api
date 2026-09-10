@@ -419,7 +419,8 @@ test("in-repo host serves spliced rootPromptMessagesJson blobs on getBlob", asyn
   const duplex = new InteractiveDuplex();
   duplex.onSend = (message) => {
     if (field(message, "runRequest")) {
-      assert.equal(Boolean(field(asObject(field(asObject(field(message, "runRequest")), "action")), "resumeAction")), true);
+      assert.equal(Boolean(field(asObject(field(asObject(field(message, "runRequest")), "action")), "userMessageAction")), true);
+      assert.equal(Boolean(field(asObject(field(asObject(field(message, "runRequest")), "action")), "resumeAction")), false);
       duplex.push({ kvServerMessage: { id: 9, getBlobArgs: { blobId: firstId } } });
       return;
     }
