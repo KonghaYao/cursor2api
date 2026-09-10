@@ -215,6 +215,22 @@ export function systemPromptFromClient(body: Record<string, unknown>): string {
   return parts.join("\n\n");
 }
 
+/** Keep AgentService request context aligned with the client system prompt. */
+export function cwdFromClientSystem(body: Record<string, unknown>): string | undefined {
+  const system = systemPromptFromClient(body);
+  const matches = [
+    ...system.matchAll(/^\s*(?:Working directory|Current working directory)\s*:\s*(.+?)\s*$/gim),
+  ];
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const raw = String(matches[i]?.[1] || "").trim();
+    const quoted = raw.match(/^([`'"])(.*)\1$/);
+    const cwd = (quoted?.[2] ?? raw).trim();
+    if (!cwd || /[\0\r\n]/.test(cwd)) continue;
+    if (cwd.startsWith("/") || /^[a-z]:[\\/]/i.test(cwd) || cwd.startsWith("\\\\")) return cwd;
+  }
+  return undefined;
+}
+
 export function composeCustomToolPrompt(opts: {
   body: Record<string, unknown>;
   tools: CustomToolDef[];
@@ -596,6 +612,7 @@ async function startCustomToolTurn(opts: {
     fast: extractFastMode(opts.body),
     reasoningEffort: extractReasoningEffort(opts.body),
     customTools,
+    cwd: cwdFromClientSystem(opts.body),
     conversationId: ids.conversationId,
     agentSessionId: ids.agentSessionId,
     onCheckpoint: () => {

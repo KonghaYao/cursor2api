@@ -4,6 +4,7 @@ import { customToolsClearForTests, openaiToolsToCustom } from "./custom_tools.ts
 import {
   agentImagesFromCursorParts,
   customToolChatClearForTests,
+  cwdFromClientSystem,
   handleCustomToolChatCompletions,
   handleCustomToolMessages,
   setCustomToolAgentHostForTests,
@@ -31,6 +32,50 @@ test("agentImagesFromCursorParts maps Inference image parts to AgentService imag
   assert.equal(images[0]?.data, "aaaa");
   assert.equal(images[0]?.mimeType, "image/jpeg");
   assert.match(images[0]?.path || "", /\.jpg$/);
+});
+
+test("cwdFromClientSystem extracts the absolute working directory from env context", () => {
+  assert.equal(
+    cwdFromClientSystem({
+      messages: [
+        {
+          role: "system",
+          content: "<env>\nWorking directory: /Users/mino/code/project with spaces\nIs directory a git repo: Yes\n</env>",
+        },
+      ],
+    }),
+    "/Users/mino/code/project with spaces",
+  );
+  assert.equal(cwdFromClientSystem({ system: "Working directory: relative/path" }), undefined);
+});
+
+test("OpenAI chat passes the system working directory to AgentService host", async () => {
+  let created: CustomToolAgentCreateOpts | undefined;
+  setCustomToolAgentHostForTests({
+    async create(opts) {
+      created = opts;
+      return {
+        agentId: "agent-cwd",
+        async send() {
+          return { wait: async () => ({ text: "ok" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const res = await handleCustomToolChatCompletions({
+    headers: new Headers({ authorization: "Bearer crsr_test" }),
+    body: {
+      model: "composer-2.5",
+      messages: [
+        { role: "system", content: "<env>\nWorking directory: /workspace/repo\n</env>" },
+        { role: "user", content: "what is my pwd?" },
+      ],
+    },
+    tools: [],
+  });
+  assert.equal(res.status, 200);
+  assert.equal(created?.cwd, "/workspace/repo");
 });
 
 test("OpenAI chat returns reasoning_content and forwards image bytes", async () => {

@@ -333,6 +333,38 @@ async function waitFor<T>(fn: () => T | undefined, timeoutMs = 1000): Promise<T>
   throw new Error("timed out");
 }
 
+test("in-repo host forwards cwd to Run and request context", async () => {
+  const cwd = "/workspace/repo";
+  const duplex = new InteractiveDuplex();
+  let contextCwd: string | undefined;
+  duplex.onSend = (message) => {
+    const run = asObject(field(message, "runRequest"));
+    if (run) {
+      const fs = asObject(field(run, "mcpFileSystemOptions"));
+      assert.equal(fs?.workspaceProjectDir, cwd);
+      duplex.push({ execServerMessage: { id: 1, execId: "ctx", requestContextArgs: {} } });
+      return;
+    }
+    const exec = asObject(field(message, "execClientMessage"));
+    const result = asObject(field(exec, "requestContextResult"));
+    const success = asObject(field(result, "success"));
+    const context = asObject(field(success, "requestContext"));
+    const env = asObject(field(context, "env"));
+    if (env) {
+      contextCwd = String(env.processWorkingDirectory || "");
+      duplex.push({ interactionUpdate: { turnEnded: {} } });
+    }
+  };
+  const host = createSdkAgentHost({
+    openRun: async () => duplex,
+    exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+  });
+  const agent = await host.create({ apiKey: "crsr_test", model: "composer-2.5", customTools: {}, cwd });
+  await (await agent.send("ping")).wait();
+  assert.equal(contextCwd, cwd);
+  await agent.close();
+});
+
 test("in-repo host reuses caller conversationId and conversationState", async () => {
   const duplex = new InteractiveDuplex();
   duplex.onSend = (message) => {
