@@ -595,9 +595,10 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
         // Do not `return await` a streaming Response: Deno.serve treats the
         // handler as finished and legacy-aborts request.signal, which
         // cancelAction's the in-flight SSE. Adopt the promise; map errors
-        // without buffering the body.
+        // without buffering the body. Stream path must not bind request.signal
+        // to cancelAction (legacy abort after 200); SSE cancel() owns abort.
         return handleCloudMessages(request.headers, body, requestId, ctx.kv, {
-          signal: request.signal,
+          signal: body.stream ? undefined : request.signal,
         }).catch((err) => mapGatewayError(err, anthropicRequest, requestId));
       }
       return handleInferenceMessages(ctx, request, body, requestId).catch((err) => mapGatewayError(err, anthropicRequest, requestId));
@@ -609,7 +610,7 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
       if (unsupported) return unsupported;
       if (ctx.upstream === "cloud") {
         return handleCloudChatCompletions(request.headers, body, ctx.kv, {
-          signal: request.signal,
+          signal: body.stream ? undefined : request.signal,
         }).catch((err) => mapGatewayError(err, anthropicRequest, requestId));
       }
       return handleInferenceChatCompletions(ctx, request, body).catch((err) => mapGatewayError(err, anthropicRequest, requestId));

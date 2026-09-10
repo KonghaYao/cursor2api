@@ -609,6 +609,56 @@ test("OpenAI stream=true forwards AgentService thinking and text deltas", async 
   assert.match(sse, /"finish_reason":"stop"/);
 });
 
+test("OpenAI stream=true returns SSE before AgentService open", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let finish!: (result: { text: string }) => void;
+  const finished = new Promise<{ text: string }>((resolve) => {
+    finish = resolve;
+  });
+  setCustomToolAgentHostForTests({
+    async create() {
+      await gate;
+      return {
+        agentId: "agent-late",
+        async send() {
+          return {
+            wait: () => finished,
+            abort() {
+              finish({ text: "" });
+            },
+          };
+        },
+        async close() {},
+      };
+    },
+  });
+  const res = await Promise.race([
+    handleCustomToolChatCompletions({
+      headers: new Headers({ authorization: "Bearer crsr_test" }),
+      body: {
+        model: "composer-2.5",
+        stream: true,
+        messages: [{ role: "user", content: "sse-headers-before-open" }],
+      },
+      tools: [],
+    }),
+    new Promise<Response>((_, reject) => {
+      setTimeout(() => reject(new Error("SSE headers waited for AgentService open")), 80);
+    }),
+  ]);
+  assert.equal(res.status, 200);
+  assert.match(String(res.headers.get("content-type") || ""), /text\/event-stream/);
+  assert.equal(res.headers.get("x-accel-buffering"), "no");
+  const reader = res.body!.getReader();
+  const first = await reader.read();
+  assert.match(new TextDecoder().decode(first.value), /:\s*connected/);
+  release();
+  await reader.cancel();
+});
+
 test("Anthropic stream=true forwards thinking then text deltas", async () => {
   let onDelta: ((chunk: { text?: string; thinking?: string }) => void) | undefined;
   let finish!: (result: { text: string; thinking: string }) => void;
@@ -1407,11 +1457,19 @@ test("SSE cancel aborts the in-flight AgentService run", async () => {
   });
   const res = await handleCustomToolChatCompletions({
     headers: new Headers({ authorization: "Bearer crsr_test" }),
-    body: { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "hi" }] },
+    body: { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "sse-cancel" }] },
     tools: [],
   });
   assert.equal(res.status, 200);
-  await res.body?.cancel();
+  const reader = res.body!.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  while (!buf.includes('"role":"assistant"')) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (value) buf += dec.decode(value, { stream: true });
+  }
+  await reader.cancel();
   await new Promise((r) => setTimeout(r, 20));
   assert.ok(aborts >= 1, `expected SSE cancel to abort AgentService, got ${aborts}`);
 });

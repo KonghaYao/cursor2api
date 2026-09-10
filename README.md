@@ -42,7 +42,7 @@ curl -sS https://cursor2api.freetavily.deno.net/v1/chat/completions \
 | 能力 | 状态 | 用户侧含义 |
 |------|------|------------|
 | 文本聊天 | 可用 | OpenAI `/v1/chat/completions`、Anthropic `/v1/messages` |
-| 流式 `stream: true` | 可用 | 正文和思考跟 Cursor 后端增量推 SSE。工具调用仍是一整块，不会拆碎 |
+| 流式 `stream: true` | 可用 | 立刻回 SSE（含 keepalive）；正文/思考在 AgentService 推出 `textDelta`/`thinkingDelta` 时转发。Composer 常在想完后短时间打出全文。工具调用仍是一整块 |
 | 工具调用 | 可用 | 和 OpenAI / Anthropic 一样：先拿到 `tool_calls` / `tool_use`，本地执行后再回传结果 |
 | `system` 提示 | 部分可用 | 会随会话进 Cursor 的对话 roots，**叠在** Cursor 自带助手设定上面，换不掉「Composer / 工作区 / 文件工具」那套身份。官方 SDK 的 `systemPrompt` 能整段替换，但要账号开门，而且只给 SDK 本机 agent；Dashboard `crsr_` 一发仍是 `unknown option '--system-prompt'`。同一会话里改 system 会开成新对话 |
 | 上下文缓存 | 部分可用 | 同一条对话（第一条 user + 模型 / 工具 / 系统提示不变）会复用 Cursor 会话。不必传 `x-session-id`。Deno Deploy 用 KV 只记会话 id（不存聊天正文），换实例也能续上。每一枪都会开关到 Cursor 的后向连接；你跑完工具再 POST `role: tool` 时是**新的一轮**，不是把结果塞回上一枪还开着的那条流 |

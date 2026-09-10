@@ -102,6 +102,7 @@ test("stream=true returns SSE headers before the AgentService turn finishes", as
   );
   assert.equal(res.status, 200);
   assert.match(String(res.headers.get("content-type") || ""), /text\/event-stream/);
+  assert.equal(res.headers.get("x-accel-buffering"), "no");
   finish({ text: "ok", thinking: "" });
   const sse = await res.text();
   assert.match(sse, /data: \[DONE\]/);

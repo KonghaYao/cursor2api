@@ -523,6 +523,10 @@ async function startCustomToolTurn(opts: {
   body: Record<string, unknown>;
   tools: CustomToolDef[];
   signal?: AbortSignal;
+  /** Passed into AgentService send() — stream cancel, not HTTP request.signal. */
+  sendSignal?: AbortSignal;
+  /** Bind `signal` to cancelAction after send(). Stream path sets false. */
+  attachAbort?: boolean;
   kv?: Kv;
   protocol?: "openai" | "anthropic";
 }): Promise<{ live: LiveTurn; session: ClientToolSession; sessionId: string; continued: boolean }> {
@@ -626,12 +630,13 @@ async function startCustomToolTurn(opts: {
     conversationState: spliced.conversationState,
     onDelta: (chunk) => deltas.push(chunk),
     // Do not pass HTTP request.signal into send(): Deno.serve aborts it after
-    // 200, which would cancelAction a parked Run. Client abort is attachClientAbort.
+    // 200, which would cancelAction a parked Run. Stream cancel uses sendSignal.
+    ...(opts.sendSignal ? { signal: opts.sendSignal } : {}),
   });
   await persistCommittedLength();
   const abortRun = () => run.abort?.();
   const releaseRun = () => (run.release ?? run.abort)?.();
-  const detachClientAbort = attachClientAbort(opts.signal, abortRun);
+  const detachClientAbort = opts.attachAbort === false ? () => {} : attachClientAbort(opts.signal, abortRun);
   const live: LiveTurn = {
     agent,
     session,
@@ -780,6 +785,21 @@ export async function handleCustomToolChatCompletions(opts: {
   kv?: Kv;
 }): Promise<Response> {
   const apiKey = cloudApiKeyFromHeaders(opts.headers);
+  if (opts.body.stream) {
+    return streamCustomOpenAi({
+      open: (sendSignal) =>
+        startCustomToolTurn({
+          apiKey,
+          body: opts.body,
+          tools: opts.tools,
+          kv: opts.kv,
+          protocol: "openai",
+          attachAbort: false,
+          sendSignal,
+        }),
+      model: opts.body.model,
+    });
+  }
   const started = await startCustomToolTurn({
     apiKey,
     body: opts.body,
@@ -789,9 +809,6 @@ export async function handleCustomToolChatCompletions(opts: {
     protocol: "openai",
   });
   const agentId = started.live.agent.agentId;
-  if (opts.body.stream) {
-    return streamCustomOpenAi({ ...started, model: opts.body.model, agentId, signal: opts.signal });
-  }
   const settled = await settleCustomTools(started.session, started.live);
   started.live.detachClientAbort?.();
   if (settled.kind === "tools") {
@@ -839,6 +856,22 @@ export async function handleCustomToolMessages(opts: {
   kv?: Kv;
 }): Promise<Response> {
   const apiKey = cloudApiKeyFromHeaders(opts.headers);
+  if (opts.body.stream) {
+    return streamCustomAnthropic({
+      open: (sendSignal) =>
+        startCustomToolTurn({
+          apiKey,
+          body: opts.body,
+          tools: opts.tools,
+          kv: opts.kv,
+          protocol: "anthropic",
+          attachAbort: false,
+          sendSignal,
+        }),
+      model: opts.body.model,
+      requestId: opts.requestId,
+    });
+  }
   const started = await startCustomToolTurn({
     apiKey,
     body: opts.body,
@@ -848,9 +881,6 @@ export async function handleCustomToolMessages(opts: {
     protocol: "anthropic",
   });
   const agentId = started.live.agent.agentId;
-  if (opts.body.stream) {
-    return streamCustomAnthropic({ ...started, model: opts.body.model, agentId, requestId: opts.requestId, signal: opts.signal });
-  }
   const settled = await settleCustomTools(started.session, started.live);
   started.live.detachClientAbort?.();
   if (settled.kind === "tools") {
@@ -891,44 +921,64 @@ export async function handleCustomToolMessages(opts: {
   }, opts.requestId);
 }
 
+const sseBytes = new TextEncoder();
+const SSE_CONNECTED = sseBytes.encode(": connected\n\n");
+const SSE_KEEPALIVE = sseBytes.encode(": keepalive\n\n");
+const SSE_KEEPALIVE_MS = 1_000;
+
+type StartedTurn = { live: LiveTurn; session: ClientToolSession; sessionId: string };
+
 function streamCustomOpenAi(opts: {
-  live: LiveTurn;
-  session: ClientToolSession;
-  sessionId: string;
+  open: (sendSignal: AbortSignal) => Promise<StartedTurn>;
   model: unknown;
-  agentId: string;
-  signal?: AbortSignal;
 }): Promise<Response> {
-  const { live, session, sessionId, model, agentId } = opts;
   const created = Math.floor(Date.now() / 1000);
+  const streamAbort = new AbortController();
+  let live: LiveTurn | undefined;
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const chunk = (delta: Record<string, unknown>, finish: string | null = null, extra: Record<string, unknown> = {}) =>
-        encodeSseData({
-          id: agentId,
-          object: "chat.completion.chunk",
-          created,
-          model: String(model || "composer-2.5"),
-          choices: [{ index: 0, delta, finish_reason: finish }],
-          cursor_agent_id: agentId,
-          conversation_id: sessionId,
-          ...extra,
-        });
-      let emittedThinking = live.deltas.ackedThinking;
-      let emittedText = live.deltas.ackedText;
-      const flush = () => {
-        const thinking = longerText(live.thinking, live.deltas.streamedThinking);
-        const text = longerText(live.text, live.deltas.streamedText);
-        if (thinking.length > emittedThinking) {
-          controller.enqueue(chunk({ reasoning_content: thinking.slice(emittedThinking) }));
-          emittedThinking = thinking.length;
+      const keep = setInterval(() => {
+        try {
+          controller.enqueue(SSE_KEEPALIVE);
+        } catch {
+          /* stream already closed */
         }
-        if (text.length > emittedText) {
-          controller.enqueue(chunk({ content: text.slice(emittedText) }));
-          emittedText = text.length;
-        }
-      };
+      }, SSE_KEEPALIVE_MS);
       try {
+        controller.enqueue(SSE_CONNECTED);
+        const started = await opts.open(streamAbort.signal);
+        live = started.live;
+        if (streamAbort.signal.aborted) {
+          live.abort?.();
+          return;
+        }
+        const { session, sessionId } = started;
+        const agentId = live.agent.agentId;
+        const chunk = (delta: Record<string, unknown>, finish: string | null = null, extra: Record<string, unknown> = {}) =>
+          encodeSseData({
+            id: agentId,
+            object: "chat.completion.chunk",
+            created,
+            model: String(opts.model || "composer-2.5"),
+            choices: [{ index: 0, delta, finish_reason: finish }],
+            cursor_agent_id: agentId,
+            conversation_id: sessionId,
+            ...extra,
+          });
+        let emittedThinking = live.deltas.ackedThinking;
+        let emittedText = live.deltas.ackedText;
+        const flush = () => {
+          const thinking = longerText(live!.thinking, live!.deltas.streamedThinking);
+          const text = longerText(live!.text, live!.deltas.streamedText);
+          if (thinking.length > emittedThinking) {
+            controller.enqueue(chunk({ reasoning_content: thinking.slice(emittedThinking) }));
+            emittedThinking = thinking.length;
+          }
+          if (text.length > emittedText) {
+            controller.enqueue(chunk({ content: text.slice(emittedText) }));
+            emittedText = text.length;
+          }
+        };
         controller.enqueue(chunk({ role: "assistant" }));
         const unsub = live.deltas.subscribe(flush);
         flush();
@@ -950,12 +1000,12 @@ function streamCustomOpenAi(opts: {
               id: agentId,
               object: "chat.completion.chunk",
               created,
-              model: String(model || "composer-2.5"),
+              model: String(opts.model || "composer-2.5"),
               choices: [],
               usage,
             }),
           );
-          controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+          controller.enqueue(sseBytes.encode("data: [DONE]\n\n"));
           return;
         }
         logAgentUsage(live.usage);
@@ -971,7 +1021,7 @@ function streamCustomOpenAi(opts: {
               id: agentId,
               object: "chat.completion.chunk",
               created,
-              model: String(model || "composer-2.5"),
+              model: String(opts.model || "composer-2.5"),
               choices: [],
               error: { message: err, type: "api_error" },
             }),
@@ -983,55 +1033,61 @@ function streamCustomOpenAi(opts: {
             id: agentId,
             object: "chat.completion.chunk",
             created,
-            model: String(model || "composer-2.5"),
+            model: String(opts.model || "composer-2.5"),
             choices: [],
             usage,
           }),
         );
-        controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+        controller.enqueue(sseBytes.encode("data: [DONE]\n\n"));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         controller.enqueue(
           encodeSseData({
-            id: agentId,
+            id: "chatcmpl-error",
             object: "chat.completion.chunk",
             created,
-            model: String(model || "composer-2.5"),
+            model: String(opts.model || "composer-2.5"),
             choices: [],
             error: { message, type: "api_error" },
           }),
         );
-        controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+        controller.enqueue(sseBytes.encode("data: [DONE]\n\n"));
       } finally {
-        live.detachClientAbort?.();
+        clearInterval(keep);
+        live?.detachClientAbort?.();
         controller.close();
       }
     },
     cancel() {
-      live.detachClientAbort?.();
-      live.abort?.();
+      streamAbort.abort();
+      live?.detachClientAbort?.();
+      live?.abort?.();
     },
   });
   return Promise.resolve(sseStreamResponse(stream));
 }
 
 function streamCustomAnthropic(opts: {
-  live: LiveTurn;
-  session: ClientToolSession;
-  sessionId: string;
+  open: (sendSignal: AbortSignal) => Promise<StartedTurn>;
   model: unknown;
-  agentId: string;
   requestId: string;
-  signal?: AbortSignal;
 }): Promise<Response> {
-  const { live, session, model, agentId, requestId } = opts;
-  const msgId = `msg_${agentId}`;
+  const { model, requestId } = opts;
+  const streamAbort = new AbortController();
+  let live: LiveTurn | undefined;
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      const keep = setInterval(() => {
+        try {
+          controller.enqueue(SSE_KEEPALIVE);
+        } catch {
+          /* stream already closed */
+        }
+      }, SSE_KEEPALIVE_MS);
       let index = 0;
       let open: "thinking" | "text" | null = null;
-      let emittedThinking = live.deltas.ackedThinking;
-      let emittedText = live.deltas.ackedText;
+      let emittedThinking = 0;
+      let emittedText = 0;
       const closeOpen = () => {
         if (!open) return;
         if (open === "thinking") {
@@ -1047,9 +1103,22 @@ function streamCustomAnthropic(opts: {
         index += 1;
         open = null;
       };
-      const flush = () => {
-        const thinking = longerText(live.thinking, live.deltas.streamedThinking);
-        const text = longerText(live.text, live.deltas.streamedText);
+      try {
+        controller.enqueue(SSE_CONNECTED);
+        const started = await opts.open(streamAbort.signal);
+        live = started.live;
+        if (streamAbort.signal.aborted) {
+          live.abort?.();
+          return;
+        }
+        const { session } = started;
+        const agentId = live.agent.agentId;
+        const msgId = `msg_${agentId}`;
+        emittedThinking = live.deltas.ackedThinking;
+        emittedText = live.deltas.ackedText;
+        const flush = () => {
+        const thinking = longerText(live!.thinking, live!.deltas.streamedThinking);
+        const text = longerText(live!.text, live!.deltas.streamedText);
         if (thinking.length > emittedThinking) {
           if (open !== "thinking") {
             closeOpen();
@@ -1093,7 +1162,6 @@ function streamCustomAnthropic(opts: {
           emittedText = text.length;
         }
       };
-      try {
         controller.enqueue(
           encodeSseEvent("message_start", {
             type: "message_start",
@@ -1184,13 +1252,15 @@ function streamCustomAnthropic(opts: {
         const message = err instanceof Error ? err.message : String(err);
         controller.enqueue(encodeSseEvent("error", toAnthropicError({ message, type: "api_error" }, requestId)));
       } finally {
-        live.detachClientAbort?.();
+        clearInterval(keep);
+        live?.detachClientAbort?.();
         controller.close();
       }
     },
     cancel() {
-      live.detachClientAbort?.();
-      live.abort?.();
+      streamAbort.abort();
+      live?.detachClientAbort?.();
+      live?.abort?.();
     },
   });
   return Promise.resolve(sseStreamResponse(stream, requestId));

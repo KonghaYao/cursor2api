@@ -95,7 +95,9 @@ export function encodeSseEvent(event: string, obj: unknown): Uint8Array {
 export function sseStreamResponse(stream: ReadableStream<Uint8Array>, requestId?: string): Response {
   const headers = new Headers({
     "content-type": "text/event-stream; charset=utf-8",
-    "cache-control": "no-cache",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
     "access-control-allow-origin": "*",
   });
   if (requestId) headers.set("request-id", requestId);
