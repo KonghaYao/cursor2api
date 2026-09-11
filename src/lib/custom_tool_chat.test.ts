@@ -1335,13 +1335,13 @@ test("in-repo host: three sequential MCP parks then text; resume splices convers
   assert.equal(duplexSentCancel(duplexes[3]!), false);
 });
 
-test("OpenAI JSON forwards AgentService errors in error field and visible content", async () => {
+test("OpenAI JSON maps AgentService resource_exhausted to HTTP 429", async () => {
   setCustomToolAgentHostForTests({
     async create() {
       return {
         agentId: "agent-err",
         async send() {
-          return { wait: async () => ({ text: "", error: "Provider exceeded max output tokens." }) };
+          return { wait: async () => ({ text: "", error: "resource_exhausted: Error" }) };
         },
         async close() {},
       };
@@ -1352,21 +1352,22 @@ test("OpenAI JSON forwards AgentService errors in error field and visible conten
     body: { model: "composer-2.5", messages: [{ role: "user", content: "hi" }] },
     tools: [],
   });
-  assert.equal(res.status, 200);
+  assert.equal(res.status, 429);
+  assert.equal(res.headers.get("retry-after"), "30");
   const body = await res.json();
-  assert.equal(body.error?.message, "Provider exceeded max output tokens.");
-  assert.equal(body.error?.type, "api_error");
-  assert.equal(body.choices[0].message.content, "Provider exceeded max output tokens.");
-  assert.equal(body.choices[0].finish_reason, "stop");
+  assert.equal(body.error?.message, "resource_exhausted: Error");
+  assert.equal(body.error?.type, "rate_limit_error");
+  assert.equal(body.error?.code, "resource_exhausted");
+  assert.equal("choices" in body, false);
 });
 
-test("OpenAI stream=true forwards AgentService errors as content and error field", async () => {
+test("OpenAI stream=true emits only a structured AgentService error", async () => {
   setCustomToolAgentHostForTests({
     async create() {
       return {
         agentId: "agent-err-sse",
         async send() {
-          return { wait: async () => ({ text: "", error: "AgentService aborted the run" }) };
+          return { wait: async () => ({ text: "", error: "resource_exhausted: Error" }) };
         },
         async close() {},
       };
@@ -1382,12 +1383,14 @@ test("OpenAI stream=true forwards AgentService errors as content and error field
     tools: [],
   });
   assert.equal(res.status, 200);
-  const sse = await consumeSse(res.body, () => {}, (buf) => buf.includes("data: [DONE]"));
-  assert.match(sse, /"content":"AgentService aborted the run"/);
-  assert.match(sse, /"error":\{"message":"AgentService aborted the run","type":"api_error"\}/);
+  const sse = await new Response(res.body).text();
+  assert.match(sse, /"error":\{"message":"resource_exhausted: Error","type":"rate_limit_error","code":"resource_exhausted"\}/);
+  assert.doesNotMatch(sse, /"content":"resource_exhausted: Error"/);
+  assert.doesNotMatch(sse, /"finish_reason":"stop"/);
+  assert.doesNotMatch(sse, /data: \[DONE\]/);
 });
 
-test("Anthropic JSON error-only responses use the error envelope", async () => {
+test("Anthropic JSON maps AgentService authentication errors to HTTP 401", async () => {
   setCustomToolAgentHostForTests({
     async create() {
       return {
@@ -1405,13 +1408,14 @@ test("Anthropic JSON error-only responses use the error envelope", async () => {
     tools: [],
     requestId: "req_err",
   });
-  assert.equal(res.status, 200);
+  assert.equal(res.status, 401);
   const body = await res.json();
   assert.equal(body.type, "error");
+  assert.equal(body.error?.type, "authentication_error");
   assert.equal(body.error?.message, "ERROR_NOT_LOGGED_IN: not logged in");
 });
 
-test("Anthropic stream=true emits error event and visible text for AgentService errors", async () => {
+test("Anthropic stream=true emits a structured AgentService error without visible text", async () => {
   setCustomToolAgentHostForTests({
     async create() {
       return {
@@ -1435,10 +1439,12 @@ test("Anthropic stream=true emits error event and visible text for AgentService 
     requestId: "req_err_sse",
   });
   assert.equal(res.status, 200);
-  const sse = await consumeSse(res.body, () => {}, (buf) => buf.includes("event: error") || buf.includes("message_stop"));
+  const sse = await new Response(res.body).text();
   assert.match(sse, /event: error/);
+  assert.match(sse, /rate_limit_error/);
   assert.match(sse, /rate limited/);
-  assert.match(sse, /text_delta/);
+  assert.doesNotMatch(sse, /text_delta/);
+  assert.doesNotMatch(sse, /message_stop/);
 });
 
 test("client abort calls AgentService abort while the turn is in flight", async () => {

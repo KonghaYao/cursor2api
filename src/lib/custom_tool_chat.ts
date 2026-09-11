@@ -727,20 +727,87 @@ function trimAgentError(error?: string): string | undefined {
   return msg || undefined;
 }
 
+type MappedAgentError = {
+  status: number;
+  type: string;
+  code: string;
+  message: string;
+};
+
+function mapAgentError(error?: string): MappedAgentError | undefined {
+  const message = trimAgentError(error);
+  if (!message) return undefined;
+  const normalized = message.toLowerCase();
+
+  if (/resource[_\s-]?exhausted|rate[_\s-]?limit|too many requests|usage limit|quota (?:exceeded|exhausted)/i.test(normalized)) {
+    return {
+      status: 429,
+      type: "rate_limit_error",
+      code: normalized.includes("resource_exhausted") ? "resource_exhausted" : "rate_limit_exceeded",
+      message,
+    };
+  }
+  if (/error_not_logged_in|not logged in|unauthenticated|authentication/i.test(normalized)) {
+    return { status: 401, type: "authentication_error", code: "authentication_error", message };
+  }
+  if (/permission[_\s-]?denied|forbidden|not supported in your region/i.test(normalized)) {
+    return { status: 403, type: "permission_error", code: "permission_denied", message };
+  }
+  if (/max(?:imum)? output tokens|output_token_limit/i.test(normalized)) {
+    return { status: 400, type: "invalid_request_error", code: "max_output_tokens", message };
+  }
+  if (/invalid[_\s-]?argument|bad[_\s-]?model|bad model|unknown option/i.test(normalized)) {
+    return { status: 400, type: "invalid_request_error", code: "invalid_argument", message };
+  }
+  if (/request[_\s-]?too[_\s-]?large|payload[_\s-]?too[_\s-]?large/i.test(normalized)) {
+    return { status: 413, type: "request_too_large", code: "request_too_large", message };
+  }
+  if (/deadline[_\s-]?exceeded|timed? out|timeout/i.test(normalized)) {
+    return { status: 504, type: "timeout_error", code: "upstream_timeout", message };
+  }
+  if (/overload|stream_unavailable|temporarily unavailable|service unavailable/i.test(normalized)) {
+    return { status: 503, type: "overloaded_error", code: "upstream_unavailable", message };
+  }
+  if (/not[_\s-]?found/i.test(normalized)) {
+    return { status: 404, type: "not_found_error", code: "not_found", message };
+  }
+  if (/conflict|already exists/i.test(normalized)) {
+    return { status: 409, type: "conflict_error", code: "conflict", message };
+  }
+  return { status: 502, type: "server_error", code: "upstream_error", message };
+}
+
+function withAgentErrorHeaders(response: Response, error: MappedAgentError): Response {
+  if (error.status === 429) response.headers.set("retry-after", "30");
+  return response;
+}
+
+function openAiAgentErrorResponse(error: MappedAgentError): Response {
+  logCustomToolError(error.message);
+  return withAgentErrorHeaders(
+    jsonResponse(error.status, {
+      error: { message: error.message, type: error.type, code: error.code },
+    }),
+    error,
+  );
+}
+
+function anthropicAgentErrorResponse(error: MappedAgentError, requestId: string): Response {
+  logCustomToolError(error.message);
+  return withAgentErrorHeaders(
+    jsonResponse(
+      error.status,
+      toAnthropicError({ message: error.message, type: error.type, code: error.code }, requestId),
+      requestId,
+    ),
+    error,
+  );
+}
+
 function logCustomToolError(error?: string): void {
   const msg = trimAgentError(error);
   if (!msg) return;
   console.log(`  custom_tools error ${msg.slice(0, 300)}`);
-}
-
-/** Cursor Agent often ignores a lone `error` field; keep the message in visible text too. */
-function agentVisibleText(text?: string, error?: string): string {
-  const t = text || "";
-  const e = trimAgentError(error);
-  if (!e) return t;
-  if (!t) return e;
-  if (t.includes(e)) return t;
-  return `${t}\n${e}`;
 }
 
 /** AgentService thinkingDelta has no real signature. Use "" so clients can echo the block. */
@@ -768,29 +835,25 @@ function openAiCompletion(opts: {
   sessionId: string;
   text: string;
   thinking?: string;
-  error?: string;
   usage?: AgentTurnUsage;
   toolCalls?: ReturnType<typeof clientToolsToOpenAi>;
 }) {
   const toolCalls = opts.toolCalls?.length ? opts.toolCalls : undefined;
-  const err = trimAgentError(opts.error);
   const message: Record<string, unknown> = {
     role: "assistant",
-    content: toolCalls ? opts.text || null : agentVisibleText(opts.text, err),
+    content: toolCalls ? opts.text || null : opts.text,
   };
   if (opts.thinking) message.reasoning_content = opts.thinking;
   if (toolCalls) message.tool_calls = toolCalls;
-  if (err) logCustomToolError(err);
   return {
     id: opts.agentId,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
     model: String(opts.model || "composer-2.5"),
-    choices: [{ index: 0, message, finish_reason: err ? "stop" : toolCalls ? "tool_calls" : "stop" }],
+    choices: [{ index: 0, message, finish_reason: toolCalls ? "tool_calls" : "stop" }],
     usage: openaiUsageFromAgent(opts.usage),
     cursor_agent_id: opts.agentId,
     conversation_id: opts.sessionId,
-    error: err ? { message: err, type: "api_error" } : undefined,
   };
 }
 
@@ -850,6 +913,8 @@ export async function handleCustomToolChatCompletions(opts: {
   const result = started.live.done ? liveResult(started.live) : await started.live.wait();
   logAgentUsage(result.usage);
   ackLiveDeltas(started.live, result.thinking, result.text);
+  const error = mapAgentError(result.error);
+  if (error) return openAiAgentErrorResponse(error);
   return jsonResponse(
     200,
     openAiCompletion({
@@ -858,7 +923,6 @@ export async function handleCustomToolChatCompletions(opts: {
       sessionId: started.sessionId,
       text: result.text,
       thinking: result.thinking,
-      error: result.error,
       usage: result.usage,
     }),
   );
@@ -920,17 +984,14 @@ export async function handleCustomToolMessages(opts: {
   const result = started.live.done ? liveResult(started.live) : await started.live.wait();
   logAgentUsage(result.usage);
   ackLiveDeltas(started.live, result.thinking, result.text);
-  const err = trimAgentError(result.error);
-  logCustomToolError(err);
-  if (err && !result.text && !result.thinking) {
-    return jsonResponse(200, toAnthropicError({ message: err, type: "api_error" }, opts.requestId), opts.requestId);
-  }
+  const error = mapAgentError(result.error);
+  if (error) return anthropicAgentErrorResponse(error, opts.requestId);
   return jsonResponse(200, {
     id: `msg_${agentId}`,
     type: "message",
     role: "assistant",
     model: String(opts.body.model || "composer-2.5"),
-    content: anthropicContentBlocks({ thinking: result.thinking, text: agentVisibleText(result.text, err) }),
+    content: anthropicContentBlocks({ thinking: result.thinking, text: result.text }),
     stop_reason: "end_turn",
     usage: anthropicUsageFromAgent(result.usage),
     cursor_agent_id: agentId,
@@ -1026,13 +1087,9 @@ function streamCustomOpenAi(opts: {
           return;
         }
         logAgentUsage(live.usage);
-        const err = trimAgentError(live.error);
-        if (err) {
-          logCustomToolError(err);
-          if (emittedText === 0) {
-            controller.enqueue(chunk({ content: err }));
-            emittedText = err.length;
-          }
+        const error = mapAgentError(live.error);
+        if (error) {
+          logCustomToolError(error.message);
           controller.enqueue(
             encodeSseData({
               id: agentId,
@@ -1040,9 +1097,10 @@ function streamCustomOpenAi(opts: {
               created,
               model: String(opts.model || "composer-2.5"),
               choices: [],
-              error: { message: err, type: "api_error" },
+              error: { message: error.message, type: error.type, code: error.code },
             }),
           );
+          return;
         }
         controller.enqueue(chunk({}, "stop", { usage }));
         controller.enqueue(
@@ -1057,7 +1115,7 @@ function streamCustomOpenAi(opts: {
         );
         controller.enqueue(sseBytes.encode("data: [DONE]\n\n"));
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const error = mapAgentError(err instanceof Error ? err.message : String(err))!;
         controller.enqueue(
           encodeSseData({
             id: "chatcmpl-error",
@@ -1065,10 +1123,9 @@ function streamCustomOpenAi(opts: {
             created,
             model: String(opts.model || "composer-2.5"),
             choices: [],
-            error: { message, type: "api_error" },
+            error: { message: error.message, type: error.type, code: error.code },
           }),
         );
-        controller.enqueue(sseBytes.encode("data: [DONE]\n\n"));
       } finally {
         clearInterval(keep);
         live?.detachClientAbort?.();
@@ -1232,30 +1289,16 @@ function streamCustomAnthropic(opts: {
           return;
         }
         logAgentUsage(live.usage);
-        const err = trimAgentError(live.error);
-        const hadModelOutput = emittedText > 0 || emittedThinking > 0;
-        if (err) {
-          logCustomToolError(err);
-          if (!hadModelOutput) {
-            controller.enqueue(
-              encodeSseEvent("content_block_start", {
-                type: "content_block_start",
-                index,
-                content_block: { type: "text", text: "" },
-              }),
-            );
-            open = "text";
-            controller.enqueue(
-              encodeSseEvent("content_block_delta", {
-                type: "content_block_delta",
-                index,
-                delta: { type: "text_delta", text: err },
-              }),
-            );
-          }
-          closeOpen();
-          controller.enqueue(encodeSseEvent("error", toAnthropicError({ message: err, type: "api_error" }, requestId)));
-          if (!hadModelOutput) return;
+        const error = mapAgentError(live.error);
+        if (error) {
+          logCustomToolError(error.message);
+          controller.enqueue(
+            encodeSseEvent(
+              "error",
+              toAnthropicError({ message: error.message, type: error.type, code: error.code }, requestId),
+            ),
+          );
+          return;
         }
         controller.enqueue(
           encodeSseEvent("message_delta", {
@@ -1266,8 +1309,13 @@ function streamCustomAnthropic(opts: {
         );
         controller.enqueue(encodeSseEvent("message_stop", { type: "message_stop" }));
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        controller.enqueue(encodeSseEvent("error", toAnthropicError({ message, type: "api_error" }, requestId)));
+        const error = mapAgentError(err instanceof Error ? err.message : String(err))!;
+        controller.enqueue(
+          encodeSseEvent(
+            "error",
+            toAnthropicError({ message: error.message, type: error.type, code: error.code }, requestId),
+          ),
+        );
       } finally {
         clearInterval(keep);
         live?.detachClientAbort?.();
