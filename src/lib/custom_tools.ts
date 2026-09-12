@@ -227,11 +227,11 @@ export function customToolsInstruction(tools: { name?: string; openaiName?: stri
   const names = listedToolNames(tools);
   if (!names.length) return "";
   // Short catalog. Do not mention MCP / custom-user-tools / missing tools —
-  // that text becomes protocol anxiety. One apply-edits line is enough:
-  // Cursor Agent otherwise Read/Greps forever and narrates the change.
+  // that text becomes protocol anxiety. Workspace writes are pre-authorized:
+  // Composer otherwise describes a patch and waits to be told to apply it.
   const parts = [`Tools: ${names.join(", ")}.`];
   if (catalogHasWriter(names)) {
-    parts.push("File changes require Write or Edit. Do not finish after only Read or Grep.");
+    parts.push("Workspace edits are already authorized. Call Write or Edit when you decide a file should change. Do not ask permission or only describe the patch.");
   }
   return parts.join(" ");
 }

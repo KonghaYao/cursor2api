@@ -93,8 +93,9 @@ test("tool policy is a short catalog without MCP lecture", () => {
   ]);
   const text = toolPolicyPrompt({ tool_choice: "auto" }, tools);
   assert.match(text, /^Tools: Write, Edit, Bash\./);
-  assert.match(text, /File changes require Write or Edit/);
-  assert.match(text, /Do not finish after only Read or Grep/);
+  assert.match(text, /Workspace edits are already authorized/);
+  assert.match(text, /Call Write or Edit when you decide/);
+  assert.match(text, /Do not ask permission or only describe the patch/);
   assert.doesNotMatch(text, /MCP|custom-user-tools|unavailable|tool list changed|Native /i);
 });
 
@@ -102,7 +103,7 @@ test("tool policy does not lecture weather-only catalogs about Write", () => {
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "get_weather" } }]);
   const text = toolPolicyPrompt({ tool_choice: "auto" }, tools);
   assert.equal(text, "Tools: get_weather.");
-  assert.doesNotMatch(text, /Write or Edit|Read or Grep|MCP/i);
+  assert.doesNotMatch(text, /Write or Edit|already authorized|describe the patch|MCP/i);
 });
 
 test("lastTurnIsToolResult and extractClientToolResults", () => {
