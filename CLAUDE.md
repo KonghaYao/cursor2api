@@ -66,7 +66,7 @@ mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_reso
 ```
 
 - 不设该头 → 默认 toolset（shell / edit / grep / …）会回来 — **禁止**
-- 只开 MCP 家族 → 压掉 shell/edit/grep/task/webSearch；Connect body 送 `mcpTools: [custom-user-tools-…]`
+- 只开 MCP 家族 → 压掉 shell/edit/grep/task/webSearch；Connect body 送 `mcpTools: [custom-user-tools-…]`（客户端的 Write/Edit/Bash **仍是** 这些 MCP 工具，跟进枪必须原样挂上；模型说「只有 MCP、没有 Write」时先查本枪 `mcpTools` 和 roots 里的 tool policy，**不要**为此重开默认 toolset）
 - **跨轮次工具**：单测必须覆盖「`get_weather` → `lookup` → `search` → 终轮文本」（用户工具 ×3）；`conversation_id` 不变；跟进枪 `userMessageAction` 带本轮工具结果，roots 含上文。改第一条 user = 新对话。不要用「只发最后一条」当产品场景。**工具结果回来后正文不能空。**
 - **跨轮次用户话（产品验收，假 host 不够）**：同一会话三句「你的工具有什么」→「调用一下」→「我的第一句话是什么」，第三句必须能复述第一句、无异常信封。见 **2026-09-10** / `scripts/probe-session-memory.ts`。只绿 `get_weather→lookup→search` 协议单测 **不算** 过关。
 
@@ -150,6 +150,9 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 - 给 AgentService 每轮 `randomId()` 当 conversationId（isolate 一跳就丢 cache；用 `tenant:agentRunFp`，fp **不要**混进整段 pending transcript，只锚第一条 user）
 - 再用客户端 `x-session-id` / `conversation_id` 当会话键（已废弃；session 完全内部计算）
 - 把 messages / canon / 整段 transcript 写进 KV（`agent-run:` 只允许 ids + 可选小 checkpoint；`agent-run-len:` 只允许整数长度，TTL 5min，不要并进 24h 绑定）
+- 跟进枪用 `openaiToolsToCursor(body.tools)` 算 fp、却用 `openaiToolsToCustom` 挂工具（`type: custom` 的 Write/Edit 会进 mcpTools 却不进会话键；isolate 一跳就丢）。fp 必须用**本枪实际 offered** 的 `opts.tools`。
+- 复用 `existing.agent` 时仍用 create() 那一枪的 `customTools`（Write 会冻在第一枪目录里，或第一枪没有时永远加不回去）。每一枪 `send()` 都要带当前客户端 tools。
+- 把工具策略埋在 Cursor Agent 大 system **后面**（模型会按 harness 说「只有 MCP、没有 Edit/Write/Bash」）。策略放 roots 最前，并写明 listed Write/Edit/Bash **就是** 可用的客户端工具。
 
 ---
 
@@ -488,6 +491,20 @@ python3 scripts/analyze_team_usage.py team-usage-events-*.csv -o reports/usage-<
 | 根因结论 | **网关**：① 自制 state 带空 `turns: []` 抹上文；② `5c5218e` 跟进枪省略字段 → Cursor Agent 大 system 报 `Conversation state is required`。短 system / 假 host 测不出来。 |
 | 状态 | **mitigated**：每枪必带自拼 roots；禁止省略。短 system 绿不算过关。 |
 | 续记 | `/tmp` 是默认 cwd。`Prompt cache 4%` 常见于大 system 首轮。2026-09-10：本机 `8793` + `PROBE_PAD_CHARS=24000` 三句 3/3。同日对抗测试：OpenAI 大 system / stream / 三工具 / 并行会话过关；**Anthropic 跟进枪 400**（发出无 signature 的 thinking 又拒收）；**缺 Authorization 明文 500**（cloud handler 未 `await`）。同日稍后：`@cursor/sdk` `systemPrompt` = `customSystemPrompt`，本账号 `crsr_` 仍拒 `--system-prompt`；root blob 盖不住 harness（`scripts/probe-system-override.ts`）。 |
+
+###### INC-2026-09-12 — 【L】跟进枪模型声称没有 Edit/Write/Bash（只剩 MCP）
+
+| 字段 | 内容 |
+|------|------|
+| 分级 | **L（大事故）**（产品路径：Cursor Agent 写入类工具在同一对话里消失） |
+| 观测窗 (CST) | **2026-09-12** |
+| 主要坏段 (CST) | 同一对话上一轮已成功 Write → Read → rm；下一轮模型说当前会话没有 Edit / Write / Bash，只有 MCP 类工具 |
+| 触发指标 | 产品验收失败（非 M1/M5）；`conversation_id` 可能仍稳定 |
+| 用户/团队 | 走本网关的 Cursor Agent |
+| 证据 | Agent 日志「tool 列表变了」；根因在网关：会话 fp 用 `openaiToolsToCursor`（丢掉 `type: custom`），实际 park 用 `openaiToolsToCustom`；`existing.agent` 冻住第一枪 `customTools`；工具策略埋在大 system 后，Composer 按 harness 报「只有 MCP」 |
+| 根因结论 | **网关**：跟进枪 offered tools 与会话键 / Run `mcpTools` / 模型可见政策不一致。不是「当前 Agent 自己换了 tool 列表」就能结案。 |
+| 状态 | **mitigated**：fp 用本枪 `opts.tools`；每枪 `send()` 带当前 customTools；`type: custom` / 扁平 function / 带 name 的 mcp 都进客户端工具；政策放 roots 最前并写明 listed Write/Edit/Bash 可用。**不要**为了这句话去开默认 shell/edit toolset。 |
+| 续记 | 2026-09-12：单测 `reused handle still offers Write/Edit/Bash on the next Run`。 |
 
 ### 成本归因（简表）
 

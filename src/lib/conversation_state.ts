@@ -349,10 +349,13 @@ export async function spliceConversationFromClient(opts: {
   const blobs: ConversationBlobStore = new Map();
   const rootIds: string[] = [];
   const systems: string[] = [];
-  const clientSystem = systemPromptFromClient(opts.body);
-  if (clientSystem.trim()) systems.push(clientSystem.trim());
+  // Policy first: Cursor Agent's ~10k system lists native Edit/Write/Bash, but
+  // AgentService only allowlists MCP. If policy is buried after that harness,
+  // Composer reports "I only have MCP tools" and refuses the client's Write.
   const policy = toolPolicyPrompt(opts.body, opts.tools);
   if (policy.trim()) systems.push(policy.trim());
+  const clientSystem = systemPromptFromClient(opts.body);
+  if (clientSystem.trim()) systems.push(clientSystem.trim());
   if (!systems.length) systems.push(DEFAULT_SYSTEM);
   await pushRoot(blobs, rootIds, rootClientSystemText(systems.join("\n\n")));
 

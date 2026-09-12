@@ -33,11 +33,9 @@ import { CloudChatError } from "./cloud_errors.ts";
 import { cloudApiKeyFromHeaders } from "./cloud_agents.ts";
 import { credentialFingerprint } from "./auth.ts";
 import {
-  anthropicToolsToCursor,
   extractFastMode,
   extractReasoningEffort,
   flattenContent,
-  openaiToolsToCursor,
   toAnthropicError,
   toAnthropicUsage,
   toOpenAIUsage,
@@ -284,6 +282,8 @@ export type CustomToolSendOpts = {
   blobs?: Map<string, string>;
   resume?: boolean;
   customSystemPrompt?: string;
+  /** This HTTP request's client tools — do not freeze the first create() catalog. */
+  customTools?: SdkCustomToolMap;
 };
 
 export type CustomToolAgentHandle = {
@@ -455,19 +455,29 @@ function foldAnthropicReasoningEffort(body: Record<string, unknown>): void {
   else body.reasoning_effort = "xhigh";
 }
 
+function offeredToolsForFingerprint(tools: CustomToolDef[]) {
+  return tools.map((t) => ({
+    name: t.openaiName,
+    description: t.description,
+    parameters: t.inputSchema,
+  }));
+}
+
 async function sessionFpForCustomTools(
   body: Record<string, unknown>,
   protocol: "openai" | "anthropic",
+  offered: CustomToolDef[],
 ): Promise<string> {
   const messages = Array.isArray(body.messages) ? body.messages : [];
+  const cursorTools = offeredToolsForFingerprint(offered);
   if (protocol === "anthropic") {
     foldAnthropicReasoningEffort(body);
-    return computeAgentRunFp(body, anthropicToolsToCursor(body.tools), {
+    return computeAgentRunFp(body, cursorTools, {
       foldSystem: flattenContent(body.system),
       rawMessages: messages,
     });
   }
-  return computeAgentRunFp(body, openaiToolsToCursor(body.tools), { rawMessages: messages });
+  return computeAgentRunFp(body, cursorTools, { rawMessages: messages });
 }
 
 function readEnv(name: string): string | undefined {
@@ -551,7 +561,7 @@ async function startCustomToolTurn(opts: {
     throw new CloudChatError("SESSION_MODE=random cannot park customTools.execute across turns.", 400);
   }
   const protocol = opts.protocol ?? "openai";
-  const sessionFp = await sessionFpForCustomTools(opts.body, protocol);
+  const sessionFp = await sessionFpForCustomTools(opts.body, protocol, opts.tools);
   const computedIds = agentRunIds(tenant, sessionFp);
   const session = upsertClientToolSession(tenant, sessionFp, opts.tools);
   const messages = Array.isArray(opts.body.messages) ? opts.body.messages : [];
@@ -638,6 +648,7 @@ async function startCustomToolTurn(opts: {
   const deltas = createTextDeltaHub();
   const run = await agent.send(spliced.prompt, {
     ...(images.length ? { images } : {}),
+    customTools,
     resume: spliced.resume,
     blobs: spliced.blobs,
     // AgentService follow-ups reject a missing field (`Conversation state is

@@ -41,6 +41,16 @@ test("openai tools map to custom tool names and schemas", () => {
   assert.equal(sanitizeCustomToolName("foo.bar"), "foo_bar");
 });
 
+test("openai custom/mcp tool payloads still park as client tools", () => {
+  const tools = openaiToolsToCustom([
+    { type: "custom", name: "Write", description: "write a file", input_schema: { type: "object", properties: { path: { type: "string" } } } },
+    { type: "mcp", name: "lookup", description: "mcp lookup" },
+    { type: "web_search_preview" },
+  ]);
+  assert.deepEqual(tools.map((t) => t.openaiName), ["Write", "lookup"]);
+  assert.equal(tools[0]?.inputSchema.properties && typeof tools[0].inputSchema.properties, "object");
+});
+
 test("anthropic custom tools map the same way", () => {
   const tools = anthropicToolsToCustom([{ name: "lookup", description: "d", input_schema: { type: "object", properties: {} } }]);
   assert.equal(tools[0]?.name, "lookup");
@@ -57,6 +67,18 @@ test("tool policy requires a named tool", () => {
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "lookup" } }]);
   const text = toolPolicyPrompt({ tool_choice: { type: "function", function: { name: "lookup" } } }, tools);
   assert.match(text, /MUST call the tool named lookup/);
+});
+
+test("tool policy says listed Write/Edit/Bash are available", () => {
+  const tools = openaiToolsToCustom([
+    { type: "function", function: { name: "Write" } },
+    { type: "custom", name: "Edit" },
+    { type: "function", function: { name: "Bash" } },
+  ]);
+  const text = toolPolicyPrompt({ tool_choice: "auto" }, tools);
+  assert.match(text, /Client tools available this turn: Write, Edit, Bash/);
+  assert.match(text, /do not say they are unavailable/);
+  assert.match(text, /Native Cursor Edit\/Write\/Bash/);
 });
 
 test("lastTurnIsToolResult and extractClientToolResults", () => {

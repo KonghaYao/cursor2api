@@ -122,6 +122,17 @@ test("openaiProviderDefinedTools splits non-function tools", () => {
   assert.equal(openaiProviderDefinedTools(tools)[0]?.type, "web_search_preview");
 });
 
+test("openaiToolsToCursor keeps custom and mcp named tools", () => {
+  assert.deepEqual(
+    openaiToolsToCursor([
+      { type: "custom", name: "Write" },
+      { type: "mcp", name: "lookup" },
+      { type: "web_search_preview" },
+    ]).map((t) => t.name),
+    ["Write", "lookup"],
+  );
+});
+
 test("cursorBodyFromClient applies json_object response_format", () => {
   const body = cursorBodyFromClient(
     { model: "composer-2.5", response_format: { type: "json_object" } },

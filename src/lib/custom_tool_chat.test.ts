@@ -1335,6 +1335,99 @@ test("in-repo host: three sequential MCP parks then text; resume splices convers
   assert.equal(duplexSentCancel(duplexes[3]!), false);
 });
 
+test("reused handle still offers Write/Edit/Bash on the next Run", async () => {
+  const duplexes: ChatInteractiveDuplex[] = [];
+  const openRun: OpenAgentRun = async () => {
+    const duplex = new ChatInteractiveDuplex();
+    duplexes.push(duplex);
+    duplex.onSend = (message) => {
+      if (!field(message, "runRequest")) return;
+      duplex.push({ interactionUpdate: { textDelta: { text: "ok" } } });
+      duplex.push({ interactionUpdate: { turnEnded: {} } });
+    };
+    return duplex;
+  };
+  setCustomToolAgentHostForTests(
+    createSdkAgentHost({
+      openRun,
+      exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+    }),
+  );
+  const catalog = [
+    { type: "custom" as const, name: "Write", description: "write a file" },
+    { type: "function" as const, function: { name: "Edit" } },
+    { type: "function" as const, function: { name: "Bash" } },
+  ];
+  const tools = openaiToolsToCustom(catalog);
+  const headers = new Headers({ authorization: "Bearer crsr_test" });
+  const kv = createMemoryKv();
+  const user = { role: "user", content: "edit the file" };
+
+  const first = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [user], tools: catalog },
+    tools,
+    kv,
+  });
+  assert.equal(first.status, 200);
+  const body1 = await first.json();
+  const mcpNames = (duplex: ChatInteractiveDuplex) =>
+    ((duplexRunRequest(duplex)?.mcpTools as { mcpTools?: Array<{ toolName: string }> })?.mcpTools || []).map((t) => t.toolName);
+  assert.deepEqual(mcpNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
+
+  const turn2 = [user, { role: "assistant", content: "ok" }, { role: "user", content: "again" }];
+  const second = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", tools: catalog, messages: turn2 },
+    tools,
+    kv,
+  });
+  assert.equal(second.status, 200);
+  const body2 = await second.json();
+  assert.equal(body2.conversation_id, body1.conversation_id);
+  assert.equal(duplexes.length, 2);
+  assert.deepEqual(mcpNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
+  const spliced = await spliceConversationFromClient({ body: { messages: turn2, tools: catalog }, tools, messages: turn2 });
+  const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
+  assert.match(roots, /Client tools available this turn: Write, Edit, Bash/);
+  assert.match(roots, /do not say they are unavailable/);
+  assert.ok(roots.indexOf("Client tools available this turn") < roots.indexOf("edit the file"));
+});
+
+test("dropping Write from the offered catalog starts a new AgentService conversation", async () => {
+  setCustomToolAgentHostForTests({
+    async create() {
+      return {
+        agentId: "agent-tools-fp",
+        async send() {
+          return { wait: async () => ({ text: "ok" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const writeCatalog = [{ type: "custom" as const, name: "Write" }, { type: "function" as const, function: { name: "lookup" } }];
+  const lookupOnly = [{ type: "function" as const, function: { name: "lookup" } }];
+  const headers = new Headers({ authorization: "Bearer crsr_test" });
+  const kv = createMemoryKv();
+  const user = { role: "user", content: "hi" };
+  const first = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [user], tools: writeCatalog },
+    tools: openaiToolsToCustom(writeCatalog),
+    kv,
+  });
+  const second = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [user, { role: "assistant", content: "ok" }, { role: "user", content: "next" }], tools: lookupOnly },
+    tools: openaiToolsToCustom(lookupOnly),
+    kv,
+  });
+  const body1 = await first.json();
+  const body2 = await second.json();
+  assert.notEqual(body2.conversation_id, body1.conversation_id);
+});
+
 test("OpenAI JSON maps AgentService resource_exhausted to HTTP 429", async () => {
   setCustomToolAgentHostForTests({
     async create() {

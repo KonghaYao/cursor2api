@@ -29,8 +29,11 @@ test("first shot puts system in a model-visible root and user in the action prom
   assert.doesNotMatch(spliced.prompt, /<system>/);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
   assert.match(roots, /"role":"user"/);
-  assert.match(roots, /<system>\\nbe brief/);
+  assert.match(roots, /<system>/);
+  assert.match(roots, /be brief/);
   assert.match(roots, /get_weather/);
+  assert.match(roots, /Client tools available this turn/);
+  assert.ok(roots.indexOf("Client tools available this turn") < roots.indexOf("be brief"));
   assert.doesNotMatch(roots, /"role":"system"/);
   assert.doesNotMatch(roots, /weather in tokyo/);
   const ids = spliced.conversationState.rootPromptMessagesJson as string[];

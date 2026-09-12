@@ -102,6 +102,22 @@ function asSchema(raw: unknown): Record<string, unknown> {
   return { type: "object", properties: {} };
 }
 
+/** Provider-defined OpenAI types that are not client-executable function tools. */
+const SKIP_OPENAI_TOOL_TYPES = new Set([
+  "web_search",
+  "web_search_preview",
+  "file_search",
+  "computer",
+  "computer_use",
+  "code_interpreter",
+  "image_generation",
+]);
+
+function openaiToolRecordName(rec: Record<string, unknown>): string {
+  const fn = rec.function && typeof rec.function === "object" ? (rec.function as Record<string, unknown>) : rec;
+  return String(fn.name || rec.name || rec.server_label || rec.serverLabel || "").trim();
+}
+
 export function openaiToolsToCustom(tools: unknown): CustomToolDef[] {
   if (!Array.isArray(tools)) return [];
   const used = new Set<string>();
@@ -110,9 +126,9 @@ export function openaiToolsToCustom(tools: unknown): CustomToolDef[] {
     if (!t || typeof t !== "object") continue;
     const rec = t as Record<string, unknown>;
     const type = String(rec.type || "function").toLowerCase();
-    if (type && type !== "function" && type !== "custom") continue;
+    if (SKIP_OPENAI_TOOL_TYPES.has(type)) continue;
     const fn = (rec.function && typeof rec.function === "object" ? rec.function : rec) as Record<string, unknown>;
-    const openaiName = String(fn.name || rec.name || "").trim();
+    const openaiName = openaiToolRecordName(rec);
     if (!openaiName) continue;
     let name = sanitizeCustomToolName(openaiName);
     let n = 2;
@@ -168,11 +184,21 @@ export function clientToolsDisabled(body: Record<string, unknown>): boolean {
   return false;
 }
 
+export function customToolsInstruction(tools: { name?: string; openaiName?: string }[]): string {
+  const names = tools.map((t) => t.openaiName || t.name || "").filter(Boolean);
+  if (!names.length) return "Call listed custom tools via MCP.";
+  return [
+    `Client tools available this turn: ${names.join(", ")}.`,
+    "Call them by those exact names through MCP custom-user-tools.",
+    "Native Cursor Edit/Write/Bash/Shell/Read/Grep are disabled in this runtime.",
+    "If Write, Edit, StrReplace, Shell, Bash, Read, or similar names are listed, you have them — do not say they are unavailable.",
+  ].join(" ");
+}
+
 export function toolPolicyPrompt(body: Record<string, unknown>, tools: CustomToolDef[]): string {
   if (!tools.length) return "";
-  const names = tools.map((t) => t.openaiName).join(", ");
   const extra: string[] = [
-    `You may call these custom tools (in-process callbacks): ${names}.`,
+    customToolsInstruction(tools),
     "When a listed tool applies, call it instead of only describing the steps in prose.",
   ];
   const choice = body.tool_choice ?? body.toolChoice;

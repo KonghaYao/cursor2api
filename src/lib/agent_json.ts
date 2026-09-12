@@ -205,8 +205,20 @@ export function execIds(exec: JsonObject): { id: unknown; execId: unknown } {
   };
 }
 
+function mcpClientToolInstructions(tools: CustomToolSpec[]): string {
+  const names = tools.map((t) => t.name).filter(Boolean);
+  if (!names.length) return "Call listed custom tools via MCP.";
+  return [
+    `Client tools available this turn: ${names.join(", ")}.`,
+    "Call them by those exact names through MCP custom-user-tools.",
+    "Native Cursor Edit/Write/Bash/Shell/Read/Grep are disabled in this runtime.",
+    "If Write, Edit, StrReplace, Shell, Bash, Read, or similar names are listed, you have them — do not say they are unavailable.",
+  ].join(" ");
+}
+
 export function mcpStateResult(id: unknown, execId: unknown, tools: CustomToolSpec[]): JsonObject {
   const defs = mcpToolDefinitions(tools);
+  const instructions = mcpClientToolInstructions(tools);
   return execReply(id, execId, {
     mcpStateExecResult: {
       success: {
@@ -220,7 +232,7 @@ export function mcpStateResult(id: unknown, execId: unknown, tools: CustomToolSp
               {
                 serverName: CUSTOM_USER_TOOLS_SERVER,
                 serverIdentifier: CUSTOM_USER_TOOLS_SERVER,
-                instructions: "In-process OpenAI/Anthropic function tools offered through GetMcpTools / CallMcpTool.",
+                instructions,
               },
             ],
           },
@@ -252,7 +264,7 @@ export function requestContextResult(id: unknown, execId: unknown, opts: { cwd: 
             {
               serverName: CUSTOM_USER_TOOLS_SERVER,
               serverIdentifier: CUSTOM_USER_TOOLS_SERVER,
-              instructions: "Call listed custom tools via MCP.",
+              instructions: mcpClientToolInstructions(opts.tools),
             },
           ],
           webSearchEnabled: false,

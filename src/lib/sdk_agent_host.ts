@@ -113,14 +113,13 @@ export function createSdkAgentHost(opts?: {
         reasoningEffort: createOpts.reasoningEffort,
       });
       const cwd = createOpts.cwd || readEnv("GATEWAY_AGENT_CWD") || "/tmp";
-      const tools = specsFromCustomTools(createOpts.customTools);
       const blobs = new Map<string, string>();
       let conversationState: JsonObject | undefined = createOpts.conversationState;
       let closed = false;
 
       const handle: CustomToolAgentHandle = {
         agentId,
-        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void; signal?: AbortSignal; conversationState?: JsonObject; blobs?: Map<string, string>; resume?: boolean; customSystemPrompt?: string }) {
+        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void; signal?: AbortSignal; conversationState?: JsonObject; blobs?: Map<string, string>; resume?: boolean; customSystemPrompt?: string; customTools?: SdkCustomToolMap }) {
           if (closed) throw new Error("agent is closed");
           const abort = new AbortController();
           const onClientAbort = () => abort.abort();
@@ -133,6 +132,8 @@ export function createSdkAgentHost(opts?: {
             for (const [id, data] of sendOpts.blobs) blobs.set(id, data);
           }
           if (sendOpts?.conversationState) conversationState = sendOpts.conversationState;
+          const customTools = sendOpts?.customTools ?? createOpts.customTools;
+          const tools = specsFromCustomTools(customTools);
           const run = runTurn({
             openRun,
             accessToken,
@@ -146,7 +147,7 @@ export function createSdkAgentHost(opts?: {
             onDelta: sendOpts?.onDelta,
             signal: abort.signal,
             tools,
-            customTools: createOpts.customTools,
+            customTools,
             blobs,
             conversationState,
             resume: Boolean(sendOpts?.resume),

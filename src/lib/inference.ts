@@ -557,20 +557,33 @@ function applyPromptCache(messages: CursorMessage[]): CursorMessage[] {
   return out;
 }
 
+const SKIP_OPENAI_TOOL_TYPES = new Set([
+  "web_search",
+  "web_search_preview",
+  "file_search",
+  "computer",
+  "computer_use",
+  "code_interpreter",
+  "image_generation",
+]);
+
 export function openaiToolsToCursor(tools: unknown): CursorTool[] {
   if (!Array.isArray(tools)) return [];
   return tools
     .map((t) => {
       const rec = t as Record<string, unknown>;
       const type = String(rec?.type || "function").toLowerCase();
-      if (type && type !== "function") return null;
-      const fn = rec?.function || t;
-      const fnRec = fn as Record<string, unknown>;
-      if (!fnRec?.name) return null;
+      if (SKIP_OPENAI_TOOL_TYPES.has(type)) return null;
+      const fn = (rec?.function && typeof rec.function === "object" ? rec.function : rec) as Record<string, unknown>;
+      const name = String(fn?.name || rec?.name || rec?.server_label || rec?.serverLabel || "").trim();
+      if (!name) return null;
       return {
-        name: String(fnRec.name),
-        description: String(fnRec.description || ""),
-        parameters: (fnRec.parameters as JsonObject) || { type: "object", properties: {} },
+        name,
+        description: String(fn.description || rec.description || ""),
+        parameters: (fn.parameters || fn.input_schema || fn.inputSchema || rec.parameters || rec.input_schema || rec.inputSchema || {
+          type: "object",
+          properties: {},
+        }) as JsonObject,
       };
     })
     .filter((t): t is CursorTool => t != null);
