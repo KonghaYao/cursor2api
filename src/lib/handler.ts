@@ -19,17 +19,8 @@ class RequestInputError extends Error {
   }
 }
 
-const ANTHROPIC_MAX_BODY_BYTES = 32 * 1024 * 1024;
-
-async function readJson(request: Request, maxBytes?: number): Promise<Record<string, unknown>> {
-  const declaredLength = Number(request.headers.get("content-length"));
-  if (maxBytes != null && Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-    throw new RequestInputError("Request exceeds the 32 MB Messages API limit", 413);
-  }
+async function readJson(request: Request): Promise<Record<string, unknown>> {
   const text = await request.text();
-  if (maxBytes != null && new TextEncoder().encode(text).byteLength > maxBytes) {
-    throw new RequestInputError("Request exceeds the 32 MB Messages API limit", 413);
-  }
   if (!text) return {};
   try {
     const parsed = JSON.parse(text) as unknown;
@@ -289,7 +280,7 @@ export async function handleGatewayRequest(request: Request, ctx: GatewayCtx): P
     }
 
     if (method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages")) {
-      const body = await readJson(request, ANTHROPIC_MAX_BODY_BYTES);
+      const body = await readJson(request);
       validateAnthropicRequest(body);
       const unsupported = rejectUnsupportedChatOptions(body);
       if (unsupported) return unsupported;
