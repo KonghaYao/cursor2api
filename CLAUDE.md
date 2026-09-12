@@ -156,6 +156,61 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 
 ---
 
+## 2026-09-12：跟进枪丢失 Write/Edit/Bash（模型报「只有 MCP」）
+
+台账：**INC-2026-09-12**。同一 Cursor Agent 对话：上一轮已经成功 `Write` → `Read` → `rm`，下一轮模型说当前会话没有 Edit / Write / Bash，只有 MCP 类工具，并声称「这不是网关逻辑问题，是当前 Agent 暴露给我的 tool 列表变了」。**是网关。** 不要为这句话去开默认 shell/edit toolset。
+
+### 现象
+
+| 轮次 | 表现 |
+|------|------|
+| 上一轮 | 客户端写入类工具可 park，Write / Read / rm 跑通 |
+| 这一轮 | 模型自述只有 MCP 家族；拒绝再调 Edit / Write / Bash |
+
+`conversation_id` 往往仍稳定。假 host 的三轮 `get_weather→lookup→search` **测不出** 这条。
+
+### 根因（三步）
+
+1. **会话 fp 和实际挂出的工具不是同一张表。** `agentRunFp` 走 `openaiToolsToCursor(body.tools)`（只认 `type: function`），park 走 `openaiToolsToCustom`（含 `type: custom`）。Cursor Agent 的 Write/Edit 一旦是 custom，会进 `mcpTools` 却不进会话键；Deno isolate 一跳就按「没这些工具」重建 Run。
+2. **`existing.agent` 冻住第一枪 `customTools`。** 跟进枪复用 handle 时仍用 `create()` 那一枪的目录，本枪客户端 tools 变了也带不上去；第一枪没有 Write 时永远加不回去。
+3. **工具策略埋在 Cursor Agent 大 system 后面。** AgentService 只开 MCP 家族；Composer harness 仍讲原生 Edit/Write/Bash。政策不够靠前时，模型按 harness 报「我没有这些工具」，即使 `mcpTools` 里已经有 `Write`。
+
+客户端的 Write/Edit/Bash **本来就是** 合成 MCP `custom-user-tools`，不是上游默认 toolset。模型说「只有 MCP」不等于客户端没把 Write 打进来。
+
+### 正确做法
+
+| 项 | 策略 |
+|----|------|
+| 会话 fp | 用**本枪实际 offered** 的 `opts.tools`，不要再解析一遍 `body.tools` 的子集 |
+| 每一枪 Run | `send()` 带当前 `customTools`；不要冻 `create()` 目录 |
+| 工具形状 | `type: custom` / 扁平 function / 带 name 的 mcp 都进客户端工具；`web_search_preview` 等 provider 类型仍跳过 |
+| roots 政策 | **放在** client system **前面**；写明 listed Write/Edit/Bash **就是** 可用的客户端工具，不要说它们 unavailable |
+| 默认 toolset | 仍然禁止。不要为了这句话去开 shell/edit |
+
+### 验收
+
+单测必须覆盖：
+
+- 复用 handle 的下一枪 `mcpTools` 仍含 Write / Edit / Bash（含 `type: custom` 的 Write）
+- 从目录里拿掉 Write → `conversation_id` 变（fp 跟 offered 走）
+- roots 里政策在 client system 之前，且含「do not say they are unavailable」
+
+```text
+reused handle still offers Write/Edit/Bash on the next Run
+dropping Write from the offered catalog starts a new AgentService conversation
+tool policy says listed Write/Edit/Bash are available
+```
+
+### 约束
+
+| 内容 | 策略 |
+|------|------|
+| 跟进枪 Write 消失 | 先对本枪 `mcpTools` + roots 政策，不要信「Agent 换了 tool 列表」 |
+| 开 shell/edit | **禁止**。写入类工具走客户端 park |
+| `type: custom` | 必须进 offered 目录和 fp，不能只进其中一个 |
+
+---
+
 ## 2026-09-10：conversationState 两头都错（空 turns 抹上文 / 省略字段被拒）
 
 台账：**INC-2026-09-10**。先是 `b97f6d7` 每枪自拼 state 带空 `turns: []`，三句用户话忘上文。接着 `5c5218e` **省略**跟进枪的 `conversationState`，短 system 探针能绿，**Cursor Agent（~10k system）跟进枪直接 `invalid_argument: Conversation state is required`**。

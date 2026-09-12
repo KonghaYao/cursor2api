@@ -102,6 +102,7 @@ curl -sS https://cursor2api.freetavily.deno.net/v1/chat/completions \
 
 | 日期 | 说明 | 状态 |
 |------|------|------|
+| 2026-09-12 | 同一对话上一轮 Write/Read 还能跑，下一轮模型说没有 Edit/Write/Bash、只剩 MCP。是网关跟进枪工具目录和政策不一致，不是客户端自己换了 tool 列表 | 已修 |
 | 2026-09-09 | Cursor 把旧版 `InferenceService/Stream` 整条删了；网关聊天只走 AgentService，该路径已从入口移除 | 已移除 |
 | 2026-09-01 | 会话 id 每轮随机，长对话缓存全灭 | 已修 |
 | 2026-09-05 | 当天全局缓存命中略低于目标，本身不是缓存坏了 | 已关闭 |
