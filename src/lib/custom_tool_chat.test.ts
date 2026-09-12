@@ -1511,6 +1511,7 @@ test("reused handle still offers Write/Edit/Bash on the next Run", async () => {
   const policyRoot = utf8FromBlobData(spliced.blobs.get(String(ids[0]))!);
   const systemRoot = utf8FromBlobData(spliced.blobs.get(String(ids[1]))!);
   assert.match(policyRoot, /Tools: Write, Edit, Bash/);
+  assert.match(policyRoot, /File changes require Write or Edit/);
   assert.doesNotMatch(policyRoot, /MCP|custom-user-tools|unavailable|tool list changed|Native /i);
   assert.doesNotMatch(policyRoot, /You are Cursor Grok/);
   assert.match(systemRoot, /You are Cursor Grok/);
@@ -1610,6 +1611,7 @@ test("Write park then a later user turn still offers Write and keeps the call in
   const policyRoot = utf8FromBlobData(spliced.blobs.get(String(ids[0]))!);
   const systemRoot = utf8FromBlobData(spliced.blobs.get(String(ids[1]))!);
   assert.match(policyRoot, /Tools: Write, Edit, Bash/);
+  assert.match(policyRoot, /File changes require Write or Edit/);
   assert.doesNotMatch(policyRoot, /MCP|custom-user-tools|unavailable|tool list changed|Native /i);
   assert.doesNotMatch(policyRoot, /You are Cursor Grok/);
   assert.match(systemRoot, /You are Cursor Grok/);

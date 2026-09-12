@@ -215,12 +215,25 @@ export function clientToolsDisabled(body: Record<string, unknown>): boolean {
   return false;
 }
 
+function listedToolNames(tools: { name?: string; openaiName?: string }[]): string[] {
+  return tools.map((t) => t.openaiName || t.name || "").filter(Boolean);
+}
+
+function catalogHasWriter(names: string[]): boolean {
+  return names.some((n) => /^(Write|Edit|StrReplace)$/i.test(n));
+}
+
 export function customToolsInstruction(tools: { name?: string; openaiName?: string }[]): string {
-  const names = tools.map((t) => t.openaiName || t.name || "").filter(Boolean);
+  const names = listedToolNames(tools);
   if (!names.length) return "";
-  // Catalog only. Mentions of MCP / custom-user-tools / "do not say tools
-  // are missing" make Composer narrate protocol anxiety instead of calling.
-  return `Tools: ${names.join(", ")}.`;
+  // Short catalog. Do not mention MCP / custom-user-tools / missing tools —
+  // that text becomes protocol anxiety. One apply-edits line is enough:
+  // Cursor Agent otherwise Read/Greps forever and narrates the change.
+  const parts = [`Tools: ${names.join(", ")}.`];
+  if (catalogHasWriter(names)) {
+    parts.push("File changes require Write or Edit. Do not finish after only Read or Grep.");
+  }
+  return parts.join(" ");
 }
 
 export function toolPolicyPrompt(body: Record<string, unknown>, tools: CustomToolDef[]): string {
