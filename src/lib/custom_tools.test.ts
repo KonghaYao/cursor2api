@@ -95,6 +95,7 @@ test("tool policy says listed Write/Edit/Bash are available", () => {
   assert.match(text, /Client tools available this turn: Write, Edit, Bash/);
   assert.match(text, /Do not say they are unavailable/);
   assert.match(text, /do not claim you only have MCP-family tools/);
+  assert.match(text, /Never write tool calls as chat text/);
   assert.doesNotMatch(text, /Native Cursor Edit\/Write\/Bash are disabled/);
 });
 

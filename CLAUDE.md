@@ -192,7 +192,7 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 单测必须覆盖：
 
 - 复用 handle 的下一枪 `mcpTools` **以及** `requestContext` / `mcpState` 仍含 Write / Edit / Bash（含 `type: custom` 的 Write）
-- Write park → tool 结果 → 再跟进 user 后，roots 仍有 Write 的 `[Tool Call]`，政策是**独立 first root**（不要和 ~10k Cursor Agent system 拼进同一个 blob）
+- Write park → tool 结果 → 再跟进 user 后，roots 仍有 Write 已调用的历史（**不要**写成 `[Tool Call]` / `[tool_call]` 伪协议，Composer 会照抄成正文），政策是**独立 first root**
 - 从目录里拿掉 Write → `conversation_id` 变（fp 跟 offered 走）
 - 政策写明 listed Write/Edit/Bash **就是** 可用的客户端工具；**不要**写「Native Write is disabled」（Composer 会据此报「我没有 Write」）
 
@@ -562,7 +562,7 @@ python3 scripts/analyze_team_usage.py team-usage-events-*.csv -o reports/usage-<
 | 证据 | Agent 日志「tool 列表变了」；根因在网关：会话 fp 用 `openaiToolsToCursor`（丢掉 `type: custom`），实际 park 用 `openaiToolsToCustom`；`existing.agent` 冻住第一枪 `customTools`；工具策略埋在大 system 后，Composer 按 harness 报「只有 MCP」 |
 | 根因结论 | **网关**：跟进枪 offered tools 与会话键 / Run `mcpTools` / 模型可见政策不一致。不是「当前 Agent 自己换了 tool 列表」就能结案。 |
 | 状态 | **mitigated**：fp 用本枪 `opts.tools`；每枪 `send()` 带当前 customTools；`type: custom` / 扁平 function / 带 name 的 mcp 都进客户端工具；政策放 roots 最前并写明 listed Write/Edit/Bash 可用。**不要**为了这句话去开默认 shell/edit toolset。 |
-| 续记 | 2026-09-12：单测 `reused handle still offers Write/Edit/Bash on the next Run`。同日稍后对抗：`mcpTools` 已带 Write 时模型仍报「只有 MCP」——政策被拼进同一条 ~10k system blob，且 `replayMessages` 丢掉 assistant `tool_calls`；「Native Edit/Write/Bash are disabled」会被 Composer 理解成「我没有 Write」。政策改为独立 first root，roots 回放 `[Tool Call]`，并去掉那句 disabled。`parseMcpArgs` 对已带 `custom-user-tools-` 前缀的 `toolName` 也要剥掉，否则 `get_mcp_tools` 回放会 `Unknown custom tool`。 |
+| 续记 | 2026-09-12：单测 `reused handle still offers Write/Edit/Bash on the next Run`。同日稍后对抗：`mcpTools` 已带 Write 时模型仍报「只有 MCP」——政策被拼进同一条 ~10k system blob，且 `replayMessages` 丢掉 assistant `tool_calls`；「Native Edit/Write/Bash are disabled」会被 Composer 理解成「我没有 Write」。政策改为独立 first root，roots 回放「Already invoked client tool …」（**禁止** `[Tool Call]` / `[tool_call]` 伪协议，Composer 会照抄成正文而不走 MCP）。`parseMcpArgs` 对已带 `custom-user-tools-` 前缀的 `toolName` 也要剥掉，否则 `get_mcp_tools` 回放会 `Unknown custom tool`。 |
 
 ### 成本归因（简表）
 

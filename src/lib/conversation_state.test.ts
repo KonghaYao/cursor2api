@@ -68,8 +68,8 @@ test("tool follow-up puts latest results in userMessageAction, not empty resume"
   assert.match(spliced.prompt, /22/);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
   assert.match(roots, /weather in tokyo then humidity then news/);
-  assert.match(roots, /\[Tool Call\]/);
-  assert.match(roots, /name: get_weather/);
+  assert.match(roots, /Already invoked client tool get_weather/);
+  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]/);
   assert.doesNotMatch(roots, /"temp":22/);
 });
 
@@ -106,8 +106,9 @@ test("three sequential user tool rounds keep the full catalog history in roots",
   assert.match(roots, /tokyo weather, humidity, then a headline/);
   assert.match(roots, /call_wx/);
   assert.match(roots, /call_hum/);
-  assert.match(roots, /name: get_weather/);
-  assert.match(roots, /name: lookup/);
+  assert.match(roots, /Already invoked client tool get_weather/);
+  assert.match(roots, /Already invoked client tool lookup/);
+  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]/);
   assert.match(roots, /22/);
   assert.match(roots, /40/);
   assert.doesNotMatch(roots, /rain later/);
@@ -206,12 +207,14 @@ test("policy stays its own first root ahead of a large Cursor Agent system", asy
   assert.match(policyRoot, /Client tools available this turn: Write, Edit, Bash/);
   assert.match(policyRoot, /must not say they are unavailable|Do not say they are unavailable/);
   assert.match(policyRoot, /do not claim you only have MCP-family tools/);
+  assert.match(policyRoot, /Never write tool calls as chat text/);
   assert.doesNotMatch(policyRoot, /Native Cursor Edit\/Write\/Bash/);
   assert.doesNotMatch(policyRoot, /You are Cursor Grok/);
   assert.match(systemRoot, /You are Cursor Grok/);
   assert.doesNotMatch(systemRoot, /Client tools available this turn/);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
-  assert.match(roots, /name: Write/);
+  assert.match(roots, /Already invoked client tool Write/);
+  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]/);
   assert.match(roots, /wrote a\.ts/);
   assert.doesNotMatch(roots, /edit again/);
 });

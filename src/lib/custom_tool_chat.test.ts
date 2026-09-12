@@ -573,7 +573,8 @@ test("park_miss with a full transcript splices tool history into conversationSta
   assert.match(roots, /weather in tokyo/);
   assert.match(roots, /call_1/);
   assert.match(roots, /22/);
-  assert.match(roots, /\[Tool Call\][\s\S]*call_id: call_2/);
+  assert.match(roots, /Already invoked client tool lookup \(id call_2\)/);
+  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]/);
   assert.doesNotMatch(roots, /humidity/);
 });
 
@@ -1512,6 +1513,7 @@ test("reused handle still offers Write/Edit/Bash on the next Run", async () => {
   assert.match(policyRoot, /Client tools available this turn: Write, Edit, Bash/);
   assert.match(policyRoot, /Do not say they are unavailable/);
   assert.match(policyRoot, /do not claim you only have MCP-family tools/);
+  assert.match(policyRoot, /Never write tool calls as chat text/);
   assert.doesNotMatch(policyRoot, /You are Cursor Grok/);
   assert.match(systemRoot, /You are Cursor Grok/);
   assert.doesNotMatch(systemRoot, /Client tools available this turn/);
@@ -1613,7 +1615,8 @@ test("Write park then a later user turn still offers Write and keeps the call in
   assert.doesNotMatch(policyRoot, /You are Cursor Grok/);
   assert.match(systemRoot, /You are Cursor Grok/);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
-  assert.match(roots, /name: Write/);
+  assert.match(roots, /Already invoked client tool Write/);
+  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]/);
   assert.match(roots, /wrote a\.ts/);
   assert.doesNotMatch(roots, /edit again/);
 });

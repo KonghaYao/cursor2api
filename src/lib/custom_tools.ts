@@ -222,7 +222,8 @@ export function customToolsInstruction(tools: { name?: string; openaiName?: stri
     `Client tools available this turn: ${names.join(", ")}.`,
     "Call them by those exact names through MCP custom-user-tools.",
     "Listed Write, Edit, StrReplace, Shell, Bash, Read, or similar names ARE those client tools — they are not missing.",
-    "Do not say they are unavailable, and do not claim you only have MCP-family tools when these names are listed.",
+    "Do not say they are unavailable, do not claim you only have MCP-family tools, and do not say the tool list changed when these names are listed.",
+    "Never write tool calls as chat text or fake tool-call protocol blocks; invoke the listed tools through MCP.",
   ].join(" ");
 }
 

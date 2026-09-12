@@ -212,7 +212,10 @@ function assistantToolCalls(rec: Record<string, unknown>): Array<{ id: string; n
 }
 
 function toolCallRootText(opts: { id: string; name: string; args: string }): string {
-  return ["[Tool Call]", "[tool_call]", `call_id: ${opts.id}`, `name: ${opts.name}`, "arguments:", opts.args].join("\n");
+  // Past tense, no [Tool Call] / [tool_call] markers — Composer copies those
+  // into visible text instead of invoking MCP (16fbae5 regression).
+  void opts.args;
+  return `Already invoked client tool ${opts.name} (id ${opts.id}).`;
 }
 
 function toolNamesById(messages: unknown[]): Map<string, string> {
