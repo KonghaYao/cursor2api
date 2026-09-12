@@ -315,6 +315,15 @@ test("mcp args unwrap protobuf Value JSON and plain JSON", () => {
   assert.equal(parsed?.toolName, "get_weather");
   assert.equal(parsed?.args.city, "Tokyo");
   assert.equal(parsed?.toolCallId, "call_1");
+  const prefixed = parseMcpArgs({
+    mcpArgs: {
+      name: "custom-user-tools-Write",
+      toolName: "custom-user-tools-Write",
+      providerIdentifier: "custom-user-tools",
+      args: { path: { stringValue: "a.ts" } },
+    },
+  });
+  assert.equal(prefixed?.toolName, "Write");
 });
 
 test("mcpSuccessResult is a complete exec client message", () => {

@@ -98,6 +98,43 @@ test("in-repo host parks customTools.execute and finishes after the tool result"
   await agent.close();
 });
 
+test("in-repo host parks Write when mcpArgs toolName is already prefixed", async () => {
+  const tools = openaiToolsToCustom([{ type: "custom", name: "Write" }]);
+  const session = upsertClientToolSession("t", "s-prefixed", tools);
+  const customTools = toSdkCustomTools(session);
+  const duplex = new InteractiveDuplex();
+  duplex.onSend = (message) => {
+    if (field(message, "runRequest", "run_request")) {
+      duplex.push({
+        execServerMessage: {
+          id: 2,
+          execId: "mcp-write",
+          mcpArgs: {
+            name: "custom-user-tools-Write",
+            providerIdentifier: "custom-user-tools",
+            toolName: "custom-user-tools-Write",
+            toolCallId: "call_w",
+            args: { path: { stringValue: "a.ts" } },
+          },
+        },
+      });
+    }
+  };
+  const host = createSdkAgentHost({
+    openRun: async () => duplex,
+    exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+  });
+  const agent = await host.create({ apiKey: "crsr_test", model: "composer-2.5", customTools });
+  const run = await agent.send("write a.ts");
+  const parked = await waitFor(() => session.parked.find((p) => !p.offered));
+  assert.equal(parked?.name, "Write");
+  assert.equal(parked?.args.path, "a.ts");
+  parked!.resolve?.({ content: [{ type: "text", text: "wrote" }] });
+  run.release?.();
+  await run.wait();
+  await agent.close();
+});
+
 test("JWT credentials skip exchange_user_api_key", async () => {
   const jwt = "eyJhbGciOiJub25lIn0.eyJleHAiOjk5OTk5OTk5OTl9.test";
   let exchanged = false;
@@ -476,13 +513,14 @@ test("in-repo host serves spliced rootPromptMessagesJson blobs on getBlob", asyn
   ];
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "get_weather" } }]);
   const spliced = await spliceConversationFromClient({ body: { messages }, tools, messages });
-  const firstId = String((spliced.conversationState.rootPromptMessagesJson as string[])[0]);
+  const rootIds = spliced.conversationState.rootPromptMessagesJson as string[];
+  const systemId = String(rootIds[1] ?? rootIds[0]);
   const duplex = new InteractiveDuplex();
   duplex.onSend = (message) => {
     if (field(message, "runRequest")) {
       assert.equal(Boolean(field(asObject(field(asObject(field(message, "runRequest")), "action")), "userMessageAction")), true);
       assert.equal(Boolean(field(asObject(field(asObject(field(message, "runRequest")), "action")), "resumeAction")), false);
-      duplex.push({ kvServerMessage: { id: 9, getBlobArgs: { blobId: firstId } } });
+      duplex.push({ kvServerMessage: { id: 9, getBlobArgs: { blobId: systemId } } });
       return;
     }
     const kv = asObject(field(message, "kvClientMessage"));

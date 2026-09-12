@@ -15,7 +15,7 @@ import { createMemoryKv } from "./kv.ts";
 import type { CustomToolAgentCreateOpts, CustomToolSendOpts } from "./custom_tool_chat.ts";
 import { createSdkAgentHost } from "./sdk_agent_host.ts";
 import type { AgentDuplex, OpenAgentRun } from "./agent_run.ts";
-import { decodeRootPromptText, spliceConversationFromClient } from "./conversation_state.ts";
+import { decodeRootPromptText, spliceConversationFromClient, utf8FromBlobData } from "./conversation_state.ts";
 
 afterEach(() => {
   customToolsClearForTests();
@@ -251,6 +251,74 @@ test("AgentService conversationId survives an isolate hop via KV", async () => {
   assert.equal(creates[1]?.agentSessionId, creates[0]?.agentSessionId);
   assert.doesNotMatch(prompts[1] || "", /<system>/);
   assert.match(prompts[1] || "", /again/);
+});
+
+test("isolate hop with Write catalog still attaches Write on create and send", async () => {
+  const kv = createMemoryKv();
+  const catalog = [
+    { type: "custom" as const, name: "Write" },
+    { type: "function" as const, function: { name: "Edit" } },
+    { type: "function" as const, function: { name: "Bash" } },
+  ];
+  const tools = openaiToolsToCustom(catalog);
+  const creates: CustomToolAgentCreateOpts[] = [];
+  const sendTools: Array<string[] | undefined> = [];
+  setCustomToolAgentHostForTests({
+    async create(opts) {
+      creates.push(opts);
+      return {
+        agentId: opts.agentSessionId || "agent-hop-write",
+        async send(_prompt, sendOpts) {
+          sendTools.push(Object.keys(sendOpts?.customTools || opts.customTools || {}));
+          return { wait: async () => ({ text: "ok" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const headers = new Headers({ authorization: "Bearer crsr_test" });
+  const user = { role: "user", content: "write a.ts" };
+  const first = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [user], tools: catalog },
+    tools,
+    kv,
+  });
+  assert.equal(first.status, 200);
+  const body1 = await first.json();
+  assert.deepEqual(Object.keys(creates[0]?.customTools || {}), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(sendTools[0], ["Write", "Edit", "Bash"]);
+
+  customToolChatClearForTests();
+  setCustomToolAgentHostForTests({
+    async create(opts) {
+      creates.push(opts);
+      return {
+        agentId: opts.agentSessionId || "agent-hop-write-2",
+        async send(_prompt, sendOpts) {
+          sendTools.push(Object.keys(sendOpts?.customTools || {}));
+          return { wait: async () => ({ text: "ok2" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const second = await handleCustomToolChatCompletions({
+    headers,
+    body: {
+      model: "composer-2.5",
+      tools: catalog,
+      messages: [user, { role: "assistant", content: "ok" }, { role: "user", content: "edit again" }],
+    },
+    tools,
+    kv,
+  });
+  const body2 = await second.json();
+  assert.equal(second.status, 200);
+  assert.equal(body2.conversation_id, body1.conversation_id);
+  assert.equal(creates.length, 2);
+  assert.deepEqual(Object.keys(creates[1]?.customTools || {}), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(sendTools[1], ["Write", "Edit", "Bash"]);
 });
 
 test("same first user reuses AgentService conversation even with different x-session-id", async () => {
@@ -505,7 +573,7 @@ test("park_miss with a full transcript splices tool history into conversationSta
   assert.match(roots, /weather in tokyo/);
   assert.match(roots, /call_1/);
   assert.match(roots, /22/);
-  assert.doesNotMatch(roots, /call_2/);
+  assert.match(roots, /\[Tool Call\][\s\S]*call_id: call_2/);
   assert.doesNotMatch(roots, /humidity/);
 });
 
@@ -1204,6 +1272,53 @@ function duplexSentMcpResult(duplex: ChatInteractiveDuplex): boolean {
   return duplex.sent.some((m) => field(asObject(field(m, "execClientMessage")), "mcpResult", "mcp_result"));
 }
 
+function duplexMcpToolNames(duplex: ChatInteractiveDuplex): string[] {
+  return ((duplexRunRequest(duplex)?.mcpTools as { mcpTools?: Array<{ toolName: string }> })?.mcpTools || []).map(
+    (t) => t.toolName,
+  );
+}
+
+function duplexRequestContextToolNames(duplex: ChatInteractiveDuplex): string[] {
+  for (const message of duplex.sent) {
+    const exec = asObject(field(message, "execClientMessage"));
+    const result = asObject(field(exec, "requestContextResult"));
+    const success = asObject(field(result, "success"));
+    const context = asObject(field(success, "requestContext"));
+    const tools = context?.tools as Array<{ toolName?: string }> | undefined;
+    if (Array.isArray(tools) && tools.length) return tools.map((t) => String(t.toolName || ""));
+  }
+  return [];
+}
+
+function duplexMcpStateToolNames(duplex: ChatInteractiveDuplex): string[] {
+  for (const message of duplex.sent) {
+    const exec = asObject(field(message, "execClientMessage"));
+    const result = asObject(field(exec, "mcpStateExecResult"));
+    const success = asObject(field(result, "success"));
+    const servers = success?.servers as Array<{ tools?: Array<{ toolName?: string }> }> | undefined;
+    const tools = (servers || []).flatMap((s) => s.tools || []);
+    if (tools.length) return tools.map((t) => String(t.toolName || ""));
+  }
+  return [];
+}
+
+function attachCatalogDiscovery(duplex: ChatInteractiveDuplex, onReady: () => void): void {
+  duplex.onSend = (message) => {
+    if (field(message, "runRequest")) {
+      duplex.push({ execServerMessage: { id: 1, execId: "ctx", requestContextArgs: {} } });
+      return;
+    }
+    const exec = asObject(field(message, "execClientMessage"));
+    if (field(exec, "requestContextResult")) {
+      duplex.push({ execServerMessage: { id: 2, execId: "mcp-state", mcpStateExecArgs: {} } });
+      return;
+    }
+    if (field(exec, "mcpStateExecResult")) {
+      onReady();
+    }
+  };
+}
+
 test("in-repo host: three sequential MCP parks then text; resume splices conversationState", async () => {
   const names = ["get_weather", "lookup", "search"];
   const duplexes: ChatInteractiveDuplex[] = [];
@@ -1340,11 +1455,10 @@ test("reused handle still offers Write/Edit/Bash on the next Run", async () => {
   const openRun: OpenAgentRun = async () => {
     const duplex = new ChatInteractiveDuplex();
     duplexes.push(duplex);
-    duplex.onSend = (message) => {
-      if (!field(message, "runRequest")) return;
+    attachCatalogDiscovery(duplex, () => {
       duplex.push({ interactionUpdate: { textDelta: { text: "ok" } } });
       duplex.push({ interactionUpdate: { turnEnded: {} } });
-    };
+    });
     return duplex;
   };
   setCustomToolAgentHostForTests(
@@ -1361,21 +1475,23 @@ test("reused handle still offers Write/Edit/Bash on the next Run", async () => {
   const tools = openaiToolsToCustom(catalog);
   const headers = new Headers({ authorization: "Bearer crsr_test" });
   const kv = createMemoryKv();
+  const harness = `You are Cursor Grok 4.6. Native tools: Read, Write, Edit, Bash.\n${"x".repeat(4000)}`;
+  const system = { role: "system", content: harness };
   const user = { role: "user", content: "edit the file" };
 
   const first = await handleCustomToolChatCompletions({
     headers,
-    body: { model: "composer-2.5", messages: [user], tools: catalog },
+    body: { model: "composer-2.5", messages: [system, user], tools: catalog },
     tools,
     kv,
   });
   assert.equal(first.status, 200);
   const body1 = await first.json();
-  const mcpNames = (duplex: ChatInteractiveDuplex) =>
-    ((duplexRunRequest(duplex)?.mcpTools as { mcpTools?: Array<{ toolName: string }> })?.mcpTools || []).map((t) => t.toolName);
-  assert.deepEqual(mcpNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpToolNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexRequestContextToolNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpStateToolNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
 
-  const turn2 = [user, { role: "assistant", content: "ok" }, { role: "user", content: "again" }];
+  const turn2 = [system, user, { role: "assistant", content: "ok" }, { role: "user", content: "again" }];
   const second = await handleCustomToolChatCompletions({
     headers,
     body: { model: "composer-2.5", tools: catalog, messages: turn2 },
@@ -1386,12 +1502,120 @@ test("reused handle still offers Write/Edit/Bash on the next Run", async () => {
   const body2 = await second.json();
   assert.equal(body2.conversation_id, body1.conversation_id);
   assert.equal(duplexes.length, 2);
-  assert.deepEqual(mcpNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpToolNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexRequestContextToolNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpStateToolNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
   const spliced = await spliceConversationFromClient({ body: { messages: turn2, tools: catalog }, tools, messages: turn2 });
+  const ids = spliced.conversationState.rootPromptMessagesJson as string[];
+  const policyRoot = utf8FromBlobData(spliced.blobs.get(String(ids[0]))!);
+  const systemRoot = utf8FromBlobData(spliced.blobs.get(String(ids[1]))!);
+  assert.match(policyRoot, /Client tools available this turn: Write, Edit, Bash/);
+  assert.match(policyRoot, /Do not say they are unavailable/);
+  assert.match(policyRoot, /do not claim you only have MCP-family tools/);
+  assert.doesNotMatch(policyRoot, /You are Cursor Grok/);
+  assert.match(systemRoot, /You are Cursor Grok/);
+  assert.doesNotMatch(systemRoot, /Client tools available this turn/);
+});
+
+test("Write park then a later user turn still offers Write and keeps the call in roots", async () => {
+  const duplexes: ChatInteractiveDuplex[] = [];
+  const openRun: OpenAgentRun = async () => {
+    const duplex = new ChatInteractiveDuplex();
+    const i = duplexes.length;
+    duplexes.push(duplex);
+    attachCatalogDiscovery(duplex, () => {
+      if (i === 0) {
+        duplex.push({
+          execServerMessage: {
+            id: 3,
+            execId: "mcp-write",
+            mcpArgs: {
+              name: "custom-user-tools-Write",
+              providerIdentifier: "custom-user-tools",
+              toolName: "Write",
+              toolCallId: "call_w",
+              args: { path: { stringValue: "a.ts" } },
+            },
+          },
+        });
+        return;
+      }
+      duplex.push({ interactionUpdate: { textDelta: { text: i === 1 ? "wrote it" : "editing again" } } });
+      duplex.push({ interactionUpdate: { turnEnded: {} } });
+    });
+    return duplex;
+  };
+  setCustomToolAgentHostForTests(
+    createSdkAgentHost({
+      openRun,
+      exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+    }),
+  );
+  const catalog = [
+    { type: "custom" as const, name: "Write", description: "write a file" },
+    { type: "function" as const, function: { name: "Edit" } },
+    { type: "function" as const, function: { name: "Bash" } },
+  ];
+  const tools = openaiToolsToCustom(catalog);
+  const headers = new Headers({ authorization: "Bearer crsr_test" });
+  const kv = createMemoryKv();
+  const harness = `You are Cursor Grok 4.6. Native tools: Read, Write, Edit, Bash.\n${"x".repeat(4000)}`;
+  const system = { role: "system", content: harness };
+  const user = { role: "user", content: "write a.ts" };
+
+  const first = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [system, user], tools: catalog },
+    tools,
+    kv,
+  });
+  const body1 = await first.json();
+  assert.equal(body1.choices[0].finish_reason, "tool_calls");
+  const tc = body1.choices[0].message.tool_calls;
+  assert.equal(tc[0].function.name, "Write");
+  assert.deepEqual(duplexMcpToolNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
+
+  const afterWrite = [
+    system,
+    user,
+    { role: "assistant", content: null, tool_calls: tc },
+    { role: "tool", tool_call_id: tc[0].id, content: "wrote a.ts" },
+  ];
+  const second = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", tools: catalog, messages: afterWrite },
+    tools,
+    kv,
+  });
+  const body2 = await second.json();
+  assert.equal(body2.conversation_id, body1.conversation_id);
+  assert.equal(body2.choices[0].message.content, "wrote it");
+
+  const later = [...afterWrite, { role: "assistant", content: "wrote it" }, { role: "user", content: "edit again" }];
+  const third = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", tools: catalog, messages: later },
+    tools,
+    kv,
+  });
+  const body3 = await third.json();
+  assert.equal(third.status, 200);
+  assert.equal(body3.conversation_id, body1.conversation_id);
+  assert.equal(duplexes.length, 3);
+  assert.deepEqual(duplexMcpToolNames(duplexes[2]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexRequestContextToolNames(duplexes[2]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpStateToolNames(duplexes[2]!), ["Write", "Edit", "Bash"]);
+  const spliced = await spliceConversationFromClient({ body: { messages: later, tools: catalog }, tools, messages: later });
+  const ids = spliced.conversationState.rootPromptMessagesJson as string[];
+  const policyRoot = utf8FromBlobData(spliced.blobs.get(String(ids[0]))!);
+  const systemRoot = utf8FromBlobData(spliced.blobs.get(String(ids[1]))!);
+  assert.match(policyRoot, /Client tools available this turn: Write, Edit, Bash/);
+  assert.doesNotMatch(policyRoot, /You are Cursor Grok/);
+  assert.match(systemRoot, /You are Cursor Grok/);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
-  assert.match(roots, /Client tools available this turn: Write, Edit, Bash/);
-  assert.match(roots, /do not say they are unavailable/);
-  assert.ok(roots.indexOf("Client tools available this turn") < roots.indexOf("edit the file"));
+  assert.match(roots, /name: Write/);
+  assert.match(roots, /wrote a\.ts/);
+  assert.doesNotMatch(roots, /edit again/);
 });
 
 test("dropping Write from the offered catalog starts a new AgentService conversation", async () => {

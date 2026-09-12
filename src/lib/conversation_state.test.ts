@@ -37,7 +37,13 @@ test("first shot puts system in a model-visible root and user in the action prom
   assert.doesNotMatch(roots, /"role":"system"/);
   assert.doesNotMatch(roots, /weather in tokyo/);
   const ids = spliced.conversationState.rootPromptMessagesJson as string[];
-  assert.equal(ids.length, 1);
+  assert.equal(ids.length, 2);
+  const policyRoot = utf8FromBlobData(spliced.blobs.get(String(ids[0]))!);
+  const systemRoot = utf8FromBlobData(spliced.blobs.get(String(ids[1]))!);
+  assert.match(policyRoot, /Client tools available this turn/);
+  assert.doesNotMatch(policyRoot, /be brief/);
+  assert.match(systemRoot, /be brief/);
+  assert.doesNotMatch(systemRoot, /Client tools available this turn/);
   for (const id of ids) assert.ok(spliced.blobs.has(id));
 });
 
@@ -62,6 +68,8 @@ test("tool follow-up puts latest results in userMessageAction, not empty resume"
   assert.match(spliced.prompt, /22/);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
   assert.match(roots, /weather in tokyo then humidity then news/);
+  assert.match(roots, /\[Tool Call\]/);
+  assert.match(roots, /name: get_weather/);
   assert.doesNotMatch(roots, /"temp":22/);
 });
 
@@ -98,6 +106,8 @@ test("three sequential user tool rounds keep the full catalog history in roots",
   assert.match(roots, /tokyo weather, humidity, then a headline/);
   assert.match(roots, /call_wx/);
   assert.match(roots, /call_hum/);
+  assert.match(roots, /name: get_weather/);
+  assert.match(roots, /name: lookup/);
   assert.match(roots, /22/);
   assert.match(roots, /40/);
   assert.doesNotMatch(roots, /rain later/);
@@ -162,6 +172,48 @@ test("three user turns keep the first sentence in roots for the last question", 
   assert.match(roots3, /调用一下/);
   assert.match(roots3, /22/);
   assert.doesNotMatch(roots3, /我的第一句话是什么/);
+});
+
+test("policy stays its own first root ahead of a large Cursor Agent system", async () => {
+  const harness = `You are Cursor Grok 4.6. Native tools: Read, Write, Edit, Bash, Grep.\n${"x".repeat(8000)}`;
+  const catalog = [
+    { type: "custom" as const, name: "Write" },
+    { type: "function" as const, function: { name: "Edit" } },
+    { type: "function" as const, function: { name: "Bash" } },
+  ];
+  const tools = openaiToolsToCustom(catalog);
+  const messages = [
+    { role: "system", content: harness },
+    { role: "user", content: "edit the file" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "call_w", type: "function", function: { name: "Write", arguments: '{"path":"a.ts"}' } }],
+    },
+    { role: "tool", tool_call_id: "call_w", content: "wrote a.ts" },
+    { role: "assistant", content: "wrote it" },
+    { role: "user", content: "edit again" },
+  ];
+  const spliced = await spliceConversationFromClient({
+    body: { messages, tools: catalog },
+    tools,
+    messages,
+  });
+  const ids = spliced.conversationState.rootPromptMessagesJson as string[];
+  assert.ok(ids.length >= 2);
+  const policyRoot = utf8FromBlobData(spliced.blobs.get(String(ids[0]))!);
+  const systemRoot = utf8FromBlobData(spliced.blobs.get(String(ids[1]))!);
+  assert.match(policyRoot, /Client tools available this turn: Write, Edit, Bash/);
+  assert.match(policyRoot, /must not say they are unavailable|Do not say they are unavailable/);
+  assert.match(policyRoot, /do not claim you only have MCP-family tools/);
+  assert.doesNotMatch(policyRoot, /Native Cursor Edit\/Write\/Bash/);
+  assert.doesNotMatch(policyRoot, /You are Cursor Grok/);
+  assert.match(systemRoot, /You are Cursor Grok/);
+  assert.doesNotMatch(systemRoot, /Client tools available this turn/);
+  const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
+  assert.match(roots, /name: Write/);
+  assert.match(roots, /wrote a\.ts/);
+  assert.doesNotMatch(roots, /edit again/);
 });
 
 test("blob ids are SHA-256 of the JSON bytes (Connect JSON base64)", async () => {

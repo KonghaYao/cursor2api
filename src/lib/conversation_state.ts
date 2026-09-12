@@ -171,6 +171,50 @@ function assistantVisibleText(rec: Record<string, unknown>): string {
     .trim();
 }
 
+function toolCallArgsText(raw: unknown): string {
+  if (typeof raw === "string") return raw;
+  if (raw && typeof raw === "object") return JSON.stringify(raw);
+  return "";
+}
+
+function assistantToolCalls(rec: Record<string, unknown>): Array<{ id: string; name: string; args: string }> {
+  const out: Array<{ id: string; name: string; args: string }> = [];
+  if (Array.isArray(rec.tool_calls)) {
+    for (const raw of rec.tool_calls) {
+      const tc = asRec(raw);
+      if (!tc) continue;
+      const fn = asRec(tc.function) ?? tc;
+      const id = String(tc.id || "").trim();
+      const name = String(fn.name || tc.name || "").trim();
+      if (!id && !name) continue;
+      out.push({
+        id,
+        name,
+        args: toolCallArgsText(fn.arguments ?? fn.args ?? tc.arguments ?? tc.input),
+      });
+    }
+  }
+  if (Array.isArray(rec.content)) {
+    for (const block of rec.content) {
+      const b = asRec(block);
+      if (!b || String(b.type || "") !== "tool_use") continue;
+      const id = String(b.id || "").trim();
+      const name = String(b.name || "").trim();
+      if (!id && !name) continue;
+      out.push({
+        id,
+        name,
+        args: toolCallArgsText(b.input ?? b.arguments),
+      });
+    }
+  }
+  return out;
+}
+
+function toolCallRootText(opts: { id: string; name: string; args: string }): string {
+  return ["[Tool Call]", "[tool_call]", `call_id: ${opts.id}`, `name: ${opts.name}`, "arguments:", opts.args].join("\n");
+}
+
 function toolNamesById(messages: unknown[]): Map<string, string> {
   const names = new Map<string, string>();
   for (const m of messages) {
@@ -269,6 +313,9 @@ async function replayMessages(
     if (role === "assistant") {
       const text = assistantVisibleText(rec);
       if (text) await pushRoot(store, ids, rootAssistantText(text));
+      for (const call of assistantToolCalls(rec)) {
+        await pushRoot(store, ids, rootAssistantText(toolCallRootText(call)));
+      }
       continue;
     }
     if (role === "tool" || role === "function") {
@@ -348,16 +395,14 @@ export async function spliceConversationFromClient(opts: {
 }): Promise<SplicedConversation> {
   const blobs: ConversationBlobStore = new Map();
   const rootIds: string[] = [];
-  const systems: string[] = [];
-  // Policy first: Cursor Agent's ~10k system lists native Edit/Write/Bash, but
-  // AgentService only allowlists MCP. If policy is buried after that harness,
-  // Composer reports "I only have MCP tools" and refuses the client's Write.
+  // Policy is its own first root. Concatenating it into the ~10k Cursor Agent
+  // system blob still lets Composer attend to harness "Read/Write/Bash" and
+  // report "I only have MCP tools".
   const policy = toolPolicyPrompt(opts.body, opts.tools);
-  if (policy.trim()) systems.push(policy.trim());
+  if (policy.trim()) await pushRoot(blobs, rootIds, rootClientSystemText(policy.trim()));
   const clientSystem = systemPromptFromClient(opts.body);
-  if (clientSystem.trim()) systems.push(clientSystem.trim());
-  if (!systems.length) systems.push(DEFAULT_SYSTEM);
-  await pushRoot(blobs, rootIds, rootClientSystemText(systems.join("\n\n")));
+  if (clientSystem.trim()) await pushRoot(blobs, rootIds, rootClientSystemText(clientSystem.trim()));
+  if (!rootIds.length) await pushRoot(blobs, rootIds, rootClientSystemText(DEFAULT_SYSTEM));
 
   const { resume, prompt, historyEnd } = splicedUserPrompt({
     messages: opts.messages,

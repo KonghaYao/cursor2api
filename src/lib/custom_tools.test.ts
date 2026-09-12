@@ -51,6 +51,22 @@ test("openai custom/mcp tool payloads still park as client tools", () => {
   assert.equal(tools[0]?.inputSchema.properties && typeof tools[0].inputSchema.properties, "object");
 });
 
+test("openai nested custom.custom.name still parks as Write", () => {
+  const tools = openaiToolsToCustom([
+    {
+      type: "custom",
+      custom: {
+        name: "Write",
+        description: "nested write",
+        input_schema: { type: "object", properties: { path: { type: "string" } } },
+      },
+    },
+  ]);
+  assert.equal(tools[0]?.openaiName, "Write");
+  assert.equal(tools[0]?.description, "nested write");
+  assert.equal(tools[0]?.inputSchema.properties && typeof tools[0].inputSchema.properties, "object");
+});
+
 test("anthropic custom tools map the same way", () => {
   const tools = anthropicToolsToCustom([{ name: "lookup", description: "d", input_schema: { type: "object", properties: {} } }]);
   assert.equal(tools[0]?.name, "lookup");
@@ -77,8 +93,9 @@ test("tool policy says listed Write/Edit/Bash are available", () => {
   ]);
   const text = toolPolicyPrompt({ tool_choice: "auto" }, tools);
   assert.match(text, /Client tools available this turn: Write, Edit, Bash/);
-  assert.match(text, /do not say they are unavailable/);
-  assert.match(text, /Native Cursor Edit\/Write\/Bash/);
+  assert.match(text, /Do not say they are unavailable/);
+  assert.match(text, /do not claim you only have MCP-family tools/);
+  assert.doesNotMatch(text, /Native Cursor Edit\/Write\/Bash are disabled/);
 });
 
 test("lastTurnIsToolResult and extractClientToolResults", () => {

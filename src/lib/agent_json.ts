@@ -3,6 +3,7 @@
  * In-repo stand-in for the @cursor/sdk local Agent + custom-user-tools MCP executor.
  */
 
+import { customToolsInstruction } from "./custom_tools.ts";
 import { mapGrokEffort, parseAgentGrokModel } from "./inference.ts";
 
 export const CUSTOM_USER_TOOLS_SERVER = "custom-user-tools";
@@ -206,14 +207,7 @@ export function execIds(exec: JsonObject): { id: unknown; execId: unknown } {
 }
 
 function mcpClientToolInstructions(tools: CustomToolSpec[]): string {
-  const names = tools.map((t) => t.name).filter(Boolean);
-  if (!names.length) return "Call listed custom tools via MCP.";
-  return [
-    `Client tools available this turn: ${names.join(", ")}.`,
-    "Call them by those exact names through MCP custom-user-tools.",
-    "Native Cursor Edit/Write/Bash/Shell/Read/Grep are disabled in this runtime.",
-    "If Write, Edit, StrReplace, Shell, Bash, Read, or similar names are listed, you have them — do not say they are unavailable.",
-  ].join(" ");
+  return customToolsInstruction(tools);
 }
 
 export function mcpStateResult(id: unknown, execId: unknown, tools: CustomToolSpec[]): JsonObject {
@@ -389,15 +383,19 @@ export type ParsedMcpCall = {
   providerIdentifier: string;
 };
 
+function mcpCallableToolName(raw: unknown): string {
+  const name = String(raw || "").trim();
+  if (!name) return "";
+  const prefix = `${CUSTOM_USER_TOOLS_SERVER}-`;
+  return name.startsWith(prefix) ? name.slice(prefix.length) : name;
+}
+
 export function parseMcpArgs(exec: JsonObject): ParsedMcpCall | undefined {
   const raw = asObject(field(exec, "mcpArgs", "mcp_args"));
   if (!raw) return undefined;
   const providerIdentifier = String(field(raw, "providerIdentifier", "provider_identifier") || "");
-  const wireName = String(field(raw, "name") || "");
-  const prefix = `${CUSTOM_USER_TOOLS_SERVER}-`;
   const toolName =
-    String(field(raw, "toolName", "tool_name") || "") ||
-    (wireName.startsWith(prefix) ? wireName.slice(prefix.length) : wireName);
+    mcpCallableToolName(field(raw, "toolName", "tool_name")) || mcpCallableToolName(field(raw, "name"));
   const toolCallId = String(field(raw, "toolCallId", "tool_call_id") || "") || undefined;
   return {
     toolName,

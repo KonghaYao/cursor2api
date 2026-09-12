@@ -115,7 +115,38 @@ const SKIP_OPENAI_TOOL_TYPES = new Set([
 
 function openaiToolRecordName(rec: Record<string, unknown>): string {
   const fn = rec.function && typeof rec.function === "object" ? (rec.function as Record<string, unknown>) : rec;
-  return String(fn.name || rec.name || rec.server_label || rec.serverLabel || "").trim();
+  const custom = rec.custom && typeof rec.custom === "object" ? (rec.custom as Record<string, unknown>) : undefined;
+  return String(
+    fn.name ||
+      rec.name ||
+      custom?.name ||
+      rec.server_label ||
+      rec.serverLabel ||
+      rec.toolName ||
+      rec.tool_name ||
+      "",
+  ).trim();
+}
+
+function customDescription(rec: Record<string, unknown>): string {
+  const custom = rec.custom && typeof rec.custom === "object" ? (rec.custom as Record<string, unknown>) : undefined;
+  return String(custom?.description || "");
+}
+
+function openaiToolRecordSchema(rec: Record<string, unknown>): Record<string, unknown> {
+  const fn = rec.function && typeof rec.function === "object" ? (rec.function as Record<string, unknown>) : rec;
+  const custom = rec.custom && typeof rec.custom === "object" ? (rec.custom as Record<string, unknown>) : undefined;
+  return asSchema(
+    fn.parameters ??
+      fn.input_schema ??
+      fn.inputSchema ??
+      rec.parameters ??
+      rec.input_schema ??
+      rec.inputSchema ??
+      custom?.parameters ??
+      custom?.input_schema ??
+      custom?.inputSchema,
+  );
 }
 
 export function openaiToolsToCustom(tools: unknown): CustomToolDef[] {
@@ -140,8 +171,8 @@ export function openaiToolsToCustom(tools: unknown): CustomToolDef[] {
     out.push({
       name,
       openaiName,
-      description: String(fn.description || rec.description || ""),
-      inputSchema: asSchema(fn.parameters ?? rec.input_schema ?? rec.inputSchema),
+      description: String(fn.description || rec.description || customDescription(rec) || ""),
+      inputSchema: openaiToolRecordSchema(rec),
     });
   }
   return out;
@@ -190,8 +221,8 @@ export function customToolsInstruction(tools: { name?: string; openaiName?: stri
   return [
     `Client tools available this turn: ${names.join(", ")}.`,
     "Call them by those exact names through MCP custom-user-tools.",
-    "Native Cursor Edit/Write/Bash/Shell/Read/Grep are disabled in this runtime.",
-    "If Write, Edit, StrReplace, Shell, Bash, Read, or similar names are listed, you have them — do not say they are unavailable.",
+    "Listed Write, Edit, StrReplace, Shell, Bash, Read, or similar names ARE those client tools — they are not missing.",
+    "Do not say they are unavailable, and do not claim you only have MCP-family tools when these names are listed.",
   ].join(" ");
 }
 
