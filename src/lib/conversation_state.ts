@@ -398,9 +398,8 @@ export async function spliceConversationFromClient(opts: {
 }): Promise<SplicedConversation> {
   const blobs: ConversationBlobStore = new Map();
   const rootIds: string[] = [];
-  // Policy is its own first root. Concatenating it into the ~10k Cursor Agent
-  // system blob still lets Composer attend to harness "Read/Write/Bash" and
-  // report "I only have MCP tools".
+  // Short catalog as its own first root. Do not lecture about MCP or missing
+  // tools — that text becomes the model's tool-anxiety script.
   const policy = toolPolicyPrompt(opts.body, opts.tools);
   if (policy.trim()) await pushRoot(blobs, rootIds, rootClientSystemText(policy.trim()));
   const clientSystem = systemPromptFromClient(opts.body);

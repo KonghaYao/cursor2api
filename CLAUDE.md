@@ -152,7 +152,7 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 - 把 messages / canon / 整段 transcript 写进 KV（`agent-run:` 只允许 ids + 可选小 checkpoint；`agent-run-len:` 只允许整数长度，TTL 5min，不要并进 24h 绑定）
 - 跟进枪用 `openaiToolsToCursor(body.tools)` 算 fp、却用 `openaiToolsToCustom` 挂工具（`type: custom` 的 Write/Edit 会进 mcpTools 却不进会话键；isolate 一跳就丢）。fp 必须用**本枪实际 offered** 的 `opts.tools`。
 - 复用 `existing.agent` 时仍用 create() 那一枪的 `customTools`（Write 会冻在第一枪目录里，或第一枪没有时永远加不回去）。每一枪 `send()` 都要带当前客户端 tools。
-- 把工具策略埋在 Cursor Agent 大 system **后面**（模型会按 harness 说「只有 MCP、没有 Edit/Write/Bash」）。策略放 roots 最前，并写明 listed Write/Edit/Bash **就是** 可用的客户端工具。
+- 把工具策略埋在 Cursor Agent 大 system **后面**（模型会按 harness 说「只有 MCP、没有 Edit/Write/Bash」）。策略放 roots 最前，**只列** `Tools: Write, Edit, Bash.`，不要写 MCP / 「不要说工具没了」那种防御讲义
 
 ---
 
@@ -184,7 +184,7 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 | 会话 fp | 用**本枪实际 offered** 的 `opts.tools`，不要再解析一遍 `body.tools` 的子集 |
 | 每一枪 Run | `send()` 带当前 `customTools`；不要冻 `create()` 目录 |
 | 工具形状 | `type: custom` / 扁平 function / 带 name 的 mcp 都进客户端工具；`web_search_preview` 等 provider 类型仍跳过 |
-| roots 政策 | **独立 first root**，不要和 client system 拼进同一个 blob；写明 listed Write/Edit/Bash **就是** 可用的客户端工具，不要说「Native Write is disabled」或它们 unavailable |
+| roots 政策 | **独立 first root**，只要短目录 `Tools: Write, Edit, Bash.`；不要讲 MCP / custom-user-tools / 「不要说工具没了 / 列表变了」——模型会围着协议转。不要写「Native Write is disabled」 |
 | 默认 toolset | 仍然禁止。不要为了这句话去开 shell/edit |
 
 ### 验收
@@ -194,14 +194,14 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 - 复用 handle 的下一枪 `mcpTools` **以及** `requestContext` / `mcpState` 仍含 Write / Edit / Bash（含 `type: custom` 的 Write）
 - Write park → tool 结果 → 再跟进 user 后，roots 仍有 Write 已调用的历史（**不要**写成 `[Tool Call]` / `[tool_call]` 伪协议，Composer 会照抄成正文），政策是**独立 first root**
 - 从目录里拿掉 Write → `conversation_id` 变（fp 跟 offered 走）
-- 政策写明 listed Write/Edit/Bash **就是** 可用的客户端工具；**不要**写「Native Write is disabled」（Composer 会据此报「我没有 Write」）
+- 政策是短目录 `Tools: Write, Edit, Bash.`；**不含** MCP / custom-user-tools / unavailable / tool list changed；**不要**写「Native Write is disabled」
 
 ```text
 reused handle still offers Write/Edit/Bash on the next Run
 Write park then a later user turn still offers Write and keeps the call in roots
 policy stays its own first root ahead of a large Cursor Agent system
 dropping Write from the offered catalog starts a new AgentService conversation
-tool policy says listed Write/Edit/Bash are available
+tool policy is a short catalog without MCP lecture
 ```
 
 ### 约束
@@ -561,8 +561,8 @@ python3 scripts/analyze_team_usage.py team-usage-events-*.csv -o reports/usage-<
 | 用户/团队 | 走本网关的 Cursor Agent |
 | 证据 | Agent 日志「tool 列表变了」；根因在网关：会话 fp 用 `openaiToolsToCursor`（丢掉 `type: custom`），实际 park 用 `openaiToolsToCustom`；`existing.agent` 冻住第一枪 `customTools`；工具策略埋在大 system 后，Composer 按 harness 报「只有 MCP」 |
 | 根因结论 | **网关**：跟进枪 offered tools 与会话键 / Run `mcpTools` / 模型可见政策不一致。不是「当前 Agent 自己换了 tool 列表」就能结案。 |
-| 状态 | **mitigated**：fp 用本枪 `opts.tools`；每枪 `send()` 带当前 customTools；`type: custom` / 扁平 function / 带 name 的 mcp 都进客户端工具；政策放 roots 最前并写明 listed Write/Edit/Bash 可用。**不要**为了这句话去开默认 shell/edit toolset。 |
-| 续记 | 2026-09-12：单测 `reused handle still offers Write/Edit/Bash on the next Run`。同日稍后对抗：`mcpTools` 已带 Write 时模型仍报「只有 MCP」——政策被拼进同一条 ~10k system blob，且 `replayMessages` 丢掉 assistant `tool_calls`；「Native Edit/Write/Bash are disabled」会被 Composer 理解成「我没有 Write」。政策改为独立 first root，roots 回放「Already invoked client tool …」（**禁止** `[Tool Call]` / `[tool_call]` 伪协议，Composer 会照抄成正文而不走 MCP）。`parseMcpArgs` 对已带 `custom-user-tools-` 前缀的 `toolName` 也要剥掉，否则 `get_mcp_tools` 回放会 `Unknown custom tool`。 |
+| 状态 | **mitigated**：fp 用本枪 `opts.tools`；每枪 `send()` 带当前 customTools；`type: custom` / 扁平 function / 带 name 的 mcp 都进客户端工具；政策是独立 first root 的短目录。**不要**为了这句话去开默认 shell/edit toolset。 |
+| 续记 | 2026-09-12：单测 `reused handle still offers Write/Edit/Bash on the next Run`。同日稍后对抗：`mcpTools` 已带 Write 时模型仍报「只有 MCP」——政策被拼进同一条 ~10k system blob，且 `replayMessages` 丢掉 assistant `tool_calls`；「Native Edit/Write/Bash are disabled」会被 Composer 理解成「我没有 Write」。政策改为独立 first root，roots 回放「Already invoked client tool …」（**禁止** `[Tool Call]` / `[tool_call]` 伪协议，Composer 会照抄成正文而不走 MCP）。`parseMcpArgs` 对已带 `custom-user-tools-` 前缀的 `toolName` 也要剥掉，否则 `get_mcp_tools` 回放会 `Unknown custom tool`。同日再对抗：防御性长政策（MCP-family、custom-user-tools 命名空间、「不要说工具列表变了」）会让思考围着协议转；政策改为只列 `Tools: …`。 |
 
 ### 成本归因（简表）
 

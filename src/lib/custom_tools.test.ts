@@ -85,18 +85,15 @@ test("tool policy requires a named tool", () => {
   assert.match(text, /MUST call the tool named lookup/);
 });
 
-test("tool policy says listed Write/Edit/Bash are available", () => {
+test("tool policy is a short catalog without MCP lecture", () => {
   const tools = openaiToolsToCustom([
     { type: "function", function: { name: "Write" } },
     { type: "custom", name: "Edit" },
     { type: "function", function: { name: "Bash" } },
   ]);
   const text = toolPolicyPrompt({ tool_choice: "auto" }, tools);
-  assert.match(text, /Client tools available this turn: Write, Edit, Bash/);
-  assert.match(text, /Do not say they are unavailable/);
-  assert.match(text, /do not claim you only have MCP-family tools/);
-  assert.match(text, /Never write tool calls as chat text/);
-  assert.doesNotMatch(text, /Native Cursor Edit\/Write\/Bash are disabled/);
+  assert.equal(text, "Tools: Write, Edit, Bash.");
+  assert.doesNotMatch(text, /MCP|custom-user-tools|unavailable|tool list changed|Native /i);
 });
 
 test("lastTurnIsToolResult and extractClientToolResults", () => {

@@ -217,22 +217,17 @@ export function clientToolsDisabled(body: Record<string, unknown>): boolean {
 
 export function customToolsInstruction(tools: { name?: string; openaiName?: string }[]): string {
   const names = tools.map((t) => t.openaiName || t.name || "").filter(Boolean);
-  if (!names.length) return "Call listed custom tools via MCP.";
-  return [
-    `Client tools available this turn: ${names.join(", ")}.`,
-    "Call them by those exact names through MCP custom-user-tools.",
-    "Listed Write, Edit, StrReplace, Shell, Bash, Read, or similar names ARE those client tools — they are not missing.",
-    "Do not say they are unavailable, do not claim you only have MCP-family tools, and do not say the tool list changed when these names are listed.",
-    "Never write tool calls as chat text or fake tool-call protocol blocks; invoke the listed tools through MCP.",
-  ].join(" ");
+  if (!names.length) return "";
+  // Catalog only. Mentions of MCP / custom-user-tools / "do not say tools
+  // are missing" make Composer narrate protocol anxiety instead of calling.
+  return `Tools: ${names.join(", ")}.`;
 }
 
 export function toolPolicyPrompt(body: Record<string, unknown>, tools: CustomToolDef[]): string {
   if (!tools.length) return "";
-  const extra: string[] = [
-    customToolsInstruction(tools),
-    "When a listed tool applies, call it instead of only describing the steps in prose.",
-  ];
+  const extra: string[] = [];
+  const catalog = customToolsInstruction(tools);
+  if (catalog) extra.push(catalog);
   const choice = body.tool_choice ?? body.toolChoice;
   const rec = choice && typeof choice === "object" && !Array.isArray(choice) ? (choice as Record<string, unknown>) : undefined;
   const type = typeof choice === "string" ? choice : String(rec?.type || rec?.mode || "auto");

@@ -1510,13 +1510,11 @@ test("reused handle still offers Write/Edit/Bash on the next Run", async () => {
   const ids = spliced.conversationState.rootPromptMessagesJson as string[];
   const policyRoot = utf8FromBlobData(spliced.blobs.get(String(ids[0]))!);
   const systemRoot = utf8FromBlobData(spliced.blobs.get(String(ids[1]))!);
-  assert.match(policyRoot, /Client tools available this turn: Write, Edit, Bash/);
-  assert.match(policyRoot, /Do not say they are unavailable/);
-  assert.match(policyRoot, /do not claim you only have MCP-family tools/);
-  assert.match(policyRoot, /Never write tool calls as chat text/);
+  assert.match(policyRoot, /Tools: Write, Edit, Bash/);
+  assert.doesNotMatch(policyRoot, /MCP|custom-user-tools|unavailable|tool list changed|Native /i);
   assert.doesNotMatch(policyRoot, /You are Cursor Grok/);
   assert.match(systemRoot, /You are Cursor Grok/);
-  assert.doesNotMatch(systemRoot, /Client tools available this turn/);
+  assert.doesNotMatch(systemRoot, /\bTools:/);
 });
 
 test("Write park then a later user turn still offers Write and keeps the call in roots", async () => {
@@ -1611,9 +1609,11 @@ test("Write park then a later user turn still offers Write and keeps the call in
   const ids = spliced.conversationState.rootPromptMessagesJson as string[];
   const policyRoot = utf8FromBlobData(spliced.blobs.get(String(ids[0]))!);
   const systemRoot = utf8FromBlobData(spliced.blobs.get(String(ids[1]))!);
-  assert.match(policyRoot, /Client tools available this turn: Write, Edit, Bash/);
+  assert.match(policyRoot, /Tools: Write, Edit, Bash/);
+  assert.doesNotMatch(policyRoot, /MCP|custom-user-tools|unavailable|tool list changed|Native /i);
   assert.doesNotMatch(policyRoot, /You are Cursor Grok/);
   assert.match(systemRoot, /You are Cursor Grok/);
+  assert.doesNotMatch(systemRoot, /\bTools:/);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
   assert.match(roots, /Already invoked client tool Write/);
   assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]/);
