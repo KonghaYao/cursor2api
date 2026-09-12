@@ -26,7 +26,6 @@ export {
   resolveCursorImage,
   countCursorImageParts,
   countCursorMediaParts,
-  MAX_CURSOR_IMAGE_BYTES,
 } from "./content_parts.ts";
 
 export type OpenAiMessagesToCursorOpts = MediaResolveOpts;

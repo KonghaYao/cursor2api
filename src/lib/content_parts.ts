@@ -1,9 +1,5 @@
 /** Cursor InferenceContentPart: text | image | file. data is raw base64, not a data URL. */
 
-export const MAX_CURSOR_MEDIA_BYTES = 10 * 1024 * 1024;
-/** @deprecated use MAX_CURSOR_MEDIA_BYTES */
-export const MAX_CURSOR_IMAGE_BYTES = MAX_CURSOR_MEDIA_BYTES;
-
 export class ImageInputError extends Error {
   constructor(message: string) {
     super(message);
@@ -28,17 +24,6 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-function base64DecodedBytes(b64: string): number {
-  const pad = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
-  return Math.max(0, Math.floor((b64.length * 3) / 4) - pad);
-}
-
-function assertMediaSize(decodedBytes: number): void {
-  if (decodedBytes > MAX_CURSOR_MEDIA_BYTES) {
-    throw new ImageInputError(`Media input is too large (max ${MAX_CURSOR_MEDIA_BYTES} bytes)`);
-  }
-}
-
 /** Parse `data:<mime>;base64,...` into Cursor image/file data fields. */
 export function parseDataUrl(url: string): CursorMediaBytes | null {
   const trimmed = url.trim();
@@ -48,7 +33,6 @@ export function parseDataUrl(url: string): CursorMediaBytes | null {
   if (!m[2]) return null;
   const data = (m[3] || "").replace(/\s+/g, "");
   if (!data) return null;
-  assertMediaSize(base64DecodedBytes(data));
   return { data, mimeType };
 }
 
@@ -92,7 +76,6 @@ export async function resolveCursorMedia(
   if (!res.ok) throw new ImageInputError(`Failed to fetch media (${res.status})`);
   const mime = (res.headers.get("content-type") || "").split(";")[0]?.trim().toLowerCase() || fallbackMime;
   const buf = new Uint8Array(await res.arrayBuffer());
-  assertMediaSize(buf.length);
   if (!buf.length) throw new ImageInputError("Media input is empty");
   return { data: bytesToBase64(buf), mimeType: mime || fallbackMime };
 }
@@ -188,7 +171,6 @@ async function mediaFromRawBase64(
   mimeType: string,
 ): Promise<CursorMediaBytes> {
   const clean = data.replace(/\s+/g, "");
-  assertMediaSize(base64DecodedBytes(clean));
   return { data: clean, mimeType: mimeType || "application/octet-stream" };
 }
 

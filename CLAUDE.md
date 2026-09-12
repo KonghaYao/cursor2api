@@ -867,8 +867,8 @@ Connect JSON 形状（与现有 prompt-cache `parts.parts[].text` 一致）：
 提交 `27023de` — *feat: map OpenAI image_url to Cursor InferenceImagePart*
 
 1. 有图时走 `parts`，无图仍用 `text`（避免改变纯文本路径）
-2. `data:image/...;base64,...` 本地拆 mime + payload；`http(s)` 由网关拉取再编码（上限 10MB）
-3. 非法 scheme / 缺 url / 超限 → `ImageInputError` → **400**
+2. `data:image/...;base64,...` 本地拆 mime + payload；`http(s)` 由网关拉取再编码（不设本地体积上限）
+3. 非法 scheme / 缺 url / 空内容 → `ImageInputError` → **400**
 
 相关测试：`src/lib/inference.model.test.ts`；Deno 集成：`tests/deno_gateway.integration.test.ts` — *forwards OpenAI image_url as Cursor image parts*。
 
