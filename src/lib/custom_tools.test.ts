@@ -10,6 +10,7 @@ import {
   lastTurnIsToolResult,
   sanitizeCustomToolName,
   openaiToolsToCustom,
+  clientToolsFromRequest,
   parkClientToolCall,
   resolveClientToolResults,
   toolPolicyPrompt,
@@ -51,6 +52,21 @@ test("openai custom/mcp tool payloads still park as client tools", () => {
   ]);
   assert.deepEqual(tools.map((t) => t.openaiName), ["Write", "lookup"]);
   assert.equal(tools[0]?.inputSchema.properties && typeof tools[0].inputSchema.properties, "object");
+});
+
+test("clientToolsFromRequest reads this turn's body.tools and does not persist a catalog", () => {
+  const catalog = [
+    { type: "custom", name: "Write" },
+    { type: "function", function: { name: "Edit" } },
+    { type: "function", function: { name: "Bash" } },
+  ];
+  assert.deepEqual(clientToolsFromRequest({ tools: catalog }).map((t) => t.openaiName), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(clientToolsFromRequest({ tools: catalog, messages: [{ role: "user", content: "again" }] }).map((t) => t.openaiName), [
+    "Write",
+    "Edit",
+    "Bash",
+  ]);
+  assert.deepEqual(clientToolsFromRequest({ messages: [{ role: "user", content: "hi" }] }), []);
 });
 
 test("openai nested custom.custom.name still parks as Write", () => {

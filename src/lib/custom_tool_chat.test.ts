@@ -1554,6 +1554,67 @@ test("reused handle still offers Write/Edit/Bash on the next Run", async () => {
   assert.doesNotMatch(systemRoot, /\bTools:/);
 });
 
+test("follow-up mcpTools come from this request body.tools, not KV", async () => {
+  const duplexes: ChatInteractiveDuplex[] = [];
+  const openRun: OpenAgentRun = async () => {
+    const duplex = new ChatInteractiveDuplex();
+    duplexes.push(duplex);
+    attachCatalogDiscovery(duplex, () => {
+      duplex.push({ interactionUpdate: { textDelta: { text: "ok" } } });
+      duplex.push({ interactionUpdate: { turnEnded: {} } });
+    });
+    return duplex;
+  };
+  setCustomToolAgentHostForTests(
+    createSdkAgentHost({
+      openRun,
+      exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+    }),
+  );
+  const catalog = [
+    { type: "custom" as const, name: "Write" },
+    { type: "function" as const, function: { name: "Edit" } },
+    { type: "function" as const, function: { name: "Bash" } },
+  ];
+  const headers = new Headers({ authorization: "Bearer crsr_test" });
+  const user = { role: "user", content: "edit the file" };
+
+  const first = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [user], tools: catalog },
+    tools: [],
+  });
+  assert.equal(first.status, 200);
+  const body1 = await first.json();
+  assert.deepEqual(duplexMcpToolNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
+
+  customToolChatClearForTests();
+  setCustomToolAgentHostForTests(
+    createSdkAgentHost({
+      openRun,
+      exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+    }),
+  );
+
+  const second = await handleCustomToolChatCompletions({
+    headers,
+    body: {
+      model: "composer-2.5",
+      tools: catalog,
+      messages: [user, { role: "assistant", content: "ok" }, { role: "user", content: "again" }],
+    },
+    tools: [],
+  });
+  assert.equal(second.status, 200);
+  const body2 = await second.json();
+  assert.equal(body2.conversation_id, body1.conversation_id);
+  assert.equal(duplexes.length, 2);
+  assert.deepEqual(duplexMcpToolNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpListedNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexRequestContextListedNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpStateListedNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
+});
+
 test("Write park then a later user turn still offers Write and keeps the call in roots", async () => {
   const duplexes: ChatInteractiveDuplex[] = [];
   const openRun: OpenAgentRun = async () => {

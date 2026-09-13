@@ -45,6 +45,7 @@ import { kvGetAgentRun, kvGetAgentRunLen, kvSetAgentRun, kvSetAgentRunLen, type 
 import { agentRunIds, resolveSessionMode } from "./session.ts";
 import { computeAgentRunFp } from "./session_fingerprint.ts";
 import {
+  clientToolsFromRequest,
   clientToolsToAnthropic,
   clientToolsToOpenAi,
   composeToolResultPrompt,
@@ -439,6 +440,15 @@ function liveKey(tenant: string, sessionFp: string): string {
   return `${tenant}:${sessionFp}`;
 }
 
+function offeredToolsThisTurn(
+  body: Record<string, unknown>,
+  protocol: "openai" | "anthropic",
+  tools: CustomToolDef[],
+): CustomToolDef[] {
+  if (tools.length) return tools;
+  return clientToolsFromRequest(body, protocol);
+}
+
 /** Anthropic `thinking.budget_tokens` → fingerprint `reasoning_effort` (same bands as /v1/messages). */
 function foldAnthropicReasoningEffort(body: Record<string, unknown>): void {
   if (body.reasoning_effort != null && String(body.reasoning_effort).trim() !== "") return;
@@ -564,9 +574,10 @@ async function startCustomToolTurn(opts: {
     throw new CloudChatError("SESSION_MODE=random cannot park customTools.execute across turns.", 400);
   }
   const protocol = opts.protocol ?? "openai";
-  const sessionFp = await sessionFpForCustomTools(opts.body, protocol, opts.tools);
+  const tools = offeredToolsThisTurn(opts.body, protocol, opts.tools);
+  const sessionFp = await sessionFpForCustomTools(opts.body, protocol, tools);
   const computedIds = agentRunIds(tenant, sessionFp);
-  const session = upsertClientToolSession(tenant, sessionFp, opts.tools);
+  const session = upsertClientToolSession(tenant, sessionFp, tools);
   const messages = Array.isArray(opts.body.messages) ? opts.body.messages : [];
   const toolResults = extractLatestClientToolResults(messages);
   const toolFollowUp = lastTurnIsToolResult(messages) && toolResults.length > 0;
@@ -612,7 +623,7 @@ async function startCustomToolTurn(opts: {
 
   const spliced = await spliceConversationFromClient({
     body: opts.body,
-    tools: opts.tools,
+    tools,
     messages,
     priorMessageCount: priorMessageCount ?? undefined,
   });
@@ -691,7 +702,7 @@ async function startCustomToolTurn(opts: {
     detachClientAbort();
   });
   const origin = existing ? "follow" : binding ? "kv_hit" : "create";
-  console.log(`  custom_tools ${origin} session=${sessionId.slice(0, 24)} agent=${agent.agentId.slice(0, 14)} tools=${opts.tools.length} images=${images.length}`);
+  console.log(`  custom_tools ${origin} session=${sessionId.slice(0, 24)} agent=${agent.agentId.slice(0, 14)} tools=${tools.length} images=${images.length}`);
   return { live, session, sessionId, continued: false };
 }
 

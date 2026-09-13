@@ -215,6 +215,12 @@ export function clientToolsDisabled(body: Record<string, unknown>): boolean {
   return false;
 }
 
+/** This request's catalog. Client sends the full list every turn; do not persist it. */
+export function clientToolsFromRequest(body: Record<string, unknown>, protocol: "openai" | "anthropic" = "openai"): CustomToolDef[] {
+  if (clientToolsDisabled(body)) return [];
+  return protocol === "anthropic" ? anthropicToolsToCustom(body.tools) : openaiToolsToCustom(body.tools);
+}
+
 function listedToolNames(tools: { name?: string; openaiName?: string }[]): string[] {
   return tools.map((t) => t.openaiName || t.name || "").filter(Boolean);
 }
