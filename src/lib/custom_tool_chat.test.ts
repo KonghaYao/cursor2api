@@ -1279,6 +1279,12 @@ function duplexMcpToolNames(duplex: ChatInteractiveDuplex): string[] {
   );
 }
 
+function duplexMcpListedNames(duplex: ChatInteractiveDuplex): string[] {
+  return ((duplexRunRequest(duplex)?.mcpTools as { mcpTools?: Array<{ name: string }> })?.mcpTools || []).map(
+    (t) => t.name,
+  );
+}
+
 function duplexRequestContextToolNames(duplex: ChatInteractiveDuplex): string[] {
   for (const message of duplex.sent) {
     const exec = asObject(field(message, "execClientMessage"));
@@ -1291,6 +1297,18 @@ function duplexRequestContextToolNames(duplex: ChatInteractiveDuplex): string[] 
   return [];
 }
 
+function duplexRequestContextListedNames(duplex: ChatInteractiveDuplex): string[] {
+  for (const message of duplex.sent) {
+    const exec = asObject(field(message, "execClientMessage"));
+    const result = asObject(field(exec, "requestContextResult"));
+    const success = asObject(field(result, "success"));
+    const context = asObject(field(success, "requestContext"));
+    const tools = context?.tools as Array<{ name?: string }> | undefined;
+    if (Array.isArray(tools) && tools.length) return tools.map((t) => String(t.name || ""));
+  }
+  return [];
+}
+
 function duplexMcpStateToolNames(duplex: ChatInteractiveDuplex): string[] {
   for (const message of duplex.sent) {
     const exec = asObject(field(message, "execClientMessage"));
@@ -1299,6 +1317,18 @@ function duplexMcpStateToolNames(duplex: ChatInteractiveDuplex): string[] {
     const servers = success?.servers as Array<{ tools?: Array<{ toolName?: string }> }> | undefined;
     const tools = (servers || []).flatMap((s) => s.tools || []);
     if (tools.length) return tools.map((t) => String(t.toolName || ""));
+  }
+  return [];
+}
+
+function duplexMcpStateListedNames(duplex: ChatInteractiveDuplex): string[] {
+  for (const message of duplex.sent) {
+    const exec = asObject(field(message, "execClientMessage"));
+    const result = asObject(field(exec, "mcpStateExecResult"));
+    const success = asObject(field(result, "success"));
+    const servers = success?.servers as Array<{ tools?: Array<{ name?: string }> }> | undefined;
+    const tools = (servers || []).flatMap((s) => s.tools || []);
+    if (tools.length) return tools.map((t) => String(t.name || ""));
   }
   return [];
 }
@@ -1489,8 +1519,11 @@ test("reused handle still offers Write/Edit/Bash on the next Run", async () => {
   assert.equal(first.status, 200);
   const body1 = await first.json();
   assert.deepEqual(duplexMcpToolNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpListedNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
   assert.deepEqual(duplexRequestContextToolNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexRequestContextListedNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
   assert.deepEqual(duplexMcpStateToolNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpStateListedNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
 
   const turn2 = [system, user, { role: "assistant", content: "ok" }, { role: "user", content: "again" }];
   const second = await handleCustomToolChatCompletions({
@@ -1504,8 +1537,11 @@ test("reused handle still offers Write/Edit/Bash on the next Run", async () => {
   assert.equal(body2.conversation_id, body1.conversation_id);
   assert.equal(duplexes.length, 2);
   assert.deepEqual(duplexMcpToolNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpListedNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
   assert.deepEqual(duplexRequestContextToolNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexRequestContextListedNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
   assert.deepEqual(duplexMcpStateToolNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpStateListedNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
   const spliced = await spliceConversationFromClient({ body: { messages: turn2, tools: catalog }, tools, messages: turn2 });
   const ids = spliced.conversationState.rootPromptMessagesJson as string[];
   const policyRoot = utf8FromBlobData(spliced.blobs.get(String(ids[0]))!);
@@ -1575,6 +1611,7 @@ test("Write park then a later user turn still offers Write and keeps the call in
   const tc = body1.choices[0].message.tool_calls;
   assert.equal(tc[0].function.name, "Write");
   assert.deepEqual(duplexMcpToolNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpListedNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
 
   const afterWrite = [
     system,
@@ -1604,8 +1641,11 @@ test("Write park then a later user turn still offers Write and keeps the call in
   assert.equal(body3.conversation_id, body1.conversation_id);
   assert.equal(duplexes.length, 3);
   assert.deepEqual(duplexMcpToolNames(duplexes[2]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpListedNames(duplexes[2]!), ["Write", "Edit", "Bash"]);
   assert.deepEqual(duplexRequestContextToolNames(duplexes[2]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexRequestContextListedNames(duplexes[2]!), ["Write", "Edit", "Bash"]);
   assert.deepEqual(duplexMcpStateToolNames(duplexes[2]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpStateListedNames(duplexes[2]!), ["Write", "Edit", "Bash"]);
   const spliced = await spliceConversationFromClient({ body: { messages: later, tools: catalog }, tools, messages: later });
   const ids = spliced.conversationState.rootPromptMessagesJson as string[];
   const policyRoot = utf8FromBlobData(spliced.blobs.get(String(ids[0]))!);
@@ -1655,6 +1695,46 @@ test("dropping Write from the offered catalog starts a new AgentService conversa
   const body1 = await first.json();
   const body2 = await second.json();
   assert.notEqual(body2.conversation_id, body1.conversation_id);
+});
+
+test("same Write/Edit names with a different schema stay the same AgentService conversation", async () => {
+  setCustomToolAgentHostForTests({
+    async create() {
+      return {
+        agentId: "agent-tools-schema",
+        async send() {
+          return { wait: async () => ({ text: "ok" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const writeA = [
+    { type: "custom" as const, name: "Write", description: "write a file", input_schema: { type: "object", properties: { path: { type: "string" } } } },
+    { type: "function" as const, function: { name: "Edit", parameters: { type: "object", properties: { old: { type: "string" } } } } },
+  ];
+  const writeB = [
+    { type: "custom" as const, name: "Write", description: "write a file (updated)", input_schema: { type: "object", properties: { path: { type: "string" }, contents: { type: "string" } } } },
+    { type: "function" as const, function: { name: "Edit", parameters: { type: "object", properties: { old_string: { type: "string" }, new_string: { type: "string" } } } } },
+  ];
+  const headers = new Headers({ authorization: "Bearer crsr_test" });
+  const kv = createMemoryKv();
+  const user = { role: "user", content: "hi" };
+  const first = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [user], tools: writeA },
+    tools: openaiToolsToCustom(writeA),
+    kv,
+  });
+  const second = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [user, { role: "assistant", content: "ok" }, { role: "user", content: "next" }], tools: writeB },
+    tools: openaiToolsToCustom(writeB),
+    kv,
+  });
+  const body1 = await first.json();
+  const body2 = await second.json();
+  assert.equal(body2.conversation_id, body1.conversation_id);
 });
 
 test("OpenAI JSON maps AgentService resource_exhausted to HTTP 429", async () => {

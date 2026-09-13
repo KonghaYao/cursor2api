@@ -456,10 +456,13 @@ function foldAnthropicReasoningEffort(body: Record<string, unknown>): void {
 }
 
 function offeredToolsForFingerprint(tools: CustomToolDef[]) {
+  // Names only. Cursor Agent Write/Edit schemas are huge and churn across
+  // turns; hashing description+schema forks `tenant:fp` and the next Run
+  // looks like a new conversation that "lost" those tools.
   return tools.map((t) => ({
     name: t.openaiName,
-    description: t.description,
-    parameters: t.inputSchema,
+    description: "",
+    parameters: {},
   }));
 }
 

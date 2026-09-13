@@ -219,8 +219,13 @@ function listedToolNames(tools: { name?: string; openaiName?: string }[]): strin
   return tools.map((t) => t.openaiName || t.name || "").filter(Boolean);
 }
 
-function catalogHasWriter(names: string[]): boolean {
-  return names.some((n) => /^(Write|Edit|StrReplace)$/i.test(n));
+function catalogWriterNames(names: string[]): string[] {
+  return names.filter((n) => /^(Write|Edit|StrReplace|ApplyPatch)$/i.test(n));
+}
+
+function joinOr(names: string[]): string {
+  if (names.length <= 2) return names.join(" or ");
+  return `${names.slice(0, -1).join(", ")}, or ${names[names.length - 1]}`;
 }
 
 export function customToolsInstruction(tools: { name?: string; openaiName?: string }[]): string {
@@ -230,8 +235,11 @@ export function customToolsInstruction(tools: { name?: string; openaiName?: stri
   // that text becomes protocol anxiety. Workspace writes are pre-authorized:
   // Composer otherwise describes a patch and waits to be told to apply it.
   const parts = [`Tools: ${names.join(", ")}.`];
-  if (catalogHasWriter(names)) {
-    parts.push("Workspace edits are already authorized. Call Write or Edit when you decide a file should change. Do not ask permission or only describe the patch.");
+  const writers = catalogWriterNames(names);
+  if (writers.length) {
+    parts.push(
+      `Workspace edits are already authorized. Call ${joinOr(writers)} when you decide a file should change. Do not ask permission or only describe the patch.`,
+    );
   }
   return parts.join(" ");
 }

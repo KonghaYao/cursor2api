@@ -97,8 +97,11 @@ export function gatewayAgentModelId(model: unknown): string {
 }
 
 export function mcpToolDefinitions(tools: CustomToolSpec[]): JsonObject[] {
+  // `name` is what Composer enumerates (get_mcp_tools / requestContext.tools).
+  // Keep it the client name (Write), not `custom-user-tools-Write`, or follow-up
+  // turns report "I only have MCP tools" after a successful Write round.
   return tools.map((tool) => ({
-    name: `${CUSTOM_USER_TOOLS_SERVER}-${tool.name}`,
+    name: tool.name,
     providerIdentifier: CUSTOM_USER_TOOLS_SERVER,
     toolName: tool.name,
     description: tool.description || tool.name,

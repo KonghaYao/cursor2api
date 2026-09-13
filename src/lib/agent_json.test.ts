@@ -9,8 +9,10 @@ import {
   gatewayAgentModelSelection,
   mcpArgsToRecord,
   mcpSuccessResult,
+  mcpStateResult,
   mcpToolDefinitions,
   parseMcpArgs,
+  requestContextResult,
   parseServerMessage,
   mergeAgentTurnUsage,
   promptCacheHitPercent,
@@ -136,12 +138,26 @@ test("mcp allowlist is the MCP proto family, not shell/edit", () => {
   assert.ok(!MCP_ALLOWED_PROTO_TOOLS.some((n) => n.includes("edit")));
 });
 
-test("mcp tool definitions use custom-user-tools wire names", () => {
+test("mcp tool definitions list client names Composer enumerates", () => {
   const defs = mcpToolDefinitions([{ name: "get_weather", description: "wx", inputSchema: { type: "object" } }]);
-  assert.equal(defs[0]?.name, "custom-user-tools-get_weather");
+  assert.equal(defs[0]?.name, "get_weather");
   assert.equal(defs[0]?.providerIdentifier, "custom-user-tools");
   assert.equal(defs[0]?.toolName, "get_weather");
   assert.match(String(defs[0]?.inputSchemaJson), /object/);
+});
+
+test("requestContext and mcpState list Write, not custom-user-tools-Write", () => {
+  const tools = [{ name: "Write", description: "write a file" }, { name: "Edit" }];
+  const ctx = requestContextResult(1, "e", { cwd: "/tmp", tools });
+  const listed = (ctx.execClientMessage as { requestContextResult: { success: { requestContext: { tools: Array<{ name: string; toolName: string }> } } } })
+    .requestContextResult.success.requestContext.tools;
+  assert.deepEqual(listed.map((t) => t.name), ["Write", "Edit"]);
+  assert.deepEqual(listed.map((t) => t.toolName), ["Write", "Edit"]);
+  const state = mcpStateResult(2, "s", tools);
+  const serverTools = (state.execClientMessage as { mcpStateExecResult: { success: { servers: Array<{ tools: Array<{ name: string; toolName: string }> }> } } })
+    .mcpStateExecResult.success.servers[0]?.tools;
+  assert.deepEqual(serverTools?.map((t) => t.name), ["Write", "Edit"]);
+  assert.deepEqual(serverTools?.map((t) => t.toolName), ["Write", "Edit"]);
 });
 
 test("buildRunRequest omits excludeWorkspaceContext and only carries mcp tools", () => {
@@ -158,8 +174,9 @@ test("buildRunRequest omits excludeWorkspaceContext and only carries mcp tools",
   const rm = req.requestedModel as { modelId: string; parameters?: Array<{ id: string; value: string }> };
   assert.equal(rm.modelId, "composer-2.5");
   assert.deepEqual(rm.parameters, [{ id: "fast", value: "false" }]);
-  const tools = (req.mcpTools as { mcpTools: Array<{ toolName: string }> }).mcpTools;
+  const tools = (req.mcpTools as { mcpTools: Array<{ name: string; toolName: string }> }).mcpTools;
   assert.equal(tools[0]?.toolName, "lookup");
+  assert.equal(tools[0]?.name, "lookup");
 });
 
 test("buildRunRequest does not send customSystemPrompt", () => {

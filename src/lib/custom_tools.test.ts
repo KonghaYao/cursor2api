@@ -99,6 +99,14 @@ test("tool policy is a short catalog without MCP lecture", () => {
   assert.doesNotMatch(text, /MCP|custom-user-tools|unavailable|tool list changed|Native /i);
 });
 
+test("tool policy names StrReplace when that is the writer in the catalog", () => {
+  const tools = openaiToolsToCustom([{ type: "function", function: { name: "StrReplace" } }]);
+  const text = toolPolicyPrompt({ tool_choice: "auto" }, tools);
+  assert.match(text, /^Tools: StrReplace\./);
+  assert.match(text, /Call StrReplace when you decide/);
+  assert.doesNotMatch(text, /Call Write or Edit/);
+});
+
 test("tool policy does not lecture weather-only catalogs about Write", () => {
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "get_weather" } }]);
   const text = toolPolicyPrompt({ tool_choice: "auto" }, tools);
