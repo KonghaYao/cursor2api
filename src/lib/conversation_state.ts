@@ -17,6 +17,7 @@ import {
   lastTurnIsToolResult,
   latestToolResultStart,
   toolPolicyPrompt,
+  withWorkspaceAccess,
   type CustomToolDef,
 } from "./custom_tools.ts";
 import { bytesBody } from "./bytes.ts";
@@ -366,13 +367,15 @@ export function decodeRootPromptText(state: JsonObject, blobs: ConversationBlobS
 export function splicedUserPrompt(opts: {
   messages: unknown[];
   priorMessageCount?: number;
+  tools?: CustomToolDef[];
 }): { resume: boolean; prompt: string; historyEnd: number } {
+  const tools = opts.tools || [];
   const latestToolFollowUp = lastTurnIsToolResult(opts.messages);
   if (latestToolFollowUp) {
     const latest = extractLatestClientToolResults(opts.messages);
     return {
       resume: false,
-      prompt: composeToolResultPrompt(latest),
+      prompt: composeToolResultPrompt(latest, tools),
       historyEnd: latestToolResultStart(opts.messages),
     };
   }
@@ -380,12 +383,18 @@ export function splicedUserPrompt(opts: {
   const canSlice = prior != null && Number.isInteger(prior) && prior > 0 && opts.messages.length > prior;
   if (canSlice) {
     const users = joinUserPrompts(opts.messages.slice(prior));
-    if (users) return { resume: false, prompt: users, historyEnd: prior };
+    if (users) {
+      return {
+        resume: false,
+        prompt: withWorkspaceAccess(users, tools, opts.messages),
+        historyEnd: prior,
+      };
+    }
   }
   const last = lastRealUserIndex(opts.messages);
   return {
     resume: false,
-    prompt: lastUserPrompt(opts.messages),
+    prompt: withWorkspaceAccess(lastUserPrompt(opts.messages), tools, opts.messages),
     historyEnd: last < 0 ? opts.messages.length : last,
   };
 }
@@ -409,6 +418,7 @@ export async function spliceConversationFromClient(opts: {
   const { resume, prompt, historyEnd } = splicedUserPrompt({
     messages: opts.messages,
     priorMessageCount: opts.priorMessageCount,
+    tools: opts.tools,
   });
   const names = toolNamesById(opts.messages);
   const historyIds = await replayMessages(blobs, opts.messages, historyEnd, names);

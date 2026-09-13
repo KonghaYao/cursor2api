@@ -67,6 +67,7 @@ test("tool follow-up puts latest results in userMessageAction, not empty resume"
   assert.equal(spliced.resume, false);
   assert.match(spliced.prompt, /call_1/);
   assert.match(spliced.prompt, /22/);
+  assert.doesNotMatch(spliced.prompt, /full read and write access/);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
   assert.match(roots, /weather in tokyo then humidity then news/);
   assert.match(roots, /Already invoked client tool get_weather/);
@@ -206,7 +207,7 @@ test("policy stays its own first root ahead of a large Cursor Agent system", asy
   const policyRoot = utf8FromBlobData(spliced.blobs.get(String(ids[0]))!);
   const systemRoot = utf8FromBlobData(spliced.blobs.get(String(ids[1]))!);
   assert.match(policyRoot, /Tools: Write, Edit, Bash/);
-  assert.match(policyRoot, /Workspace edits are already authorized/);
+  assert.match(policyRoot, /You have full read and write access/);
   assert.doesNotMatch(policyRoot, /MCP|custom-user-tools|unavailable|tool list changed|Native /i);
   assert.doesNotMatch(policyRoot, /You are Cursor Grok/);
   assert.match(systemRoot, /You are Cursor Grok/);
@@ -216,6 +217,9 @@ test("policy stays its own first root ahead of a large Cursor Agent system", asy
   assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]/);
   assert.match(roots, /wrote a\.ts/);
   assert.doesNotMatch(roots, /edit again/);
+  assert.match(spliced.prompt, /You have full read and write access/);
+  assert.match(spliced.prompt, /Tools: Write, Edit, Bash/);
+  assert.match(spliced.prompt, /edit again/);
 });
 
 test("blob ids are SHA-256 of the JSON bytes (Connect JSON base64)", async () => {

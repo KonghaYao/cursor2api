@@ -55,6 +55,7 @@ import {
   toSdkCustomTools,
   upsertClientToolSession,
   waitForClientToolBatch,
+  withWorkspaceAccess,
   type ClientToolSession,
   type CustomToolDef,
   type ParkedClientTool,
@@ -257,17 +258,16 @@ export function composeCustomToolTurnPrompt(opts: {
   priorMessageCount?: number;
 }): string {
   void opts.body;
-  void opts.tools;
   void opts.hadPriorTurn;
   const latest = extractLatestClientToolResults(opts.messages);
-  if (lastTurnIsToolResult(opts.messages) && latest.length > 0) return composeToolResultPrompt(latest);
+  if (lastTurnIsToolResult(opts.messages) && latest.length > 0) return composeToolResultPrompt(latest, opts.tools);
   const prior = opts.priorMessageCount;
   const canSlice = prior != null && Number.isInteger(prior) && prior > 0 && opts.messages.length > prior;
   if (canSlice) {
     const users = joinUserPrompts(opts.messages.slice(prior));
-    if (users) return users;
+    if (users) return withWorkspaceAccess(users, opts.tools, opts.messages);
   }
-  return lastUserPrompt(opts.messages);
+  return withWorkspaceAccess(lastUserPrompt(opts.messages), opts.tools, opts.messages);
 }
 
 export type CustomToolTurnResult = { text: string; thinking?: string; error?: string; usage?: AgentTurnUsage };

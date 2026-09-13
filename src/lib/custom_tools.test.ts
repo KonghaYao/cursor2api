@@ -15,6 +15,8 @@ import {
   toolPolicyPrompt,
   upsertClientToolSession,
   composeToolResultPrompt,
+  withWorkspaceAccess,
+  workspaceAccessPrompt,
 } from "./custom_tools.ts";
 import {
   SDK_CUSTOM_ONLY_BUILTIN_TOOLS,
@@ -93,9 +95,9 @@ test("tool policy is a short catalog without MCP lecture", () => {
   ]);
   const text = toolPolicyPrompt({ tool_choice: "auto" }, tools);
   assert.match(text, /^Tools: Write, Edit, Bash\./);
-  assert.match(text, /Workspace edits are already authorized/);
-  assert.match(text, /Call Write or Edit when you decide/);
-  assert.match(text, /Do not ask permission or only describe the patch/);
+  assert.match(text, /You have full read and write access/);
+  assert.match(text, /Apply file changes with Write or Edit immediately/);
+  assert.match(text, /keep reading instead of writing/);
   assert.doesNotMatch(text, /MCP|custom-user-tools|unavailable|tool list changed|Native /i);
 });
 
@@ -103,15 +105,15 @@ test("tool policy names StrReplace when that is the writer in the catalog", () =
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "StrReplace" } }]);
   const text = toolPolicyPrompt({ tool_choice: "auto" }, tools);
   assert.match(text, /^Tools: StrReplace\./);
-  assert.match(text, /Call StrReplace when you decide/);
-  assert.doesNotMatch(text, /Call Write or Edit/);
+  assert.match(text, /Apply file changes with StrReplace immediately/);
+  assert.doesNotMatch(text, /Write or Edit immediately/);
 });
 
 test("tool policy does not lecture weather-only catalogs about Write", () => {
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "get_weather" } }]);
   const text = toolPolicyPrompt({ tool_choice: "auto" }, tools);
   assert.equal(text, "Tools: get_weather.");
-  assert.doesNotMatch(text, /Write or Edit|already authorized|describe the patch|MCP/i);
+  assert.doesNotMatch(text, /Write or Edit|full read and write|describe a patch|MCP/i);
 });
 
 test("lastTurnIsToolResult and extractClientToolResults", () => {
@@ -291,9 +293,36 @@ test("composeToolResultPrompt lists client tool output", () => {
   const text = composeToolResultPrompt([{ id: "call_1", content: '{"temp":22}' }]);
   assert.match(text, /call_1/);
   assert.match(text, /22/);
+  assert.match(text, /Take the next action now/);
+  assert.doesNotMatch(text, /full read and write access/);
+  assert.doesNotMatch(text, /Do not call the same tools again/);
   const failed = composeToolResultPrompt([{ id: "call_2", content: "lookup failed", isError: true }]);
   assert.match(failed, /call_2 ERROR:/);
   assert.match(failed, /lookup failed/);
+});
+
+test("tool follow-up restates full read/write access when Write is in the catalog", () => {
+  const tools = openaiToolsToCustom([
+    { type: "function", function: { name: "Write" } },
+    { type: "custom", name: "Edit" },
+  ]);
+  const text = composeToolResultPrompt([{ id: "call_w", content: "wrote a.ts" }], tools);
+  assert.match(text, /wrote a\.ts/);
+  assert.match(text, /You have full read and write access/);
+  assert.match(text, /Tools: Write, Edit/);
+  assert.match(text, /Apply remaining file changes now/);
+  assert.doesNotMatch(text, /Do not call the same tools again/);
+  const later = withWorkspaceAccess("edit again", tools, [
+    { role: "user", content: "write a.ts" },
+    { role: "assistant", content: null, tool_calls: [{ id: "call_w", type: "function", function: { name: "Write" } }] },
+    { role: "tool", tool_call_id: "call_w", content: "wrote a.ts" },
+    { role: "assistant", content: "wrote it" },
+    { role: "user", content: "edit again" },
+  ]);
+  assert.match(later, /You have full read and write access/);
+  assert.match(later, /Tools: Write, Edit/);
+  assert.match(later, /edit again/);
+  assert.equal(workspaceAccessPrompt(tools), "You have full read and write access. Tools: Write, Edit.");
 });
 
 test("sdk local agent allowlists only mcp so customTools work and builtins stay off", () => {

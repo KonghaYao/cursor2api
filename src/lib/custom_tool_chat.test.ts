@@ -1547,7 +1547,7 @@ test("reused handle still offers Write/Edit/Bash on the next Run", async () => {
   const policyRoot = utf8FromBlobData(spliced.blobs.get(String(ids[0]))!);
   const systemRoot = utf8FromBlobData(spliced.blobs.get(String(ids[1]))!);
   assert.match(policyRoot, /Tools: Write, Edit, Bash/);
-  assert.match(policyRoot, /Workspace edits are already authorized/);
+  assert.match(policyRoot, /You have full read and write access/);
   assert.doesNotMatch(policyRoot, /MCP|custom-user-tools|unavailable|tool list changed|Native /i);
   assert.doesNotMatch(policyRoot, /You are Cursor Grok/);
   assert.match(systemRoot, /You are Cursor Grok/);
@@ -1628,6 +1628,8 @@ test("Write park then a later user turn still offers Write and keeps the call in
   const body2 = await second.json();
   assert.equal(body2.conversation_id, body1.conversation_id);
   assert.equal(body2.choices[0].message.content, "wrote it");
+  assert.match(duplexUserText(duplexes[1]!), /You have full read and write access/);
+  assert.match(duplexUserText(duplexes[1]!), /Tools: Write, Edit, Bash/);
 
   const later = [...afterWrite, { role: "assistant", content: "wrote it" }, { role: "user", content: "edit again" }];
   const third = await handleCustomToolChatCompletions({
@@ -1651,7 +1653,7 @@ test("Write park then a later user turn still offers Write and keeps the call in
   const policyRoot = utf8FromBlobData(spliced.blobs.get(String(ids[0]))!);
   const systemRoot = utf8FromBlobData(spliced.blobs.get(String(ids[1]))!);
   assert.match(policyRoot, /Tools: Write, Edit, Bash/);
-  assert.match(policyRoot, /Workspace edits are already authorized/);
+  assert.match(policyRoot, /You have full read and write access/);
   assert.doesNotMatch(policyRoot, /MCP|custom-user-tools|unavailable|tool list changed|Native /i);
   assert.doesNotMatch(policyRoot, /You are Cursor Grok/);
   assert.match(systemRoot, /You are Cursor Grok/);
@@ -1661,6 +1663,8 @@ test("Write park then a later user turn still offers Write and keeps the call in
   assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]/);
   assert.match(roots, /wrote a\.ts/);
   assert.doesNotMatch(roots, /edit again/);
+  assert.match(duplexUserText(duplexes[2]!), /You have full read and write access/);
+  assert.match(duplexUserText(duplexes[2]!), /edit again/);
 });
 
 test("dropping Write from the offered catalog starts a new AgentService conversation", async () => {

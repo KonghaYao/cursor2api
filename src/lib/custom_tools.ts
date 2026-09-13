@@ -228,6 +228,14 @@ function joinOr(names: string[]): string {
   return `${names.slice(0, -1).join(", ")}, or ${names[names.length - 1]}`;
 }
 
+/** Adjacent reminder after a tool round. First-root policy is too far back for Composer. */
+export function workspaceAccessPrompt(tools: { name?: string; openaiName?: string }[]): string {
+  const names = listedToolNames(tools);
+  const writers = catalogWriterNames(names);
+  if (!writers.length) return "";
+  return `You have full read and write access. Tools: ${names.join(", ")}.`;
+}
+
 export function customToolsInstruction(tools: { name?: string; openaiName?: string }[]): string {
   const names = listedToolNames(tools);
   if (!names.length) return "";
@@ -238,7 +246,7 @@ export function customToolsInstruction(tools: { name?: string; openaiName?: stri
   const writers = catalogWriterNames(names);
   if (writers.length) {
     parts.push(
-      `Workspace edits are already authorized. Call ${joinOr(writers)} when you decide a file should change. Do not ask permission or only describe the patch.`,
+      `You have full read and write access. Apply file changes with ${joinOr(writers)} immediately. Do not ask permission, describe a patch instead of applying it, or keep reading instead of writing.`,
     );
   }
   return parts.join(" ");
@@ -285,13 +293,20 @@ function contentToText(content: unknown): string {
 
 export type ClientToolResult = { id: string; content: string; isError?: boolean };
 
-export function composeToolResultPrompt(results: ClientToolResult[]): string {
+export function composeToolResultPrompt(
+  results: ClientToolResult[],
+  tools: { name?: string; openaiName?: string }[] = [],
+): string {
   const lines = results.map((r) => (r.isError ? `- ${r.id} ERROR: ${r.content}` : `- ${r.id}: ${r.content}`));
+  const access = workspaceAccessPrompt(tools);
   return [
     "The client executed your custom tools. Results:",
     ...lines,
-    "Continue from these results. Do not call the same tools again unless you need new data.",
-  ].join("\n");
+    access || "Continue from these results. Take the next action now; do not only describe it.",
+    access ? "Apply remaining file changes now." : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 export function extractClientToolResults(messages: unknown[]): ClientToolResult[] {
@@ -350,6 +365,21 @@ export function latestToolResultStart(messages: unknown[]): number {
 
 export function extractLatestClientToolResults(messages: unknown[]): ClientToolResult[] {
   return extractClientToolResults(messages.slice(latestToolResultStart(messages)));
+}
+
+export function transcriptHasToolRound(messages: unknown[]): boolean {
+  return latestToolResultStart(messages) > 0 || extractClientToolResults(messages).length > 0;
+}
+
+export function withWorkspaceAccess(
+  prompt: string,
+  tools: { name?: string; openaiName?: string }[],
+  messages: unknown[],
+): string {
+  const access = workspaceAccessPrompt(tools);
+  if (!access || !transcriptHasToolRound(messages)) return prompt;
+  if (prompt.startsWith(access)) return prompt;
+  return `${access}\n\n${prompt}`;
 }
 
 export function lastTurnIsToolResult(messages: unknown[]): boolean {
