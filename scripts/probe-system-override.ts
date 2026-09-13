@@ -7,7 +7,7 @@
  *   BASE=http://127.0.0.1:8793 node --experimental-strip-types scripts/probe-system-override.ts
  */
 import { spliceConversationFromClient } from "../src/lib/conversation_state.ts";
-import { createSdkAgentHost } from "../src/lib/sdk_agent_host.ts";
+import { createAgentServiceHost } from "../src/lib/agent_service_host.ts";
 
 const BASE = (process.env.BASE || "http://127.0.0.1:8793").replace(/\/$/, "");
 const MODEL = process.env.PROBE_MODEL || "composer-2.5-fast";
@@ -84,7 +84,7 @@ async function directCustomSystem(path: string, rootSystem: string): Promise<voi
     tools: [],
     messages,
   });
-  const host = createSdkAgentHost();
+  const host = createAgentServiceHost();
   const agent = await host.create({
     apiKey: key,
     model: MODEL,

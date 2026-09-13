@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { customToolsClearForTests, openaiToolsToCustom, toSdkCustomTools, upsertClientToolSession } from "./custom_tools.ts";
-import { createSdkAgentHost } from "./sdk_agent_host.ts";
+import { createAgentServiceHost } from "./agent_service_host.ts";
 import type { AgentDuplex, OpenAgentRun } from "./agent_run.ts";
 import type { JsonObject } from "./agent_json.ts";
 import { asObject, field } from "./agent_json.ts";
@@ -77,7 +77,7 @@ test("in-repo host parks customTools.execute and finishes after the tool result"
   };
 
   const openRun: OpenAgentRun = async () => duplex;
-  const host = createSdkAgentHost({
+  const host = createAgentServiceHost({
     openRun,
     exchange: async () => ({ accessToken: "tok", refreshToken: null }),
   });
@@ -120,7 +120,7 @@ test("in-repo host parks Write when mcpArgs toolName is already prefixed", async
       });
     }
   };
-  const host = createSdkAgentHost({
+  const host = createAgentServiceHost({
     openRun: async () => duplex,
     exchange: async () => ({ accessToken: "tok", refreshToken: null }),
   });
@@ -145,7 +145,7 @@ test("JWT credentials skip exchange_user_api_key", async () => {
       duplex.push({ interactionUpdate: { turnEnded: {} } });
     }
   };
-  const host = createSdkAgentHost({
+  const host = createAgentServiceHost({
     openRun: async (opts) => {
       assert.equal(opts.accessToken, jwt);
       return duplex;
@@ -175,7 +175,7 @@ test("AgentService requestedModel sends explicit fast for composer standard vs f
         duplex.push({ interactionUpdate: { turnEnded: {} } });
       }
     };
-    const host = createSdkAgentHost({
+    const host = createAgentServiceHost({
       openRun: async () => duplex,
       exchange: async () => ({ accessToken: "tok", refreshToken: null }),
     });
@@ -233,7 +233,7 @@ test("in-repo host does not double prompt tokens when turnEnded omits cache", as
       });
     }
   };
-  const host = createSdkAgentHost({
+  const host = createAgentServiceHost({
     openRun: async () => duplex,
     exchange: async () => ({ accessToken: "tok", refreshToken: null }),
   });
@@ -260,7 +260,7 @@ test("in-repo host merges cumulative usage snapshots without doubling cache", as
       duplex.push({ interactionUpdate: { turnEnded: snap } });
     }
   };
-  const host = createSdkAgentHost({
+  const host = createAgentServiceHost({
     openRun: async () => duplex,
     exchange: async () => ({ accessToken: "tok", refreshToken: null }),
   });
@@ -287,7 +287,7 @@ test("in-repo host returns turnEnded usage to wait()", async () => {
       });
     }
   };
-  const host = createSdkAgentHost({
+  const host = createAgentServiceHost({
     openRun: async () => duplex,
     exchange: async () => ({ accessToken: "tok", refreshToken: null }),
   });
@@ -313,7 +313,7 @@ test("in-repo host collects thinkingDelta and sends selectedImages", async () =>
       duplex.push({ interactionUpdate: { turnEnded: {} } });
     }
   };
-  const host = createSdkAgentHost({
+  const host = createAgentServiceHost({
     openRun: async () => duplex,
     exchange: async () => ({ accessToken: "tok", refreshToken: null }),
   });
@@ -344,7 +344,7 @@ test("in-repo host onDelta emits thinking and text before wait resolves", async 
       duplex.push({ interactionUpdate: { textDelta: { text: "lo" } } });
     }
   };
-  const host = createSdkAgentHost({
+  const host = createAgentServiceHost({
     openRun: async () => duplex,
     exchange: async () => ({ accessToken: "tok", refreshToken: null }),
   });
@@ -392,7 +392,7 @@ test("in-repo host forwards cwd to Run and request context", async () => {
       duplex.push({ interactionUpdate: { turnEnded: {} } });
     }
   };
-  const host = createSdkAgentHost({
+  const host = createAgentServiceHost({
     openRun: async () => duplex,
     exchange: async () => ({ accessToken: "tok", refreshToken: null }),
   });
@@ -410,7 +410,7 @@ test("in-repo host reuses caller conversationId and conversationState", async ()
       duplex.push({ interactionUpdate: { turnEnded: {} } });
     }
   };
-  const host = createSdkAgentHost({
+  const host = createAgentServiceHost({
     openRun: async (opts) => {
       assert.equal(opts.conversationId, "tenant:fixed-conversation");
       return duplex;
@@ -439,7 +439,7 @@ test("abort sends ConversationAction.cancelAction then closes the run", async ()
   duplex.onSend = (message) => {
     if (field(message, "runRequest")) return;
   };
-  const host = createSdkAgentHost({
+  const host = createAgentServiceHost({
     openRun: async () => duplex,
     exchange: async () => ({ accessToken: "tok", refreshToken: null }),
   });
@@ -477,7 +477,7 @@ test("release closes the run without cancelAction or mcpResult", async () => {
       });
     }
   };
-  const host = createSdkAgentHost({
+  const host = createAgentServiceHost({
     openRun: async () => duplex,
     exchange: async () => ({ accessToken: "tok", refreshToken: null }),
   });
@@ -528,7 +528,7 @@ test("in-repo host serves spliced rootPromptMessagesJson blobs on getBlob", asyn
       duplex.push({ interactionUpdate: { turnEnded: {} } });
     }
   };
-  const host = createSdkAgentHost({
+  const host = createAgentServiceHost({
     openRun: async () => duplex,
     exchange: async () => ({ accessToken: "tok", refreshToken: null }),
   });

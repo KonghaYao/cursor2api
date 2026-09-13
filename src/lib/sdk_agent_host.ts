@@ -1,48 +1,16 @@
 /**
- * CustomToolAgentHost backed by agent.v1.AgentService/Run (no @cursor/sdk,
- * no agent binary, no Cursor-hosted Cloud Agents sandbox VM).
- * MCP family only; customTools.execute stays in-process (parked by custom_tools.ts).
+ * CustomToolAgentHost backed by published `@cursor/sdk` local agents.
+ * Client OpenAI/Anthropic tools map to `local.customTools` (MCP family only).
  */
-import { exchangeApiKey } from "./auth.ts";
-import { randomId } from "./bytes.ts";
-import {
-  asObject,
-  field,
-  mergeAgentTurnUsage,
-  buildRunRequest,
-  clientHeartbeatMessage,
-  clientRunMessage,
-  execIds,
-  execThrow,
-  gatewayAgentModelSelection,
-  type AgentModelParam,
-  kvGetBlobResult,
-  kvSetBlobResult,
-  listMcpResourcesResult,
-  mcpAllowlistResult,
-  mcpErrorResult,
-  mcpStateResult,
-  mcpSuccessResult,
-  parseKvBlob,
-  parseMcpArgs,
-  parseServerMessage,
-  readMcpResourceNotFound,
-  requestContextResult,
-  type AgentInlineImage,
-  type AgentTurnUsage,
-  type CustomToolSpec,
-  type JsonObject,
-} from "./agent_json.ts";
-import { abortAgentDuplex, closeAgentDuplex, openAgentRun, type OpenAgentRun } from "./agent_run.ts";
-import type { CustomToolAgentHandle, CustomToolAgentHost, SdkCustomToolMap } from "./custom_tool_chat.ts";
-
-const HEARTBEAT_MS = 15_000;
-/** `AbortController.abort(reason)` used when parking tool_calls — close the Run, do not cancelAction. */
-const RELEASE_REASON = "release";
-
-function isJwt(token: string): boolean {
-  return token.startsWith("eyJ") && token.split(".").length === 3;
-}
+import { Agent, type SDKMessage } from "@cursor/sdk";
+import type { TokenUsage } from "@cursor/sdk";
+import { gatewayAgentModelSelection, type AgentInlineImage, type AgentTurnUsage } from "./agent_json.ts";
+import type {
+  CustomToolAgentHandle,
+  CustomToolAgentHost,
+  CustomToolSendOpts,
+  SdkCustomToolMap,
+} from "./custom_tool_chat.ts";
 
 function readEnv(name: string): string | undefined {
   try {
@@ -59,68 +27,106 @@ function readEnv(name: string): string | undefined {
   return undefined;
 }
 
-function specsFromCustomTools(customTools: SdkCustomToolMap): CustomToolSpec[] {
-  return Object.entries(customTools).map(([name, tool]) => ({
-    name,
-    description: tool.description,
-    inputSchema: tool.inputSchema,
+function isDenoDeploy(): boolean {
+  try {
+    return Boolean((globalThis as { Deno?: { env: { get: (k: string) => string | undefined } } }).Deno?.env.get("DENO_DEPLOYMENT_ID"));
+  } catch {
+    return false;
+  }
+}
+
+function sdkModel(model: unknown, opts?: { fast?: boolean; reasoningEffort?: unknown }) {
+  const selection = gatewayAgentModelSelection(model, opts);
+  return selection.parameters?.length
+    ? { id: selection.modelId, params: selection.parameters }
+    : { id: selection.modelId };
+}
+
+function sdkImages(images?: AgentInlineImage[]) {
+  if (!images?.length) return undefined;
+  return images.map((img) => ({
+    data: img.data,
+    mimeType: img.mimeType || "image/png",
   }));
 }
 
-async function resolveAccessToken(
-  apiKey: string,
-  exchange: typeof exchangeApiKey,
-): Promise<string> {
-  if (isJwt(apiKey)) return apiKey;
-  const exchanged = await exchange(apiKey);
-  return exchanged.accessToken;
+function sdkUserMessage(prompt: string, images?: AgentInlineImage[]) {
+  const mapped = sdkImages(images);
+  if (!mapped?.length) return prompt;
+  return { text: prompt, images: mapped };
 }
 
-function contentToText(result: { content?: Array<{ type?: string; text?: string }>; isError?: boolean }): string {
-  const parts = Array.isArray(result.content) ? result.content : [];
-  const text = parts.map((p) => (typeof p?.text === "string" ? p.text : "")).filter(Boolean).join("\n");
-  if (text) return text;
-  return result.isError ? "custom tool failed" : "";
+function usageFromTokenUsage(usage?: TokenUsage): AgentTurnUsage | undefined {
+  if (!usage) return undefined;
+  return {
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cacheReadTokens: usage.cacheReadTokens,
+    cacheWriteTokens: usage.cacheWriteTokens,
+    reasoningTokens: usage.reasoningTokens,
+  };
 }
 
-function unwrapCheckpointState(state: JsonObject): JsonObject {
-  const inner = asObject(field(state, "conversationState", "conversation_state"));
-  return inner ?? state;
+function assistantText(event: SDKMessage): string {
+  if (event.type !== "assistant") return "";
+  const blocks = event.message?.content;
+  if (!Array.isArray(blocks)) return "";
+  return blocks
+    .map((block) => (block && typeof block === "object" && block.type === "text" ? String(block.text || "") : ""))
+    .filter(Boolean)
+    .join("");
 }
 
-function lookupBlob(store: Map<string, string>, blobId: string): string | undefined {
-  const hit = store.get(blobId);
-  if (hit) return hit;
-  const std = blobId.replace(/-/g, "+").replace(/_/g, "/");
-  const padded = std.length % 4 === 0 ? std : std + "=".repeat(4 - (std.length % 4));
-  return store.get(std) ?? store.get(padded);
+function buildAgentOptions(createOpts: {
+  apiKey: string;
+  model: unknown;
+  fast?: boolean;
+  reasoningEffort?: unknown;
+  customTools: SdkCustomToolMap;
+  cwd?: string;
+}) {
+  const cwd = createOpts.cwd || readEnv("GATEWAY_AGENT_CWD") || "/tmp";
+  const hasCustomTools = Object.keys(createOpts.customTools).length > 0;
+  return {
+    apiKey: createOpts.apiKey,
+    model: sdkModel(createOpts.model, { fast: createOpts.fast, reasoningEffort: createOpts.reasoningEffort }),
+    tools: hasCustomTools ? (["mcp"] as const) : ([] as const),
+    local: {
+      cwd,
+      settingSources: [] as const,
+      customTools: createOpts.customTools,
+    },
+  };
 }
 
-export function createSdkAgentHost(opts?: {
-  openRun?: OpenAgentRun;
-  exchange?: typeof exchangeApiKey;
-}): CustomToolAgentHost {
-  const openRun = opts?.openRun ?? openAgentRun;
-  const exchange = opts?.exchange ?? exchangeApiKey;
+export function createSdkAgentHost(): CustomToolAgentHost {
+  if (isDenoDeploy()) {
+    throw new Error("Deno Deploy cannot run @cursor/sdk local agents (native executor required). Use Node/Bun.");
+  }
 
   return {
     async create(createOpts) {
-      const accessToken = await resolveAccessToken(createOpts.apiKey, exchange);
-      const agentId = createOpts.agentSessionId || randomId();
-      const conversationId = createOpts.conversationId || randomId();
-      const selection = gatewayAgentModelSelection(createOpts.model, {
-        fast: createOpts.fast,
-        reasoningEffort: createOpts.reasoningEffort,
-      });
-      const cwd = createOpts.cwd || readEnv("GATEWAY_AGENT_CWD") || "/tmp";
-      const blobs = new Map<string, string>();
-      let conversationState: JsonObject | undefined = createOpts.conversationState;
+      const base = buildAgentOptions(createOpts);
+      const resumeId = createOpts.agentSessionId?.trim();
+      let agent: Awaited<ReturnType<typeof Agent.create>>;
+      if (resumeId && !resumeId.includes(":")) {
+        try {
+          agent = await Agent.resume(resumeId, base);
+        } catch {
+          agent = await Agent.create(base);
+        }
+      } else {
+        agent = await Agent.create(base);
+      }
+
       let closed = false;
 
       const handle: CustomToolAgentHandle = {
-        agentId,
-        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void; signal?: AbortSignal; conversationState?: JsonObject; blobs?: Map<string, string>; resume?: boolean; customSystemPrompt?: string; customTools?: SdkCustomToolMap }) {
+        agentId: agent.agentId,
+        keepsParkedExecute: true,
+        async send(prompt: string, sendOpts?: CustomToolSendOpts) {
           if (closed) throw new Error("agent is closed");
+
           const abort = new AbortController();
           const onClientAbort = () => abort.abort();
           const clientSignal = sendOpts?.signal;
@@ -128,278 +134,105 @@ export function createSdkAgentHost(opts?: {
             if (clientSignal.aborted) abort.abort();
             else clientSignal.addEventListener("abort", onClientAbort, { once: true });
           }
-          if (sendOpts?.blobs) {
-            for (const [id, data] of sendOpts.blobs) blobs.set(id, data);
-          }
-          if (sendOpts?.conversationState) conversationState = sendOpts.conversationState;
+
           const customTools = sendOpts?.customTools ?? createOpts.customTools;
-          const tools = specsFromCustomTools(customTools);
-          const run = runTurn({
-            openRun,
-            accessToken,
-            conversationId,
-            agentSessionId: agentId,
-            modelId: selection.modelId,
-            modelParameters: selection.parameters,
+          const cwd = createOpts.cwd || readEnv("GATEWAY_AGENT_CWD") || "/tmp";
+          const hasCustomTools = Object.keys(customTools).length > 0;
+          const local = {
             cwd,
-            prompt,
-            images: sendOpts?.images,
-            onDelta: sendOpts?.onDelta,
-            signal: abort.signal,
-            tools,
             customTools,
-            blobs,
-            conversationState,
-            resume: Boolean(sendOpts?.resume),
-            customSystemPrompt: sendOpts?.customSystemPrompt ?? createOpts.customSystemPrompt,
-            onCheckpoint: (state) => {
-              conversationState = unwrapCheckpointState(state);
-              createOpts.onCheckpoint?.(conversationState);
-            },
-          });
-          void run.finally(() => clientSignal?.removeEventListener("abort", onClientAbort));
+          };
+
+          let text = "";
+          let thinking = "";
+          let usage: AgentTurnUsage | undefined;
+          let error: string | undefined;
+          let runRef: Awaited<ReturnType<typeof agent.send>> | undefined;
+
+          const work = (async () => {
+            try {
+              const run = await agent.send(sdkUserMessage(prompt, sendOpts?.images), {
+                local: hasCustomTools ? local : undefined,
+                onDelta: ({ update }) => {
+                  const rec = update as Record<string, unknown>;
+                  const type = String(rec.type || "");
+                  if (type === "text-delta" && typeof rec.text === "string" && rec.text) {
+                    text += rec.text;
+                    sendOpts?.onDelta?.({ text: rec.text });
+                  } else if (type === "thinking-delta" && typeof rec.text === "string" && rec.text) {
+                    thinking += rec.text;
+                    sendOpts?.onDelta?.({ thinking: rec.text });
+                  }
+                },
+              });
+              runRef = run;
+
+              for await (const event of run.stream()) {
+                if (abort.signal.aborted) break;
+                if (event.type === "thinking" && event.text) {
+                  const delta = event.text.startsWith(thinking) ? event.text.slice(thinking.length) : event.text;
+                  if (delta) {
+                    thinking += delta;
+                    sendOpts?.onDelta?.({ thinking: delta });
+                  }
+                } else if (event.type === "assistant") {
+                  const chunk = assistantText(event);
+                  if (chunk) {
+                    const delta = chunk.startsWith(text) ? chunk.slice(text.length) : chunk;
+                    if (delta) {
+                      text += delta;
+                      sendOpts?.onDelta?.({ text: delta });
+                    }
+                  }
+                } else if (event.type === "usage") {
+                  usage = usageFromTokenUsage(event.usage);
+                } else if (event.type === "status" && event.status === "ERROR" && event.message) {
+                  error = event.message;
+                }
+              }
+
+              const result = await run.wait();
+              usage = usageFromTokenUsage(result.usage) ?? usage;
+              if (result.status === "error") {
+                error = result.error?.message || "agent run failed";
+              } else if (result.result) {
+                text = result.result;
+              }
+              return { text, thinking: thinking || undefined, error, usage };
+            } catch (err) {
+              if (abort.signal.aborted) {
+                return { text, thinking: thinking || undefined, error, usage };
+              }
+              error = err instanceof Error ? err.message : String(err);
+              return { text, thinking: thinking || undefined, error, usage };
+            } finally {
+              clientSignal?.removeEventListener("abort", onClientAbort);
+            }
+          })();
+
           return {
-            wait: () => run,
+            wait: () => work,
             abort: () => {
               if (!abort.signal.aborted) abort.abort();
+              void runRef?.cancel?.();
             },
             release: () => {
-              if (!abort.signal.aborted) abort.abort(RELEASE_REASON);
+              clientSignal?.removeEventListener("abort", onClientAbort);
             },
           };
         },
         async close() {
           closed = true;
+          agent.close();
         },
       };
+
       return handle;
     },
   };
-}
-
-function isAbortError(err: unknown): boolean {
-  if (!err || typeof err !== "object") return false;
-  const name = (err as { name?: string }).name;
-  if (name === "AbortError") return true;
-  const message = err instanceof Error ? err.message : String(err);
-  return /aborted|AbortError/i.test(message);
-}
-
-function isReleaseAbort(signal?: AbortSignal): boolean {
-  return signal?.reason === RELEASE_REASON;
-}
-
-function stopDuplex(duplex: NonNullable<Awaited<ReturnType<OpenAgentRun>>>, signal?: AbortSignal): Promise<void> {
-  if (isReleaseAbort(signal)) {
-    closeAgentDuplex(duplex);
-    return Promise.resolve();
-  }
-  return abortAgentDuplex(duplex);
-}
-
-async function runTurn(opts: {
-  openRun: OpenAgentRun;
-  accessToken: string;
-  conversationId: string;
-  agentSessionId: string;
-  modelId: string;
-  modelParameters?: AgentModelParam[];
-  cwd: string;
-  prompt: string;
-  images?: AgentInlineImage[];
-  onDelta?: (chunk: { text?: string; thinking?: string }) => void;
-  signal?: AbortSignal;
-  tools: CustomToolSpec[];
-  customTools: SdkCustomToolMap;
-  blobs: Map<string, string>;
-  conversationState?: JsonObject;
-  resume?: boolean;
-  customSystemPrompt?: string;
-  onCheckpoint: (state: JsonObject) => void;
-}): Promise<{ text: string; thinking?: string; error?: string; usage?: AgentTurnUsage }> {
-  let duplex: Awaited<ReturnType<OpenAgentRun>> | undefined;
-  let cancelled = false;
-  let aborting: Promise<void> | undefined;
-  const stopOnce = () => {
-    if (cancelled) return;
-    cancelled = true;
-    if (!duplex) return;
-    aborting = stopDuplex(duplex, opts.signal);
-  };
-  opts.signal?.addEventListener("abort", stopOnce, { once: true });
-  if (opts.signal?.aborted) stopOnce();
-
-  let text = "";
-  let thinking = "";
-  let error: string | undefined;
-  let usage: AgentTurnUsage | undefined;
-  const inflight = new Set<Promise<void>>();
-  let heartbeat: ReturnType<typeof setInterval> | undefined;
-
-  const track = (work: Promise<void>) => {
-    inflight.add(work);
-    void work.finally(() => inflight.delete(work));
-  };
-
-  try {
-    duplex = await opts.openRun({
-      accessToken: opts.accessToken,
-      conversationId: opts.conversationId,
-      signal: opts.signal,
-    });
-    if (cancelled) {
-      await stopDuplex(duplex, opts.signal);
-      return { text: "", thinking: undefined, error: undefined };
-    }
-
-    const runId = randomId();
-    heartbeat = setInterval(() => {
-      void duplex!.send(clientHeartbeatMessage()).catch(() => {
-        /* stream may already be closed */
-      });
-    }, HEARTBEAT_MS);
-
-    await duplex.send(
-      clientRunMessage(
-        buildRunRequest({
-          prompt: opts.prompt,
-          modelId: opts.modelId,
-          modelParameters: opts.modelParameters,
-          conversationId: opts.conversationId,
-          runId,
-          agentSessionId: opts.agentSessionId,
-          tools: opts.tools,
-          conversationState: opts.conversationState,
-          cwd: opts.cwd,
-          images: opts.images,
-          resume: opts.resume,
-          customSystemPrompt: opts.customSystemPrompt,
-        }),
-      ),
-    );
-
-    while (true) {
-      if (cancelled) break;
-      const raw = await duplex.next();
-      if (!raw) break;
-      const parsed = parseServerMessage(raw);
-      if (parsed.kind === "error") {
-        error = parsed.message;
-        break;
-      }
-      if (parsed.kind === "textDelta") {
-        text += parsed.text;
-        if (parsed.text) opts.onDelta?.({ text: parsed.text });
-        continue;
-      }
-      if (parsed.kind === "thinkingDelta") {
-        thinking += parsed.text;
-        if (parsed.text) opts.onDelta?.({ thinking: parsed.text });
-        continue;
-      }
-      if (parsed.kind === "checkpoint") {
-        opts.onCheckpoint(parsed.state);
-        continue;
-      }
-      if (parsed.kind === "usage") {
-        usage = mergeAgentTurnUsage(usage, parsed.usage);
-        continue;
-      }
-      if (parsed.kind === "turnEnded") {
-        usage = mergeAgentTurnUsage(usage, parsed.usage);
-        break;
-      }
-      if (parsed.kind === "abort") {
-        if (!cancelled) error = "AgentService aborted the run";
-        break;
-      }
-      if (parsed.kind === "heartbeat" || parsed.kind === "ignore" || parsed.kind === "query") {
-        continue;
-      }
-      if (parsed.kind === "kv") {
-        const kv = parseKvBlob(parsed.kv);
-        if (kv.op === "get") {
-          const data = kv.blobId ? lookupBlob(opts.blobs, kv.blobId) : undefined;
-          if (!data) console.log(`  agent_kv getBlob miss id=${String(kv.blobId || "").slice(0, 24)}`);
-          await duplex.send(kvGetBlobResult(kv.id, data, data === undefined ? "not found" : undefined));
-        } else if (kv.op === "set") {
-          if (kv.blobId && kv.blobData !== undefined) opts.blobs.set(kv.blobId, kv.blobData);
-          await duplex.send(kvSetBlobResult(kv.id));
-        }
-        continue;
-      }
-      if (parsed.kind === "exec") {
-        const { id, execId } = execIds(parsed.exec);
-        const kind = parsed.execKind;
-        if (kind === "requestContextArgs" || kind === "request_context_args") {
-          await duplex.send(requestContextResult(id, execId, { cwd: opts.cwd, tools: opts.tools }));
-          continue;
-        }
-        if (kind === "mcpStateExecArgs" || kind === "mcp_state_exec_args") {
-          await duplex.send(mcpStateResult(id, execId, opts.tools));
-          continue;
-        }
-        if (kind === "listMcpResourcesExecArgs" || kind === "list_mcp_resources_exec_args") {
-          await duplex.send(listMcpResourcesResult(id, execId));
-          continue;
-        }
-        if (kind === "readMcpResourceExecArgs" || kind === "read_mcp_resource_exec_args") {
-          await duplex.send(readMcpResourceNotFound(id, execId));
-          continue;
-        }
-        if (kind === "mcpAllowlistPrecheckArgs" || kind === "mcp_allowlist_precheck_args") {
-          await duplex.send(mcpAllowlistResult(id, execId, true));
-          continue;
-        }
-        if (kind === "mcpArgs" || kind === "mcp_args") {
-          const call = parseMcpArgs(parsed.exec);
-          track(
-            (async () => {
-              if (!call?.toolName) {
-                await duplex!.send(mcpErrorResult(id, execId, "missing MCP tool name"));
-                return;
-              }
-              const tool = opts.customTools[call.toolName];
-              if (!tool) {
-                await duplex!.send(mcpErrorResult(id, execId, `Unknown custom tool: ${call.toolName}`));
-                return;
-              }
-              try {
-                const result = await tool.execute(call.args || {}, { toolCallId: call.toolCallId });
-                if (cancelled) return;
-                await duplex!.send(
-                  mcpSuccessResult(id, execId, contentToText(result), Boolean(result.isError)),
-                );
-              } catch (err) {
-                if (cancelled) return;
-                const message = err instanceof Error ? err.message : String(err);
-                await duplex!.send(mcpErrorResult(id, execId, message));
-              }
-            })(),
-          );
-          continue;
-        }
-        await duplex.send(execThrow(id, `unsupported exec ${kind}`));
-      }
-    }
-
-    if (inflight.size) await Promise.allSettled([...inflight]);
-  } catch (err) {
-    if (!cancelled && !isAbortError(err)) {
-      error = err instanceof Error ? err.message : String(err);
-    }
-  } finally {
-    opts.signal?.removeEventListener("abort", stopOnce);
-    if (heartbeat) clearInterval(heartbeat);
-    if (aborting) await aborting;
-    else duplex?.close();
-  }
-  return { text, thinking: thinking || undefined, error, usage };
 }
 
 /** Default host used by the chat path. */
 export function defaultSdkAgentHost(): CustomToolAgentHost {
   return createSdkAgentHost();
 }
-
-export type { CustomToolSpec };

@@ -490,10 +490,10 @@ function streamCloudAsAnthropicSse(opts: {
 export function cloudHealthBody() {
   return {
     ok: true,
-    rpc: "agent.v1.AgentService/Run (customTools only)",
+    rpc: "@cursor/sdk local Agent (customTools / MCP family only)",
     modes: ["/v1/chat/completions", "/v1/messages"],
     auth: "Authorization Bearer Cursor API key",
-    tools: 'AgentService customTools (MCP family allowlist; in-process execute/park; no shell/edit/grep; not HTTP MCP; not InferenceService; not @cursor/sdk; not SDK/agent binaries; not Cloud Agents sandbox VM)',
+    tools: '@cursor/sdk local.customTools (tools=["mcp"]; in-process execute/park; no default shell/edit/grep)',
     models: "GET https://api.cursor.com/v1/models",
     session: "conversationId = tenant:agentRunFp (model/tools/system/first user); client x-session-id ignored",
   };

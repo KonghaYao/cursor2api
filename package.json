@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "OpenAI/Anthropic adapter over Cursor AgentService/Run. Maps Composer/Grok model aliases; client executes tool_calls. InferenceService/Stream is removed.",
+  "description": "OpenAI/Anthropic adapter over @cursor/sdk local agents. Maps Composer/Grok model aliases; client executes tool_calls.",
   "scripts": {
     "start": "node src/node.ts",
     "start:node": "node src/node.ts",
@@ -11,13 +11,14 @@
     "start:deno": "deno run --allow-net --allow-env src/deno.ts",
     "start:cf": "wrangler dev",
     "deploy:cf": "wrangler deploy",
-    "test": "node --experimental-strip-types --test src/lib/session.test.ts src/lib/session_fingerprint.test.ts src/lib/kv.test.ts src/lib/auth.test.ts src/lib/handler.test.ts src/lib/inference.model.test.ts src/lib/inference.compat.test.ts src/lib/connect_stream.test.ts src/lib/stream_session.test.ts src/lib/cloud_openai.test.ts src/lib/custom_tools.test.ts src/lib/custom_tool_chat.test.ts src/lib/agent_json.test.ts src/lib/sdk_agent_host.test.ts src/lib/agent_run.test.ts src/lib/conversation_state.test.ts",
+    "test": "node --experimental-strip-types --test src/lib/session.test.ts src/lib/session_fingerprint.test.ts src/lib/kv.test.ts src/lib/auth.test.ts src/lib/handler.test.ts src/lib/inference.model.test.ts src/lib/inference.compat.test.ts src/lib/connect_stream.test.ts src/lib/stream_session.test.ts src/lib/cloud_openai.test.ts src/lib/custom_tools.test.ts src/lib/custom_tool_chat.test.ts src/lib/agent_json.test.ts src/lib/agent_service_host.test.ts src/lib/agent_run.test.ts src/lib/conversation_state.test.ts",
     "test:deno": "deno task test"
   },
   "engines": {
     "node": ">=22.18"
   },
   "dependencies": {
+    "@cursor/sdk": "^1.0.31",
     "unstorage": "^1.17.5"
   },
   "devDependencies": {
