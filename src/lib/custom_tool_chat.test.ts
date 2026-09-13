@@ -721,6 +721,24 @@ test("OpenAI stream=true forwards AgentService thinking and text deltas", async 
   assert.match(sse, /"content":"lo"/);
   assert.equal(sse.includes('"content":"hello"'), false);
   assert.match(sse, /"finish_reason":"stop"/);
+  const deltaLines = sse
+    .split("\n")
+    .filter((line) => line.startsWith("data: ") && !line.includes("[DONE]"))
+    .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>);
+  const contentDelta = deltaLines.find((chunk) => {
+    const delta = (chunk.choices as Array<{ delta?: Record<string, unknown> }> | undefined)?.[0]?.delta;
+    return delta && "content" in delta;
+  });
+  assert.ok(contentDelta, "expected a content delta chunk");
+  assert.equal("conversation_id" in contentDelta!, false);
+  assert.equal("cursor_agent_id" in contentDelta!, false);
+  assert.match(String(deltaLines[0]?.id || ""), /^chatcmpl-[0-9a-f]{8}$/);
+  const finishChunk = deltaLines.find((chunk) => {
+    const choice = (chunk.choices as Array<{ finish_reason?: string | null }> | undefined)?.[0];
+    return choice?.finish_reason === "stop";
+  });
+  assert.ok(finishChunk);
+  assert.match(String(finishChunk!.conversation_id || ""), /:[0-9a-f]{64}$/);
 });
 
 test("OpenAI stream=true returns SSE before AgentService open", async () => {

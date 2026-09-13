@@ -1027,9 +1027,40 @@ export async function handleCustomToolMessages(opts: {
 const sseBytes = new TextEncoder();
 const SSE_CONNECTED = sseBytes.encode(": connected\n\n");
 const SSE_KEEPALIVE = sseBytes.encode(": keepalive\n\n");
-const SSE_KEEPALIVE_MS = 1_000;
+/** Only ping when the upstream is quiet — avoids waking Cursor Agent UI every second. */
+const SSE_KEEPALIVE_IDLE_MS = 15_000;
+const SSE_KEEPALIVE_CHECK_MS = 5_000;
 
 type StartedTurn = { live: LiveTurn; session: ClientToolSession; sessionId: string };
+
+function openAiStreamChunkId(sessionId: string): string {
+  const fp = sessionId.includes(":") ? sessionId.slice(sessionId.indexOf(":") + 1) : sessionId;
+  return `chatcmpl-${fp.slice(0, 8)}`;
+}
+
+function openAiStreamChunkBody(opts: {
+  chunkId: string;
+  created: number;
+  model: unknown;
+  delta: Record<string, unknown>;
+  finish: string | null;
+  extra?: Record<string, unknown>;
+  sessionMeta?: { sessionId: string; agentId: string };
+}): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    id: opts.chunkId,
+    object: "chat.completion.chunk",
+    created: opts.created,
+    model: String(opts.model || "composer-2.5"),
+    choices: [{ index: 0, delta: opts.delta, finish_reason: opts.finish }],
+    ...opts.extra,
+  };
+  if (opts.sessionMeta) {
+    body.conversation_id = opts.sessionMeta.sessionId;
+    body.cursor_agent_id = opts.sessionMeta.agentId;
+  }
+  return body;
+}
 
 function streamCustomOpenAi(opts: {
   open: (sendSignal: AbortSignal) => Promise<StartedTurn>;
@@ -1040,15 +1071,22 @@ function streamCustomOpenAi(opts: {
   let live: LiveTurn | undefined;
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      let lastOutboundMs = Date.now();
+      const touchOutbound = () => {
+        lastOutboundMs = Date.now();
+      };
       const keep = setInterval(() => {
+        if (Date.now() - lastOutboundMs < SSE_KEEPALIVE_IDLE_MS) return;
         try {
           controller.enqueue(SSE_KEEPALIVE);
+          touchOutbound();
         } catch {
           /* stream already closed */
         }
-      }, SSE_KEEPALIVE_MS);
+      }, SSE_KEEPALIVE_CHECK_MS);
       try {
         controller.enqueue(SSE_CONNECTED);
+        touchOutbound();
         const started = await opts.open(streamAbort.signal);
         live = started.live;
         if (streamAbort.signal.aborted) {
@@ -1057,32 +1095,44 @@ function streamCustomOpenAi(opts: {
         }
         const { session, sessionId } = started;
         const agentId = live.agent.agentId;
-        const chunk = (delta: Record<string, unknown>, finish: string | null = null, extra: Record<string, unknown> = {}) =>
-          encodeSseData({
-            id: agentId,
-            object: "chat.completion.chunk",
-            created,
-            model: String(opts.model || "composer-2.5"),
-            choices: [{ index: 0, delta, finish_reason: finish }],
-            cursor_agent_id: agentId,
-            conversation_id: sessionId,
-            ...extra,
-          });
+        const chunkId = openAiStreamChunkId(sessionId);
+        const sessionMeta = { sessionId, agentId };
+        const enqueueChunk = (
+          delta: Record<string, unknown>,
+          finish: string | null = null,
+          extra: Record<string, unknown> = {},
+          includeSessionMeta = false,
+        ) => {
+          controller.enqueue(
+            encodeSseData(
+              openAiStreamChunkBody({
+                chunkId,
+                created,
+                model: opts.model,
+                delta,
+                finish,
+                extra,
+                sessionMeta: includeSessionMeta ? sessionMeta : undefined,
+              }),
+            ),
+          );
+          touchOutbound();
+        };
         let emittedThinking = live.deltas.ackedThinking;
         let emittedText = live.deltas.ackedText;
         const flush = () => {
           const thinking = longerText(live!.thinking, live!.deltas.streamedThinking);
           const text = longerText(live!.text, live!.deltas.streamedText);
           if (thinking.length > emittedThinking) {
-            controller.enqueue(chunk({ reasoning_content: thinking.slice(emittedThinking) }));
+            enqueueChunk({ reasoning_content: thinking.slice(emittedThinking) });
             emittedThinking = thinking.length;
           }
           if (text.length > emittedText) {
-            controller.enqueue(chunk({ content: text.slice(emittedText) }));
+            enqueueChunk({ content: text.slice(emittedText) });
             emittedText = text.length;
           }
         };
-        controller.enqueue(chunk({ role: "assistant" }));
+        enqueueChunk({ role: "assistant" }, null, {}, true);
         const unsub = live.deltas.subscribe(flush);
         flush();
         const settled = await settleCustomTools(session, live);
@@ -1096,19 +1146,24 @@ function streamCustomOpenAi(opts: {
           releaseUpstreamAfterPark(live, session);
           const toolCalls = clientToolsToOpenAi(settled.batch);
           console.log(`  custom_tools park ${toolCalls.map((c) => c.function.name).join(",")}`);
-          controller.enqueue(chunk({ tool_calls: toolCalls }));
-          controller.enqueue(chunk({}, "tool_calls", { usage }));
+          enqueueChunk({ tool_calls: toolCalls });
+          enqueueChunk({}, "tool_calls", { usage }, true);
           controller.enqueue(
-            encodeSseData({
-              id: agentId,
-              object: "chat.completion.chunk",
-              created,
-              model: String(opts.model || "composer-2.5"),
-              choices: [],
-              usage,
-            }),
+            encodeSseData(
+              openAiStreamChunkBody({
+                chunkId,
+                created,
+                model: opts.model,
+                delta: {},
+                finish: null,
+                extra: { choices: [], usage },
+                sessionMeta,
+              }),
+            ),
           );
+          touchOutbound();
           controller.enqueue(sseBytes.encode("data: [DONE]\n\n"));
+          touchOutbound();
           return;
         }
         logAgentUsage(live.usage);
@@ -1117,7 +1172,7 @@ function streamCustomOpenAi(opts: {
           logCustomToolError(error.message);
           controller.enqueue(
             encodeSseData({
-              id: agentId,
+              id: chunkId,
               object: "chat.completion.chunk",
               created,
               model: String(opts.model || "composer-2.5"),
@@ -1125,20 +1180,26 @@ function streamCustomOpenAi(opts: {
               error: { message: error.message, type: error.type, code: error.code },
             }),
           );
+          touchOutbound();
           return;
         }
-        controller.enqueue(chunk({}, "stop", { usage }));
+        enqueueChunk({}, "stop", { usage }, true);
         controller.enqueue(
-          encodeSseData({
-            id: agentId,
-            object: "chat.completion.chunk",
-            created,
-            model: String(opts.model || "composer-2.5"),
-            choices: [],
-            usage,
-          }),
+          encodeSseData(
+            openAiStreamChunkBody({
+              chunkId,
+              created,
+              model: opts.model,
+              delta: {},
+              finish: null,
+              extra: { choices: [], usage },
+              sessionMeta,
+            }),
+          ),
         );
+        touchOutbound();
         controller.enqueue(sseBytes.encode("data: [DONE]\n\n"));
+        touchOutbound();
       } catch (err) {
         const error = mapAgentError(err instanceof Error ? err.message : String(err))!;
         controller.enqueue(
@@ -1176,13 +1237,19 @@ function streamCustomAnthropic(opts: {
   let live: LiveTurn | undefined;
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      let lastOutboundMs = Date.now();
+      const touchOutbound = () => {
+        lastOutboundMs = Date.now();
+      };
       const keep = setInterval(() => {
+        if (Date.now() - lastOutboundMs < SSE_KEEPALIVE_IDLE_MS) return;
         try {
           controller.enqueue(SSE_KEEPALIVE);
+          touchOutbound();
         } catch {
           /* stream already closed */
         }
-      }, SSE_KEEPALIVE_MS);
+      }, SSE_KEEPALIVE_CHECK_MS);
       let index = 0;
       let open: "thinking" | "text" | null = null;
       let emittedThinking = 0;
@@ -1204,6 +1271,7 @@ function streamCustomAnthropic(opts: {
       };
       try {
         controller.enqueue(SSE_CONNECTED);
+        touchOutbound();
         const started = await opts.open(streamAbort.signal);
         live = started.live;
         if (streamAbort.signal.aborted) {
