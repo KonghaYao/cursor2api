@@ -2,6 +2,7 @@ import { sha256Hex } from "./bytes.ts";
 import {
   ROLE,
   canonicalSerialize,
+  extractAgentMode,
   extractFastMode,
   extractMaxMode,
   extractReasoningEffort,
@@ -104,6 +105,7 @@ export async function computeSessionFp(
   const flags = stableStringify({
     fast: extractFastMode(body),
     maxMode: extractMaxMode(body),
+    mode: extractAgentMode(body),
   });
   const catalog = toolsCatalogText(tools);
   const system =

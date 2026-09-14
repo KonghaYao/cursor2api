@@ -48,6 +48,7 @@ import { agentRunIds, resolveSessionMode } from "./session.ts";
 import { computeAgentRunFp } from "./session_fingerprint.ts";
 import {
   clientToolsFromRequest,
+  filterToolsByToolChoice,
   resolveOfferedTools,
   clientToolsToAnthropic,
   clientToolsToOpenAi,
@@ -411,7 +412,12 @@ type LiveTurn = {
   error?: string;
   usage?: AgentTurnUsage;
   deltas: TextDeltaHub;
+  commitLength?: () => Promise<void>;
 };
+
+async function commitSuccessfulTurn(live: LiveTurn): Promise<void> {
+  await live.commitLength?.();
+}
 
 function attachClientAbort(signal: AbortSignal | undefined, abort: () => void): () => void {
   if (!signal) return () => {};
@@ -580,16 +586,17 @@ async function startCustomToolTurn(opts: {
     throw new CloudChatError("SESSION_MODE=random cannot park customTools.execute across turns.", 400);
   }
   const protocol = opts.protocol ?? "openai";
-  const tools = resolveOfferedTools(opts.body, protocol, opts.tools);
+  const catalog = resolveOfferedTools(opts.body, protocol, opts.tools);
+  const wireTools = filterToolsByToolChoice(catalog, opts.body);
   if (opts.body.tools === undefined && opts.tools.length) {
     console.log(
       `  custom_tools warn body.tools omitted — using handler catalog ${formatOfferedTools(opts.tools)} (client should send full tools every turn)`,
     );
   }
-  console.log(`  custom_tools offered ${formatOfferedTools(tools)}`);
-  const sessionFp = await sessionFpForCustomTools(opts.body, protocol, tools);
+  console.log(`  custom_tools offered ${formatOfferedTools(wireTools)}`);
+  const sessionFp = await sessionFpForCustomTools(opts.body, protocol, catalog);
   const computedIds = agentRunIds(tenant, sessionFp);
-  const session = upsertClientToolSession(tenant, sessionFp, tools);
+  const session = upsertClientToolSession(tenant, sessionFp, catalog);
   const messages = Array.isArray(opts.body.messages) ? opts.body.messages : [];
   const toolResults = extractLatestClientToolResults(messages);
   const toolFollowUp = lastTurnIsToolResult(messages) && toolResults.length > 0;
@@ -635,19 +642,19 @@ async function startCustomToolTurn(opts: {
 
   const spliced = await spliceConversationFromClient({
     body: opts.body,
-    tools,
+    tools: wireTools,
     messages,
     priorMessageCount: priorMessageCount ?? undefined,
   });
 
   const host = await resolveHost();
-  const customTools = toSdkCustomTools(session);
+  const customTools = toSdkCustomTools(session, wireTools);
   logToolCatalogAudit(
     auditToolCatalog({
-      offered: tools,
-      wireSpecs: specsForWireAudit(tools),
+      offered: catalog,
+      wireSpecs: specsForWireAudit(wireTools),
       execKeys: Object.keys(customTools),
-      policyText: tools.length ? toolPolicyPrompt(opts.body, tools) : undefined,
+      policyText: wireTools.length ? toolPolicyPrompt(opts.body, wireTools) : undefined,
     }),
     `pre_send session=${sessionId.slice(0, 24)}`,
   );
@@ -666,7 +673,7 @@ async function startCustomToolTurn(opts: {
   }));
   if (toolFollowUp) {
     console.log(
-      `  custom_tools follow_tool session=${sessionId.slice(0, 24)} offered=${formatOfferedTools(tools)} existing=${Boolean(existing)} kv=${Boolean(binding)} resume=${spliced.resume} roots=${(spliced.conversationState.rootPromptMessagesJson as unknown[] | undefined)?.length ?? 0} — new AgentService/Run`,
+      `  custom_tools follow_tool session=${sessionId.slice(0, 24)} offered=${formatOfferedTools(wireTools)} existing=${Boolean(existing)} kv=${Boolean(binding)} resume=${spliced.resume} roots=${(spliced.conversationState.rootPromptMessagesJson as unknown[] | undefined)?.length ?? 0} — new AgentService/Run`,
     );
   }
   const images = toolFollowUp ? [] : await lastUserAgentImages(messages);
@@ -677,7 +684,7 @@ async function startCustomToolTurn(opts: {
   const rootCount = (spliced.conversationState.rootPromptMessagesJson as unknown[] | undefined)?.length ?? 0;
   if (!toolFollowUp && (existing || binding)) {
     console.log(
-      `  custom_tools follow_user session=${sessionId.slice(0, 24)} offered=${formatOfferedTools(tools)} existing=${Boolean(existing)} kv=${Boolean(binding)} resume=${spliced.resume} roots=${rootCount}`,
+      `  custom_tools follow_user session=${sessionId.slice(0, 24)} offered=${formatOfferedTools(wireTools)} existing=${Boolean(existing)} kv=${Boolean(binding)} resume=${spliced.resume} roots=${rootCount}`,
     );
   }
   const deltas = createTextDeltaHub();
@@ -698,7 +705,6 @@ async function startCustomToolTurn(opts: {
     // 200, which would cancelAction a parked Run. Stream cancel uses sendSignal.
     ...(opts.sendSignal ? { signal: opts.sendSignal } : {}),
   });
-  await persistCommittedLength();
   const abortRun = () => run.abort?.();
   const releaseRun = () => (run.release ?? run.abort)?.();
   const detachClientAbort = opts.attachAbort === false ? () => {} : attachClientAbort(opts.signal, abortRun);
@@ -712,6 +718,7 @@ async function startCustomToolTurn(opts: {
     done: false,
     text: "",
     deltas,
+    commitLength: persistCommittedLength,
   };
   session.agentId = agent.agentId;
   liveTurns.set(key, live);
@@ -725,7 +732,7 @@ async function startCustomToolTurn(opts: {
     detachClientAbort();
   });
   const origin = existing ? "follow" : binding ? "kv_hit" : "create";
-  console.log(`  custom_tools ${origin} session=${sessionId.slice(0, 24)} agent=${agent.agentId.slice(0, 14)} tools=${tools.length} images=${images.length}`);
+  console.log(`  custom_tools ${origin} session=${sessionId.slice(0, 24)} agent=${agent.agentId.slice(0, 14)} tools=${wireTools.length} images=${images.length}`);
   return { live, session, sessionId, continued: false };
 }
 
@@ -947,6 +954,7 @@ export async function handleCustomToolChatCompletions(opts: {
       `  custom_tools park offered=${formatOfferedTools(started.session.tools)} ${toolCalls.map((c) => c.function.name).join(",")}`,
     );
     ackLiveDeltas(started.live, started.live.thinking, started.live.text);
+    await commitSuccessfulTurn(started.live);
     return jsonResponse(
       200,
       openAiCompletion({
@@ -965,6 +973,7 @@ export async function handleCustomToolChatCompletions(opts: {
   ackLiveDeltas(started.live, result.thinking, result.text);
   const error = mapAgentError(result.error);
   if (error) return openAiAgentErrorResponse(error);
+  await commitSuccessfulTurn(started.live);
   return jsonResponse(
     200,
     openAiCompletion({
@@ -1019,6 +1028,7 @@ export async function handleCustomToolMessages(opts: {
     releaseUpstreamAfterPark(started.live, started.session);
     const toolUses = clientToolsToAnthropic(settled.batch);
     ackLiveDeltas(started.live, started.live.thinking, started.live.text);
+    await commitSuccessfulTurn(started.live);
     return jsonResponse(200, {
       id: `msg_${agentId}`,
       type: "message",
@@ -1036,6 +1046,7 @@ export async function handleCustomToolMessages(opts: {
   ackLiveDeltas(started.live, result.thinking, result.text);
   const error = mapAgentError(result.error);
   if (error) return anthropicAgentErrorResponse(error, opts.requestId);
+  await commitSuccessfulTurn(started.live);
   return jsonResponse(200, {
     id: `msg_${agentId}`,
     type: "message",
@@ -1175,6 +1186,7 @@ function streamCustomOpenAi(opts: {
           );
           enqueueChunk({ tool_calls: toolCalls });
           enqueueChunk({}, "tool_calls", { usage }, true);
+          await commitSuccessfulTurn(live);
           controller.enqueue(
             encodeSseData(
               openAiStreamChunkBody({
@@ -1210,6 +1222,7 @@ function streamCustomOpenAi(opts: {
           touchOutbound();
           return;
         }
+        await commitSuccessfulTurn(live);
         enqueueChunk({}, "stop", { usage }, true);
         controller.enqueue(
           encodeSseData(
@@ -1406,6 +1419,7 @@ function streamCustomAnthropic(opts: {
             }),
           );
           controller.enqueue(encodeSseEvent("message_stop", { type: "message_stop" }));
+          await commitSuccessfulTurn(live);
           return;
         }
         logAgentUsage(live.usage);
@@ -1428,6 +1442,7 @@ function streamCustomAnthropic(opts: {
           }),
         );
         controller.enqueue(encodeSseEvent("message_stop", { type: "message_stop" }));
+        await commitSuccessfulTurn(live);
       } catch (err) {
         const error = mapAgentError(err instanceof Error ? err.message : String(err))!;
         controller.enqueue(

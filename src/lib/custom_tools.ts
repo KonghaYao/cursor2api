@@ -235,6 +235,24 @@ export function resolveOfferedTools(
   return handlerTools;
 }
 
+function toolChoiceForcedName(body: Record<string, unknown>): string | undefined {
+  const choice = body.tool_choice ?? body.toolChoice;
+  if (!choice || typeof choice !== "object" || Array.isArray(choice)) return undefined;
+  const rec = choice as Record<string, unknown>;
+  const type = String(rec.type || "").toLowerCase();
+  const fn = rec.function && typeof rec.function === "object" ? (rec.function as Record<string, unknown>) : undefined;
+  const name = String(fn?.name || (type === "tool" || type === "function" ? rec.name : "") || "");
+  return name || undefined;
+}
+
+/** Per-turn wire filter aligned with inference applyToolPolicy (function/tool name only). */
+export function filterToolsByToolChoice(tools: CustomToolDef[], body: Record<string, unknown>): CustomToolDef[] {
+  const name = toolChoiceForcedName(body);
+  if (!name) return tools;
+  const filtered = tools.filter((t) => t.openaiName === name || t.name === name);
+  return filtered.length ? filtered : tools;
+}
+
 function listedToolNames(tools: { name?: string; openaiName?: string }[]): string[] {
   return tools.map((t) => t.openaiName || t.name || "").filter(Boolean);
 }
@@ -640,6 +658,7 @@ export function failParkedClientTools(session: ClientToolSession, message: strin
 
 export function toSdkCustomTools(
   session: ClientToolSession,
+  wireTools?: CustomToolDef[],
 ): Record<
   string,
   {
@@ -649,7 +668,8 @@ export function toSdkCustomTools(
   }
 > {
   const out: Record<string, { description?: string; inputSchema?: Record<string, unknown>; execute: (args: Record<string, unknown>, ctx: { toolCallId?: string }) => Promise<CustomToolResult> }> = {};
-  for (const t of session.tools) {
+  const listed = wireTools ?? session.tools;
+  for (const t of listed) {
     out[t.name] = {
       description: t.description || t.openaiName,
       inputSchema: t.inputSchema,

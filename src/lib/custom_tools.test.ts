@@ -14,6 +14,7 @@ import {
   sanitizeCustomToolName,
   openaiToolsToCustom,
   clientToolsFromRequest,
+  filterToolsByToolChoice,
   parkClientToolCall,
   resolveClientToolResults,
   toolPolicyPrompt,
@@ -56,6 +57,25 @@ test("openai custom/mcp tool payloads still park as client tools", () => {
   ]);
   assert.deepEqual(tools.map((t) => t.openaiName), ["Write", "lookup"]);
   assert.equal(tools[0]?.inputSchema.properties && typeof tools[0].inputSchema.properties, "object");
+});
+
+test("filterToolsByToolChoice keeps catalog for none and filters function name", () => {
+  const catalog = openaiToolsToCustom([
+    { type: "custom", name: "Write" },
+    { type: "function", function: { name: "Edit" } },
+    { type: "function", function: { name: "Bash" } },
+  ]);
+  assert.deepEqual(filterToolsByToolChoice(catalog, { tool_choice: "none" }).map((t) => t.openaiName), [
+    "Write",
+    "Edit",
+    "Bash",
+  ]);
+  assert.deepEqual(
+    filterToolsByToolChoice(catalog, { tool_choice: { type: "function", function: { name: "Write" } } }).map(
+      (t) => t.openaiName,
+    ),
+    ["Write"],
+  );
 });
 
 test("clientToolsFromRequest reads this turn's body.tools and does not persist a catalog", () => {

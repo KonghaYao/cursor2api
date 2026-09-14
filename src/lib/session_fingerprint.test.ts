@@ -108,6 +108,14 @@ test("reasoning_effort change alters session_fp", async () => {
   assert.notEqual(a, b);
 });
 
+test("mode change alters session_fp", async () => {
+  const msgs = [{ role: "user", content: "hi" }];
+  const p = await runCanonicalMessagePipeline(msgs, body, []);
+  const agent = await computeSessionFp({ ...body, mode: "agent" }, [], { pipelined: p.messages, rawMessages: msgs });
+  const plan = await computeSessionFp({ ...body, mode: "plan" }, [], { pipelined: p.messages, rawMessages: msgs });
+  assert.notEqual(agent, plan);
+});
+
 test("tools catalog change alters session_fp", async () => {
   const msgs = [{ role: "user", content: "x" }];
   const p = await runCanonicalMessagePipeline(msgs, body, []);

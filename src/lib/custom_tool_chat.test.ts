@@ -11,7 +11,7 @@ import {
 } from "./custom_tool_chat.ts";
 import type { AgentInlineImage, JsonObject } from "./agent_json.ts";
 import { asObject, field } from "./agent_json.ts";
-import { createMemoryKv } from "./kv.ts";
+import { createMemoryKv, kvGetAgentRunLen } from "./kv.ts";
 import type { CustomToolAgentCreateOpts, CustomToolSendOpts } from "./custom_tool_chat.ts";
 import { createSdkAgentHost } from "./sdk_agent_host.ts";
 import type { AgentDuplex, OpenAgentRun } from "./agent_run.ts";
@@ -2261,5 +2261,92 @@ test("three user sentences stay one session: list tools, call, recall first sent
   assert.match(hopPrompts[0], new RegExp(third));
   assert.match(decodeRootPromptText(hopOpts[0]!.conversationState!, hopOpts[0]!.blobs!), /你的工具有什么/);
   assert.match(String(hopBody.choices[0].message.content || ""), /你的工具有什么/);
+});
+
+test("agent-run-len advances only after a successful turn", async () => {
+  let call = 0;
+  setCustomToolAgentHostForTests({
+    async create() {
+      return {
+        agentId: "agent-len",
+        async send() {
+          call += 1;
+          return {
+            wait: async () => {
+              if (call === 1) return { text: "ok" };
+              return { text: "", error: "upstream failed" };
+            },
+          };
+        },
+        async close() {},
+      };
+    },
+  });
+  const kv = createMemoryKv();
+  const headers = new Headers({ authorization: "Bearer crsr_test" });
+  const user1 = { role: "user", content: "hello" };
+  const ok = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [user1] },
+    tools: [],
+    kv,
+  });
+  assert.equal(ok.status, 200);
+  const okBody = await ok.json();
+  const sessionId = String(okBody.conversation_id);
+  const colon = sessionId.indexOf(":");
+  const tenant = sessionId.slice(0, colon);
+  const sessionFp = sessionId.slice(colon + 1);
+  assert.equal(await kvGetAgentRunLen(kv, tenant, sessionFp), 1);
+
+  const fail = await handleCustomToolChatCompletions({
+    headers,
+    body: {
+      model: "composer-2.5",
+      messages: [user1, { role: "assistant", content: "ok" }, { role: "user", content: "again" }],
+    },
+    tools: [],
+    kv,
+  });
+  assert.equal(fail.status, 502);
+  assert.equal(await kvGetAgentRunLen(kv, tenant, sessionFp), 1);
+});
+
+test("tool_choice function Write only offers Write on the wire", async () => {
+  const duplexes: ChatInteractiveDuplex[] = [];
+  const openRun: OpenAgentRun = async () => {
+    const duplex = new ChatInteractiveDuplex();
+    duplexes.push(duplex);
+    attachCatalogDiscovery(duplex, () => {
+      duplex.push({ interactionUpdate: { textDelta: { text: "ok" } } });
+      duplex.push({ interactionUpdate: { turnEnded: {} } });
+    });
+    return duplex;
+  };
+  setCustomToolAgentHostForTests(
+    createSdkAgentHost({
+      openRun,
+      exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+    }),
+  );
+  const catalog = [
+    { type: "custom" as const, name: "Write" },
+    { type: "function" as const, function: { name: "Edit" } },
+    { type: "function" as const, function: { name: "Bash" } },
+  ];
+  const res = await handleCustomToolChatCompletions({
+    headers: new Headers({ authorization: "Bearer crsr_test" }),
+    body: {
+      model: "composer-2.5",
+      messages: [{ role: "user", content: "write file" }],
+      tools: catalog,
+      tool_choice: { type: "function", function: { name: "Write" } },
+    },
+    tools: [],
+    kv: createMemoryKv(),
+  });
+  assert.equal(res.status, 200);
+  assert.deepEqual(duplexMcpToolNames(duplexes[0]!), ["Write"]);
+  assert.deepEqual(duplexMcpListedNames(duplexes[0]!), ["Write"]);
 });
 
