@@ -217,7 +217,8 @@ export function clientToolsDisabled(body: Record<string, unknown>): boolean {
 
 /** This request's catalog. Client sends the full list every turn; do not persist it. */
 export function clientToolsFromRequest(body: Record<string, unknown>, protocol: "openai" | "anthropic" = "openai"): CustomToolDef[] {
-  if (clientToolsDisabled(body)) return [];
+  // tool_choice "none" disables calling tools this turn, not the offered catalog.
+  // Zeroing mcpTools when body.tools is present makes Composer report "only MCP".
   return protocol === "anthropic" ? anthropicToolsToCustom(body.tools) : openaiToolsToCustom(body.tools);
 }
 
@@ -278,6 +279,9 @@ export function toolPolicyPrompt(body: Record<string, unknown>, tools: CustomToo
   const rec = choice && typeof choice === "object" && !Array.isArray(choice) ? (choice as Record<string, unknown>) : undefined;
   const type = typeof choice === "string" ? choice : String(rec?.type || rec?.mode || "auto");
   const fn = rec?.function && typeof rec.function === "object" ? (rec.function as Record<string, unknown>) : rec;
+  if (type === "none") {
+    extra.push("Do not call any tools this turn.");
+  }
   if (type === "required" || type === "any") {
     extra.push("You MUST call at least one listed custom tool. Do not respond with only text.");
   }
@@ -317,7 +321,7 @@ export function composeToolResultPrompt(
 ): string {
   const lines = results.map((r) => (r.isError ? `- ${r.id} ERROR: ${r.content}` : `- ${r.id}: ${r.content}`));
   const access =
-    opts?.deepHistory && tools.length ? customToolsInstruction(tools) : workspaceAccessPrompt(tools);
+    (opts?.deepHistory ?? false) && tools.length ? customToolsInstruction(tools) : workspaceAccessPrompt(tools);
   const writers = catalogWriterNames(listedToolNames(tools));
   return [
     "The client executed your custom tools. Results:",
@@ -391,18 +395,24 @@ export function transcriptHasToolRound(messages: unknown[]): boolean {
   return latestToolResultStart(messages) > 0 || extractClientToolResults(messages).length > 0;
 }
 
-/** Long sessions bury the first-root tool policy; repeat the full catalog on tool follow-up. */
-export function toolFollowUpDeepHistory(messages: unknown[]): boolean {
+/** Long sessions bury the first-root tool policy; repeat the full catalog on follow-up. */
+export function followUpDeepHistory(messages: unknown[]): boolean {
   return extractClientToolResults(messages).length >= 3 || messages.length > 30;
 }
+
+/** @deprecated use followUpDeepHistory */
+export const toolFollowUpDeepHistory = followUpDeepHistory;
 
 export function withWorkspaceAccess(
   prompt: string,
   tools: { name?: string; openaiName?: string }[],
   messages: unknown[],
 ): string {
-  const access = workspaceAccessPrompt(tools);
-  if (!access || !transcriptHasToolRound(messages)) return prompt;
+  if (!tools.length) return prompt;
+  const deep = followUpDeepHistory(messages);
+  const access = deep ? customToolsInstruction(tools) : workspaceAccessPrompt(tools);
+  if (!access) return prompt;
+  if (!deep && !transcriptHasToolRound(messages)) return prompt;
   if (prompt.startsWith(access)) return prompt;
   return `${access}\n\n${prompt}`;
 }

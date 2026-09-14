@@ -91,10 +91,21 @@ test("anthropic custom tools map the same way", () => {
   assert.equal(tools[0]?.inputSchema.type, "object");
 });
 
-test("tool_choice none disables client tools", () => {
+test("tool_choice none disables calling, not the offered catalog", () => {
   assert.equal(clientToolsDisabled({ tool_choice: "none" }), true);
   assert.equal(clientToolsDisabled({ tool_choice: { type: "none" } }), true);
   assert.equal(clientToolsDisabled({ tool_choice: "auto" }), false);
+  const catalog = [
+    { type: "custom", name: "Write" },
+    { type: "function", function: { name: "Bash" } },
+  ];
+  assert.deepEqual(clientToolsFromRequest({ tools: catalog, tool_choice: "none" }).map((t) => t.openaiName), [
+    "Write",
+    "Bash",
+  ]);
+  const policy = toolPolicyPrompt({ tool_choice: "none" }, clientToolsFromRequest({ tools: catalog, tool_choice: "none" }));
+  assert.match(policy, /Tools: Write, Bash/);
+  assert.match(policy, /Do not call any tools this turn/);
 });
 
 test("tool policy requires a named tool", () => {
@@ -366,6 +377,24 @@ test("composeToolResultPrompt repeats full catalog instruction on deep history",
   assert.doesNotMatch(shallow, /user's computer; their device is your computer/);
   assert.match(deep, /user's computer; their device is your computer/);
   assert.match(deep, /Use Bash to run shell commands/);
+});
+
+test("long user follow-up repeats full catalog even without a prior tool round", () => {
+  const tools = openaiToolsToCustom([
+    { type: "function", function: { name: "Write" } },
+    { type: "function", function: { name: "Bash" } },
+  ]);
+  const messages = Array.from({ length: 31 }, (_, i) =>
+    i % 2 === 0
+      ? { role: "user", content: `question ${i}` }
+      : { role: "assistant", content: `answer ${i}` },
+  );
+  messages.push({ role: "user", content: "edit the file now" });
+  const prompt = withWorkspaceAccess("edit the file now", tools, messages);
+  assert.match(prompt, /user's computer; their device is your computer/);
+  assert.match(prompt, /Tools: Write, Bash/);
+  assert.match(prompt, /Use Bash to run shell commands/);
+  assert.match(prompt, /edit the file now/);
 });
 
 test("sdk local agent allowlists only mcp so customTools work and builtins stay off", () => {

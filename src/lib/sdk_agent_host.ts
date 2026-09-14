@@ -116,6 +116,9 @@ export function createSdkAgentHost(opts?: {
       const blobs = new Map<string, string>();
       let conversationState: JsonObject | undefined = createOpts.conversationState;
       let closed = false;
+      // Follow-up Runs must not fall back to create()'s first-turn catalog when send()
+      // omits customTools (reused handle). Track the latest catalog from send().
+      let latestCustomTools: SdkCustomToolMap = createOpts.customTools;
 
       const handle: CustomToolAgentHandle = {
         agentId,
@@ -132,7 +135,8 @@ export function createSdkAgentHost(opts?: {
             for (const [id, data] of sendOpts.blobs) blobs.set(id, data);
           }
           if (sendOpts?.conversationState) conversationState = sendOpts.conversationState;
-          const customTools = sendOpts?.customTools ?? createOpts.customTools;
+          if (sendOpts?.customTools) latestCustomTools = sendOpts.customTools;
+          const customTools = sendOpts?.customTools ?? latestCustomTools;
           const tools = specsFromCustomTools(customTools);
           const run = runTurn({
             openRun,

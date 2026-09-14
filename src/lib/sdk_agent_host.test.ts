@@ -135,6 +135,41 @@ test("in-repo host parks Write when mcpArgs toolName is already prefixed", async
   await agent.close();
 });
 
+test("reused handle keeps the latest send() catalog when customTools is omitted", async () => {
+  const duplexes: InteractiveDuplex[] = [];
+  const openRun: OpenAgentRun = async () => {
+    const duplex = new InteractiveDuplex();
+    duplexes.push(duplex);
+    duplex.onSend = (message) => {
+      if (field(message, "runRequest")) {
+        duplex.push({ interactionUpdate: { textDelta: { text: "ok" } } });
+        duplex.push({ interactionUpdate: { turnEnded: {} } });
+      }
+    };
+    return duplex;
+  };
+  const writeTools = openaiToolsToCustom([{ type: "custom", name: "Write" }]);
+  const writeSession = upsertClientToolSession("t", "s-latest", writeTools);
+  const editTools = openaiToolsToCustom([{ type: "function", function: { name: "Edit" } }]);
+  const editSession = upsertClientToolSession("t", "s-latest", editTools);
+  const host = createSdkAgentHost({
+    openRun,
+    exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+  });
+  const agent = await host.create({
+    apiKey: "crsr_test",
+    model: "composer-2.5",
+    customTools: toSdkCustomTools(writeSession),
+  });
+  await (await agent.send("first", { customTools: toSdkCustomTools(writeSession) })).wait();
+  await (await agent.send("second", { customTools: toSdkCustomTools(editSession) })).wait();
+  await (await agent.send("third")).wait();
+  const names = (duplexes[2]?.sent[0]?.runRequest as { mcpTools?: { mcpTools?: Array<{ name: string }> } })?.mcpTools
+    ?.mcpTools?.map((t) => t.name);
+  assert.deepEqual(names, ["Edit"]);
+  await agent.close();
+});
+
 test("JWT credentials skip exchange_user_api_key", async () => {
   const jwt = "eyJhbGciOiJub25lIn0.eyJleHAiOjk5OTk5OTk5OTl9.test";
   let exchanged = false;

@@ -1683,6 +1683,49 @@ test("offered catalog ignores stale handler tools when body.tools differs", asyn
   assert.deepEqual(duplexMcpToolNames(duplexes[1]!), ["Grep"]);
 });
 
+test("tool_choice none still offers Write/Edit/Bash on the wire", async () => {
+  const duplexes: ChatInteractiveDuplex[] = [];
+  const openRun: OpenAgentRun = async () => {
+    const duplex = new ChatInteractiveDuplex();
+    duplexes.push(duplex);
+    attachCatalogDiscovery(duplex, () => {
+      duplex.push({ interactionUpdate: { textDelta: { text: "ok" } } });
+      duplex.push({ interactionUpdate: { turnEnded: {} } });
+    });
+    return duplex;
+  };
+  setCustomToolAgentHostForTests(
+    createSdkAgentHost({
+      openRun,
+      exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+    }),
+  );
+  const catalog = [
+    { type: "custom" as const, name: "Write" },
+    { type: "function" as const, function: { name: "Edit" } },
+    { type: "function" as const, function: { name: "Bash" } },
+  ];
+  const headers = new Headers({ authorization: "Bearer crsr_test" });
+  const user = { role: "user", content: "just chat" };
+  const res = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [user], tools: catalog, tool_choice: "none" },
+    tools: [],
+    kv: createMemoryKv(),
+  });
+  assert.equal(res.status, 200);
+  assert.deepEqual(duplexMcpToolNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
+  assert.deepEqual(duplexMcpListedNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
+  const spliced = await spliceConversationFromClient({
+    body: { messages: [user], tools: catalog, tool_choice: "none" },
+    tools: openaiToolsToCustom(catalog),
+    messages: [user],
+  });
+  const policyRoot = utf8FromBlobData(spliced.blobs.get(String((spliced.conversationState.rootPromptMessagesJson as string[])[0]))!);
+  assert.match(policyRoot, /Tools: Write, Edit, Bash/);
+  assert.match(policyRoot, /Do not call any tools this turn/);
+});
+
 test("Write park then a later user turn still offers Write and keeps the call in roots", async () => {
   const duplexes: ChatInteractiveDuplex[] = [];
   const openRun: OpenAgentRun = async () => {
