@@ -131,6 +131,32 @@ export function extractMaxMode(body: Record<string, unknown> | null | undefined)
   return extractBodyFlag(body, ["max", "max_mode", "maxMode", "maxModeEnabled"]);
 }
 
+/** SDK `AgentModeOption` / Cloud REST `mode`: agent (default) or plan. */
+export type AgentModeOption = "agent" | "plan";
+
+export function extractAgentMode(
+  body: Record<string, unknown> | null | undefined,
+): AgentModeOption | undefined {
+  if (!body || typeof body !== "object") return undefined;
+  const bags: Array<Record<string, unknown> | undefined> = [
+    body,
+    body.extra_body as Record<string, unknown> | undefined,
+    body.metadata as Record<string, unknown> | undefined,
+  ];
+  for (const bag of bags) {
+    if (!bag) continue;
+    for (const key of ["mode", "cursor_mode", "agent_mode"]) {
+      const raw = bag[key];
+      if (raw === "agent" || raw === "plan") return raw;
+      if (typeof raw === "string") {
+        const norm = raw.trim().toLowerCase();
+        if (norm === "agent" || norm === "plan") return norm;
+      }
+    }
+  }
+  return undefined;
+}
+
 function extractBodyFlag(body: Record<string, unknown> | null | undefined, keys: string[]): boolean {
   if (!body || typeof body !== "object") return false;
   const bags: Array<Record<string, unknown> | undefined> = [

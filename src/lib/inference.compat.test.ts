@@ -10,6 +10,7 @@ import {
   collectTurn,
   cursorBody,
   cursorBodyFromClient,
+  extractAgentMode,
   extractMaxMode,
   extractMaxTokens,
   extractStopSequences,
@@ -34,6 +35,13 @@ test("extractMaxMode reads body/extra_body/metadata", () => {
   assert.equal(extractMaxMode({ extra_body: { maxMode: true } }), true);
   assert.equal(extractMaxMode({ metadata: { max: true } }), true);
   assert.equal(extractMaxMode({ model: "composer-2.5" }), false);
+});
+
+test("extractAgentMode reads mode from body, metadata, and cursor_mode", () => {
+  assert.equal(extractAgentMode({ mode: "plan" }), "plan");
+  assert.equal(extractAgentMode({ metadata: { mode: "agent" } }), "agent");
+  assert.equal(extractAgentMode({ cursor_mode: "PLAN" }), "plan");
+  assert.equal(extractAgentMode({ model: "composer-2.5" }), undefined);
 });
 
 test("extractMaxTokens reads max_tokens then max_completion_tokens", () => {

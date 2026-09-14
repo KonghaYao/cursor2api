@@ -33,7 +33,9 @@ import { CloudChatError } from "./cloud_errors.ts";
 import { cloudApiKeyFromHeaders } from "./cloud_agents.ts";
 import { credentialFingerprint } from "./auth.ts";
 import {
+  extractAgentMode,
   extractFastMode,
+  extractMaxMode,
   extractReasoningEffort,
   flattenContent,
   toAnthropicError,
@@ -689,6 +691,8 @@ async function startCustomToolTurn(opts: {
     // empty `turns: []`. Do not rely on an in-memory checkpoint: Cursor's
     // echoed roots can be empty placeholders.
     conversationState: spliced.conversationState,
+    maxMode: extractMaxMode(opts.body),
+    mode: extractAgentMode(opts.body),
     onDelta: (chunk) => deltas.push(chunk),
     // Do not pass HTTP request.signal into send(): Deno.serve aborts it after
     // 200, which would cancelAction a parked Run. Stream cancel uses sendSignal.

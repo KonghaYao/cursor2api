@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   MCP_ALLOWED_PROTO_TOOLS,
+  agentModeWireValue,
   buildRunRequest,
   clientCancelMessage,
   connectErrorMessage,
@@ -171,12 +172,59 @@ test("buildRunRequest omits excludeWorkspaceContext and only carries mcp tools",
   });
   assert.equal(req.excludeWorkspaceContext, undefined);
   assert.equal((req.mcpFileSystemOptions as { enabled: boolean }).enabled, false);
-  const rm = req.requestedModel as { modelId: string; parameters?: Array<{ id: string; value: string }> };
+  const rm = req.requestedModel as { modelId: string; maxMode: boolean; parameters?: Array<{ id: string; value: string }> };
   assert.equal(rm.modelId, "composer-2.5");
+  assert.equal(rm.maxMode, false);
   assert.deepEqual(rm.parameters, [{ id: "fast", value: "false" }]);
   const tools = (req.mcpTools as { mcpTools: Array<{ name: string; toolName: string }> }).mcpTools;
   assert.equal(tools[0]?.toolName, "lookup");
   assert.equal(tools[0]?.name, "lookup");
+});
+
+test("buildRunRequest sets requestedModel.maxMode and omits userMessage.mode by default", () => {
+  const req = buildRunRequest({
+    prompt: "hi",
+    modelId: "composer-2.5",
+    conversationId: "c1",
+    runId: "r1",
+    agentSessionId: "a1",
+    tools: [],
+    maxMode: true,
+  });
+  const rm = req.requestedModel as { maxMode: boolean };
+  assert.equal(rm.maxMode, true);
+  const action = req.action as { userMessageAction?: { userMessage?: { mode?: string } } };
+  assert.equal(action.userMessageAction?.userMessage?.mode, undefined);
+});
+
+test("buildRunRequest wires plan mode on userMessageAction", () => {
+  assert.equal(agentModeWireValue("plan"), "AGENT_MODE_PLAN");
+  assert.equal(agentModeWireValue("agent"), "AGENT_MODE_AGENT");
+  const req = buildRunRequest({
+    prompt: "design first",
+    modelId: "composer-2.5-fast",
+    conversationId: "c1",
+    runId: "r1",
+    agentSessionId: "a1",
+    tools: [],
+    mode: "plan",
+  });
+  const action = req.action as { userMessageAction?: { userMessage?: { mode?: string; text?: string } } };
+  assert.equal(action.userMessageAction?.userMessage?.mode, "AGENT_MODE_PLAN");
+  assert.equal(action.userMessageAction?.userMessage?.text, "design first");
+  const grok = buildRunRequest({
+    prompt: "hi",
+    modelId: "grok-4.6-fast",
+    conversationId: "c1",
+    runId: "r2",
+    agentSessionId: "a1",
+    tools: [],
+    maxMode: true,
+    mode: "agent",
+  });
+  const grokRm = grok.requestedModel as { maxMode: boolean; modelId: string };
+  assert.equal(grokRm.maxMode, true);
+  assert.equal(grokRm.modelId, "grok-4.6");
 });
 
 test("buildRunRequest does not send customSystemPrompt", () => {
@@ -289,6 +337,15 @@ test("buildRunRequest attaches inline images and clientSupportsInlineImages", ()
     tools: [],
   });
   assert.equal(plain.clientSupportsInlineImages, undefined);
+});
+
+test("parseServerMessage surfaces interactionQuery", () => {
+  const parsed = parseServerMessage({
+    interactionQuery: { webSearchRequestQuery: { id: "q1" } },
+  });
+  assert.equal(parsed.kind, "query");
+  if (parsed.kind !== "query") throw new Error("expected query");
+  assert.ok(parsed.query.webSearchRequestQuery);
 });
 
 test("parseServerMessage reads turnEnded usage (proto JSON + nested SDK shape)", () => {

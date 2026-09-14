@@ -122,7 +122,7 @@ export function createSdkAgentHost(opts?: {
 
       const handle: CustomToolAgentHandle = {
         agentId,
-        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void; signal?: AbortSignal; conversationState?: JsonObject; blobs?: Map<string, string>; resume?: boolean; customSystemPrompt?: string; customTools?: SdkCustomToolMap }) {
+        async send(prompt: string, sendOpts?: { images?: AgentInlineImage[]; onDelta?: (chunk: { text?: string; thinking?: string }) => void; signal?: AbortSignal; conversationState?: JsonObject; blobs?: Map<string, string>; resume?: boolean; customSystemPrompt?: string; customTools?: SdkCustomToolMap; maxMode?: boolean; mode?: "agent" | "plan" }) {
           if (closed) throw new Error("agent is closed");
           const abort = new AbortController();
           const onClientAbort = () => abort.abort();
@@ -156,6 +156,8 @@ export function createSdkAgentHost(opts?: {
             conversationState,
             resume: Boolean(sendOpts?.resume),
             customSystemPrompt: sendOpts?.customSystemPrompt ?? createOpts.customSystemPrompt,
+            maxMode: sendOpts?.maxMode,
+            mode: sendOpts?.mode,
             onCheckpoint: (state) => {
               conversationState = unwrapCheckpointState(state);
               createOpts.onCheckpoint?.(conversationState);
@@ -219,6 +221,8 @@ async function runTurn(opts: {
   conversationState?: JsonObject;
   resume?: boolean;
   customSystemPrompt?: string;
+  maxMode?: boolean;
+  mode?: "agent" | "plan";
   onCheckpoint: (state: JsonObject) => void;
 }): Promise<{ text: string; thinking?: string; error?: string; usage?: AgentTurnUsage }> {
   let duplex: Awaited<ReturnType<OpenAgentRun>> | undefined;
@@ -276,7 +280,10 @@ async function runTurn(opts: {
       images: opts.images,
       resume: opts.resume,
       customSystemPrompt: opts.customSystemPrompt,
+      maxMode: opts.maxMode,
+      mode: opts.mode,
     });
+    console.log(`  agent_wire send runId=${runId} agentSessionId=${opts.agentSessionId}`);
     const mcpCount = ((runRequest.mcpTools as { mcpTools?: unknown[] } | undefined)?.mcpTools || []).length;
     if (opts.tools.length && mcpCount === 0) {
       console.log(`  agent_wire warn mcpTools empty specs=${opts.tools.map((t) => t.name).join(",") || "(none)"}`);
@@ -321,7 +328,14 @@ async function runTurn(opts: {
         if (!cancelled) error = "AgentService aborted the run";
         break;
       }
-      if (parsed.kind === "heartbeat" || parsed.kind === "ignore" || parsed.kind === "query") {
+      if (parsed.kind === "query") {
+        const keys = Object.keys(parsed.query);
+        console.log(
+          `  agent_wire warn interactionQuery unsupported keys=${keys.length ? keys.join(",") : "(empty)"}`,
+        );
+        continue;
+      }
+      if (parsed.kind === "heartbeat" || parsed.kind === "ignore") {
         continue;
       }
       if (parsed.kind === "kv") {

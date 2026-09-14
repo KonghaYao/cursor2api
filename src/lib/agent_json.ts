@@ -42,6 +42,13 @@ export function field(obj: JsonObject | undefined, ...names: string[]): unknown 
 
 export type AgentModelParam = { id: string; value: string };
 
+/** Connect JSON enum on `UserMessage.mode` (agent.v1). */
+export type AgentModeWire = "AGENT_MODE_AGENT" | "AGENT_MODE_PLAN";
+
+export function agentModeWireValue(mode: "agent" | "plan"): AgentModeWire {
+  return mode === "plan" ? "AGENT_MODE_PLAN" : "AGENT_MODE_AGENT";
+}
+
 /** Inline image on AgentService UserMessage.selectedContext (Connect JSON bytes = base64). */
 export type AgentInlineImage = {
   uuid: string;
@@ -123,6 +130,10 @@ export function buildRunRequest(opts: {
   images?: AgentInlineImage[];
   /** Tool-result follow-up: history is already in conversationState roots. */
   resume?: boolean;
+  /** Composer Max — mirrors Inference `requestedModel.maxMode`. */
+  maxMode?: boolean;
+  /** SDK `AgentModeOption`; wired as `userMessage.mode` on userMessageAction. */
+  mode?: "agent" | "plan";
   /**
    * Replaces Cursor's harness system prompt (SDK `AgentOptions.systemPrompt`).
    * Dashboard `crsr_` is access-gated: without it, AgentService returns
@@ -137,6 +148,7 @@ export function buildRunRequest(opts: {
   const requestedModel: JsonObject = {
     modelId: selection.modelId,
     builtInModel: true,
+    maxMode: Boolean(opts.maxMode),
   };
   if (parameters?.length) requestedModel.parameters = parameters;
   const images = opts.images?.filter((img) => img.data) ?? [];
@@ -144,6 +156,7 @@ export function buildRunRequest(opts: {
     text: opts.prompt,
     messageId,
   };
+  if (opts.mode) userMessage.mode = agentModeWireValue(opts.mode);
   if (images.length) {
     userMessage.selectedContext = {
       selectedImages: images.map((img) => ({
