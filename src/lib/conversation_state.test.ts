@@ -181,6 +181,7 @@ test("three user turns keep the first sentence in roots for the last question", 
 test("policy stays its own first root ahead of a large Cursor Agent system", async () => {
   const harness = `You are Cursor Grok 4.6. Native tools: Read, Write, Edit, Bash, Grep.\n${"x".repeat(8000)}`;
   const catalog = [
+    { type: "function" as const, function: { name: "Read" } },
     { type: "custom" as const, name: "Write" },
     { type: "function" as const, function: { name: "Edit" } },
     { type: "function" as const, function: { name: "Bash" } },
@@ -207,7 +208,8 @@ test("policy stays its own first root ahead of a large Cursor Agent system", asy
   assert.ok(ids.length >= 2);
   const policyRoot = utf8FromBlobData(spliced.blobs.get(String(ids[0]))!);
   const systemRoot = utf8FromBlobData(spliced.blobs.get(String(ids[1]))!);
-  assert.match(policyRoot, /Tools: Write, Edit, Bash/);
+  assert.match(policyRoot, /Tools: Read, Write, Edit, Bash/);
+  assert.match(policyRoot, /Use Read to inspect files; use Write or Edit to change them/);
   assert.match(policyRoot, /You have full read and write access/);
   assert.doesNotMatch(policyRoot, /MCP|custom-user-tools|unavailable|tool list changed|Native /i);
   assert.doesNotMatch(policyRoot, /You are Cursor Grok/);
@@ -219,12 +221,14 @@ test("policy stays its own first root ahead of a large Cursor Agent system", asy
   assert.match(roots, /wrote a\.ts/);
   assert.doesNotMatch(roots, /edit again/);
   assert.match(spliced.prompt, /You have full read and write access/);
-  assert.match(spliced.prompt, /Tools: Write, Edit, Bash/);
+  assert.match(spliced.prompt, /Use Read to inspect files/);
+  assert.match(spliced.prompt, /Tools: Read, Write, Edit, Bash/);
   assert.match(spliced.prompt, /edit again/);
 });
 
 test("long writer sessions re-inject tool policy in replayed roots", async () => {
   const catalog = [
+    { type: "function" as const, function: { name: "Read" } },
     { type: "custom" as const, name: "Write" },
     { type: "function" as const, function: { name: "Edit" } },
     { type: "function" as const, function: { name: "Bash" } },
@@ -243,7 +247,7 @@ test("long writer sessions re-inject tool policy in replayed roots", async () =>
     priorMessageCount: messages.length - 1,
   });
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
-  const policyHits = roots.match(/Tools: Write, Edit, Bash\./g) ?? [];
+  const policyHits = roots.match(/Tools: Read, Write, Edit, Bash\./g) ?? [];
   assert.ok(policyHits.length >= 2, `expected periodic root reminders, got ${policyHits.length}`);
   assert.match(spliced.prompt, /Apply file changes with Write or Edit immediately/);
   assert.match(spliced.prompt, /write the patch now/);

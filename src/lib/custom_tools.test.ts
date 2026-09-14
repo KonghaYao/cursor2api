@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test, { afterEach } from "node:test";
 import {
   anthropicToolsToCustom,
+  catalogHasFileTools,
   catalogHasWriters,
   clientToolsDisabled,
   clientToolsToOpenAi,
@@ -332,6 +333,39 @@ test("composeToolResultPrompt lists client tool output", () => {
   const failed = composeToolResultPrompt([{ id: "call_2", content: "lookup failed", isError: true }]);
   assert.match(failed, /call_2 ERROR:/);
   assert.match(failed, /lookup failed/);
+});
+
+test("policy pairs Read with Write when both are offered", () => {
+  const tools = openaiToolsToCustom([
+    { type: "function", function: { name: "Read" } },
+    { type: "function", function: { name: "Write" } },
+    { type: "function", function: { name: "Edit" } },
+    { type: "function", function: { name: "Grep" } },
+  ]);
+  assert.equal(catalogHasFileTools(tools), true);
+  assert.match(
+    workspaceAccessPrompt(tools),
+    /Use Read to inspect files; use Write or Edit to change them\./,
+  );
+  assert.match(workspaceAccessPrompt(tools), /You have full read and write access/);
+  assert.match(workspaceAccessPrompt(tools), /Tools: Read, Write, Edit, Grep/);
+  const full = toolPolicyPrompt({}, tools);
+  assert.match(full, /Use Read to inspect files; use Write or Edit to change them/);
+  assert.match(full, /Apply file changes with Write or Edit immediately/);
+});
+
+test("follow-up with Read-only catalog still reminds to use Read", () => {
+  const tools = openaiToolsToCustom([{ type: "function", function: { name: "Read" } }]);
+  assert.equal(catalogHasFileTools(tools), true);
+  const messages = [
+    { role: "user", content: "what is in package.json" },
+    { role: "assistant", content: "I can check" },
+    { role: "user", content: "read it now" },
+  ];
+  const prompt = withWorkspaceAccess("read it now", tools, messages);
+  assert.match(prompt, /Use Read to inspect files/);
+  assert.match(prompt, /read it now/);
+  assert.doesNotMatch(prompt, /MCP|custom-user-tools/i);
 });
 
 test("tool follow-up restates full read/write access when Write is in the catalog", () => {

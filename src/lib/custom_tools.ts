@@ -239,12 +239,42 @@ function listedToolNames(tools: { name?: string; openaiName?: string }[]): strin
   return tools.map((t) => t.openaiName || t.name || "").filter(Boolean);
 }
 
+function catalogReaderNames(names: string[]): string[] {
+  return names.filter((n) => /^Read$/i.test(n));
+}
+
 function catalogWriterNames(names: string[]): string[] {
   return names.filter((n) => /^(Write|Edit|StrReplace|ApplyPatch)$/i.test(n));
 }
 
+/** Read / write / search tools that need explicit policy (not Bash-only catalogs). */
+export function catalogHasFileTools(tools: { name?: string; openaiName?: string }[]): boolean {
+  const names = listedToolNames(tools);
+  return (
+    catalogReaderNames(names).length > 0 ||
+    catalogWriterNames(names).length > 0 ||
+    names.some((n) => /^(Grep|Glob)$/i.test(n))
+  );
+}
+
 export function catalogHasWriters(tools: { name?: string; openaiName?: string }[]): boolean {
   return catalogWriterNames(listedToolNames(tools)).length > 0;
+}
+
+/** Pair Read with writers so Composer maps "读写" to named tools, not harness builtins. */
+function fileAccessGuidance(names: string[]): string[] {
+  const readers = catalogReaderNames(names);
+  const writers = catalogWriterNames(names);
+  const out: string[] = [];
+  if (readers.length && writers.length) {
+    out.push(`Use ${joinOr(readers)} to inspect files; use ${joinOr(writers)} to change them.`);
+    out.push("You have full read and write access.");
+  } else if (writers.length) {
+    out.push("You have full read and write access.");
+  } else if (readers.length) {
+    out.push(`Use ${joinOr(readers)} to inspect files.`);
+  }
+  return out;
 }
 
 function joinOr(names: string[]): string {
@@ -260,10 +290,9 @@ function bashInCatalog(names: string[]): boolean {
 export function workspaceAccessPrompt(tools: { name?: string; openaiName?: string }[]): string {
   const names = listedToolNames(tools);
   if (!names.length) return "";
-  const writers = catalogWriterNames(names);
   const parts = [`Tools: ${names.join(", ")}.`];
   if (bashInCatalog(names)) parts.push("Use Bash to run shell commands on the user's computer.");
-  if (writers.length) parts.push("You have full read and write access.");
+  parts.push(...fileAccessGuidance(names));
   return parts.join(" ");
 }
 
@@ -278,10 +307,11 @@ export function customToolsInstruction(tools: { name?: string; openaiName?: stri
     `Tools: ${names.join(", ")}.`,
   ];
   if (bashInCatalog(names)) parts.push("Use Bash to run shell commands on the user's computer.");
+  parts.push(...fileAccessGuidance(names));
   const writers = catalogWriterNames(names);
   if (writers.length) {
     parts.push(
-      `You have full read and write access. Apply file changes with ${joinOr(writers)} immediately. Do not ask permission, describe a patch instead of applying it, or keep reading instead of writing.`,
+      `Apply file changes with ${joinOr(writers)} immediately. Do not ask permission, describe a patch instead of applying it, or keep reading instead of writing.`,
     );
   }
   return parts.join(" ");
@@ -337,8 +367,10 @@ export function composeToolResultPrompt(
   opts?: { deepHistory?: boolean },
 ): string {
   const lines = results.map((r) => (r.isError ? `- ${r.id} ERROR: ${r.content}` : `- ${r.id}: ${r.content}`));
-  const writers = catalogWriterNames(listedToolNames(tools));
-  const useFull = Boolean(tools.length && ((opts?.deepHistory ?? false) || writers.length));
+  const names = listedToolNames(tools);
+  const writers = catalogWriterNames(names);
+  const readers = catalogReaderNames(names);
+  const useFull = Boolean(tools.length && ((opts?.deepHistory ?? false) || writers.length || readers.length));
   const access = useFull ? customToolsInstruction(tools) : workspaceAccessPrompt(tools);
   return [
     "The client executed your custom tools. Results:",
@@ -450,10 +482,10 @@ export function withWorkspaceAccess(
   const deep = followUpDeepHistory(messages);
   const hasToolRound = transcriptHasToolRound(messages);
   const followUp = transcriptIsFollowUp(messages);
-  const writers = catalogHasWriters(tools);
-  const shouldRemind = deep || hasToolRound || (followUp && writers);
+  const fileTools = catalogHasFileTools(tools);
+  const shouldRemind = deep || hasToolRound || (followUp && fileTools);
   if (!shouldRemind) return prompt;
-  const useFull = deep || (writers && (followUp || hasToolRound));
+  const useFull = deep || (fileTools && (followUp || hasToolRound));
   const access = useFull ? customToolsInstruction(tools) : workspaceAccessPrompt(tools);
   if (!access) return prompt;
   if (prompt.startsWith(access)) return prompt;

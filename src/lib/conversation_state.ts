@@ -12,7 +12,7 @@
  * model returns "".
  */
 import {
-  catalogHasWriters,
+  catalogHasFileTools,
   composeToolResultPrompt,
   extractLatestClientToolResults,
   lastTurnIsToolResult,
@@ -31,7 +31,7 @@ const utf8Dec = new TextDecoder();
 
 const DEFAULT_SYSTEM = "You are a helpful assistant.";
 /** Re-inject write-tool policy in roots when history buries the first-root catalog. */
-const ROOT_POLICY_REMINDER_INTERVAL = 8;
+const ROOT_POLICY_REMINDER_INTERVAL = 4;
 
 export type ConversationBlobStore = Map<string, string>;
 
@@ -289,7 +289,7 @@ async function replayMessages(
 ): Promise<string[]> {
   const ids: string[] = [];
   const limit = Math.min(endExclusive, messages.length);
-  const rootsReminder = catalogHasWriters(tools) ? workspaceAccessPrompt(tools) : "";
+  const rootsReminder = catalogHasFileTools(tools) ? workspaceAccessPrompt(tools) : "";
   let rootsSinceReminder = 0;
   const pushReminderIfDue = async () => {
     if (!rootsReminder) return;
