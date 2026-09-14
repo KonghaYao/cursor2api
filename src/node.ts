@@ -126,7 +126,7 @@ function listen(host: string) {
 
 listen("127.0.0.1");
 listen("::1");
-console.log("  node  @cursor/sdk local agents (customTools / MCP family only)");
+console.log("  node  AgentService/Run customTools only (MCP family; no Cloud REST chat)");
 console.log("  GET  /health");
 console.log("  GET  /v1/models");
 console.log("  POST /v1/chat/completions");

@@ -54,7 +54,7 @@ if (isDeploy) {
   );
 }
 
-console.log("  deno  chat → @cursor/sdk local agents when not on Deno Deploy");
+console.log("  deno  chat → AgentService/Run customTools (MCP family; spliced conversationState)");
 console.log("  models GET https://api.cursor.com/v1/models");
 console.log("  tools    MCP family header + in-process custom-user-tools; no customSystemPrompt");
 console.log("  GET  /health");

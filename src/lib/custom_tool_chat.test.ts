@@ -13,7 +13,7 @@ import type { AgentInlineImage, JsonObject } from "./agent_json.ts";
 import { asObject, field } from "./agent_json.ts";
 import { createMemoryKv } from "./kv.ts";
 import type { CustomToolAgentCreateOpts, CustomToolSendOpts } from "./custom_tool_chat.ts";
-import { createAgentServiceHost } from "./agent_service_host.ts";
+import { createSdkAgentHost } from "./sdk_agent_host.ts";
 import type { AgentDuplex, OpenAgentRun } from "./agent_run.ts";
 import { decodeRootPromptText, spliceConversationFromClient, utf8FromBlobData } from "./conversation_state.ts";
 
@@ -248,7 +248,7 @@ test("AgentService conversationId survives an isolate hop via KV", async () => {
   assert.equal(second.status, 200);
   assert.equal(creates.length, 2);
   assert.equal(creates[1]?.conversationId, creates[0]?.conversationId);
-  assert.equal(creates[1]?.agentSessionId, "agent-hop");
+  assert.equal(creates[1]?.agentSessionId, creates[0]?.agentSessionId);
   assert.doesNotMatch(prompts[1] || "", /<system>/);
   assert.match(prompts[1] || "", /again/);
 });
@@ -838,25 +838,24 @@ test("Anthropic stream=true forwards thinking then text deltas", async () => {
   assert.match(sse, /"text":"ok"/);
 });
 
-test("role:tool resolves the parked SDK execute on the same run", async () => {
+test("role:tool opens a new send; tool_calls closes the previous AgentService run", async () => {
   const prompts: string[] = [];
+  const sendOpts: Array<CustomToolSendOpts | undefined> = [];
   let aborts = 0;
   let releases = 0;
   setCustomToolAgentHostForTests({
     async create({ customTools }) {
       return {
         agentId: "agent-scoped",
-        keepsParkedExecute: true,
-        async send(prompt) {
+        async send(prompt, opts) {
           prompts.push(prompt);
+          sendOpts.push(opts);
           const wait = (async () => {
+            if (String(prompt).includes("The client executed your custom tools")) return { text: "22c" };
             const tool = Object.values(customTools)[0];
             if (!tool) return { text: "no-tools" };
-            const result = await tool.execute({}, {});
-            const text = Array.isArray((result as { content?: Array<{ text?: string }> }).content)
-              ? String((result as { content: Array<{ text?: string }> }).content[0]?.text || "")
-              : "";
-            return { text: text ? `temp ${JSON.parse(text).temp}c` : "22c" };
+            await tool.execute({}, {});
+            return { text: "should-not-reach-client" };
           })();
           return {
             wait: () => wait,
@@ -899,14 +898,20 @@ test("role:tool resolves the parked SDK execute on the same run", async () => {
   });
   assert.equal(second.status, 200);
   const body2 = await second.json();
-  assert.equal(body2.choices[0].message.content, "temp 22c");
-  assert.equal(prompts.length, 1);
+  assert.equal(body2.choices[0].message.content, "22c");
+  assert.equal(prompts.length, 2);
+  assert.equal(sendOpts[1]?.resume, false);
+  assert.match(prompts[1], /The client executed your custom tools/);
+  assert.match(prompts[1], /22/);
+  assert.match(decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!), /weather\?/);
+  assert.doesNotMatch(decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!), /"temp":22/);
   assert.equal(aborts, 0);
 });
 
 test("three sequential catalog tools: get_weather then lookup then search then text", async () => {
   const prompts: string[] = [];
-  let toolRound = 0;
+  const sendOpts: Array<CustomToolSendOpts | undefined> = [];
+  let sends = 0;
   let aborts = 0;
   let releases = 0;
   const kv = createMemoryKv();
@@ -914,18 +919,17 @@ test("three sequential catalog tools: get_weather then lookup then search then t
     async create({ customTools }) {
       return {
         agentId: "agent-multi",
-        keepsParkedExecute: true,
-        async send(prompt) {
+        async send(prompt, opts) {
+          const round = sends++;
           prompts.push(prompt);
+          sendOpts.push(opts);
           const wait = (async () => {
+            if (round >= 3) return { text: "all three tools done" };
             const names = ["get_weather", "lookup", "search"];
-            while (toolRound < names.length) {
-              const tool = customTools[names[toolRound]!] || Object.values(customTools)[0];
-              if (!tool) return { text: "no-tools" };
-              toolRound += 1;
-              await tool.execute({ round: toolRound - 1 }, {});
-            }
-            return { text: "all three tools done" };
+            const tool = customTools[names[round]!] || Object.values(customTools)[0];
+            if (!tool) return { text: "no-tools" };
+            await tool.execute({ round }, {});
+            return { text: "should-not-reach-client" };
           })();
           return {
             wait: () => wait,
@@ -963,6 +967,7 @@ test("three sequential catalog tools: get_weather then lookup then search then t
   assert.equal(tc1[0].function.name, "get_weather");
   assert.equal(releases, 1);
   assert.equal(aborts, 0);
+  assert.equal(sendOpts[0]?.resume, false);
   assert.equal(prompts[0], "tokyo weather, humidity, then a headline");
 
   const second = await handleCustomToolChatCompletions({
@@ -986,7 +991,12 @@ test("three sequential catalog tools: get_weather then lookup then search then t
   assert.equal(tc2[0].function.name, "lookup");
   assert.equal(releases, 2);
   assert.equal(body2.conversation_id, body1.conversation_id);
-  assert.equal(prompts.length, 1);
+  assert.equal(sendOpts[1]?.resume, false);
+  assert.match(prompts[1], /The client executed your custom tools/);
+  assert.match(prompts[1], /22/);
+  const roots2 = decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!);
+  assert.match(roots2, /tokyo weather, humidity, then a headline/);
+  assert.doesNotMatch(roots2, /"temp":22/);
 
   const third = await handleCustomToolChatCompletions({
     headers,
@@ -1010,7 +1020,11 @@ test("three sequential catalog tools: get_weather then lookup then search then t
   const tc3 = body3.choices[0].message.tool_calls;
   assert.equal(tc3[0].function.name, "search");
   assert.equal(releases, 3);
-  assert.equal(prompts.length, 1);
+  assert.equal(sendOpts[2]?.resume, false);
+  assert.match(prompts[2], /40/);
+  const roots3 = decodeRootPromptText(sendOpts[2]!.conversationState!, sendOpts[2]!.blobs!);
+  assert.match(roots3, /temp/);
+  assert.doesNotMatch(roots3, /"humidity":40/);
 
   const fourth = await handleCustomToolChatCompletions({
     headers,
@@ -1034,29 +1048,33 @@ test("three sequential catalog tools: get_weather then lookup then search then t
   const body4 = await fourth.json();
   assert.equal(body4.choices[0].message.content, "all three tools done");
   assert.equal(body4.conversation_id, body1.conversation_id);
-  assert.equal(prompts.length, 1);
+  assert.equal(prompts.length, 4);
+  assert.equal(sendOpts[3]?.resume, false);
+  assert.match(prompts[3], /rain later/);
+  const roots4 = decodeRootPromptText(sendOpts[3]!.conversationState!, sendOpts[3]!.blobs!);
+  assert.match(roots4, /humidity/);
+  assert.match(roots4, /temp/);
+  assert.doesNotMatch(roots4, /rain later/);
   assert.equal(aborts, 0);
 });
 
 test("stream=true two tool rounds emit complete tool_calls then final text", async () => {
   const prompts: string[] = [];
-  let toolRound = 0;
+  let sends = 0;
   let releases = 0;
   setCustomToolAgentHostForTests({
     async create({ customTools }) {
       return {
         agentId: "agent-multi-sse",
-        keepsParkedExecute: true,
         async send(prompt) {
+          const round = sends++;
           prompts.push(prompt);
           const wait = (async () => {
-            while (toolRound < 2) {
-              const tool = Object.values(customTools)[0];
-              if (!tool) return { text: "no-tools" };
-              toolRound += 1;
-              await tool.execute({ round: toolRound - 1 }, {});
-            }
-            return { text: "done-sse" };
+            if (round >= 2) return { text: "done-sse" };
+            const tool = Object.values(customTools)[0];
+            if (!tool) return { text: "no-tools" };
+            await tool.execute({ round }, {});
+            return { text: "should-not-reach-client" };
           })();
           return {
             wait: () => wait,
@@ -1102,7 +1120,9 @@ test("stream=true two tool rounds emit complete tool_calls then final text", asy
   assert.match(sse2, /"finish_reason":"tool_calls"/);
   const tc2 = lastOpenAiSseToolCalls(sse2);
   assert.equal(releases, 2);
-  assert.equal(prompts.length, 1);
+  assert.match(prompts[1], /The client executed your custom tools/);
+  assert.match(prompts[1], /22/);
+  assert.doesNotMatch(prompts[1] || "", /weather\?/);
 
   const third = await handleCustomToolChatCompletions({
     headers,
@@ -1122,28 +1142,28 @@ test("stream=true two tool rounds emit complete tool_calls then final text", asy
   const sse3 = await consumeSse(third.body, () => {}, (buf) => buf.includes("data: [DONE]"));
   assert.match(sse3, /done-sse/);
   assert.match(sse3, /"finish_reason":"stop"/);
-  assert.equal(prompts.length, 1);
+  assert.equal(prompts.length, 3);
+  assert.match(prompts[2], /The client executed your custom tools/);
+  assert.match(prompts[2], /40/);
 });
 
 test("Anthropic two tool_use rounds then end_turn", async () => {
   const prompts: string[] = [];
-  let toolRound = 0;
+  let sends = 0;
   let releases = 0;
   setCustomToolAgentHostForTests({
     async create({ customTools }) {
       return {
         agentId: "agent-multi-anth",
-        keepsParkedExecute: true,
         async send(prompt) {
+          const round = sends++;
           prompts.push(prompt);
           const wait = (async () => {
-            while (toolRound < 2) {
-              const tool = Object.values(customTools)[0];
-              if (!tool) return { text: "no-tools" };
-              toolRound += 1;
-              await tool.execute({ round: toolRound - 1 }, {});
-            }
-            return { text: "40 percent" };
+            if (round >= 2) return { text: "40 percent" };
+            const tool = Object.values(customTools)[0];
+            if (!tool) return { text: "no-tools" };
+            await tool.execute({ round }, {});
+            return { text: "should-not-reach-client" };
           })();
           return {
             wait: () => wait,
@@ -1193,7 +1213,9 @@ test("Anthropic two tool_use rounds then end_turn", async () => {
   assert.ok(use2);
   assert.equal(releases, 2);
   assert.equal(body2.conversation_id, body1.conversation_id);
-  assert.equal(prompts.length, 1);
+  assert.match(prompts[1], /The client executed your custom tools/);
+  assert.match(prompts[1], /22/);
+  assert.doesNotMatch(prompts[1] || "", /weather\?/);
 
   const third = await handleCustomToolMessages({
     headers,
@@ -1214,7 +1236,8 @@ test("Anthropic two tool_use rounds then end_turn", async () => {
   const body3 = await third.json();
   assert.equal(body3.stop_reason, "end_turn");
   assert.equal(body3.content.find((b: { type?: string; text?: string }) => b.type === "text")?.text, "40 percent");
-  assert.equal(prompts.length, 1);
+  assert.match(prompts[2], /The client executed your custom tools/);
+  assert.match(prompts[2], /40/);
 });
 
 class ChatInteractiveDuplex implements AgentDuplex {
@@ -1376,7 +1399,7 @@ test("in-repo host: three sequential MCP parks then text; resume splices convers
     return duplex;
   };
   setCustomToolAgentHostForTests(
-    createAgentServiceHost({
+    createSdkAgentHost({
       openRun,
       exchange: async () => ({ accessToken: "tok", refreshToken: null }),
     }),
@@ -1488,7 +1511,7 @@ test("reused handle still offers Write/Edit/Bash on the next Run", async () => {
     return duplex;
   };
   setCustomToolAgentHostForTests(
-    createAgentServiceHost({
+    createSdkAgentHost({
       openRun,
       exchange: async () => ({ accessToken: "tok", refreshToken: null }),
     }),
@@ -1561,7 +1584,7 @@ test("follow-up mcpTools come from this request body.tools, not KV", async () =>
     return duplex;
   };
   setCustomToolAgentHostForTests(
-    createAgentServiceHost({
+    createSdkAgentHost({
       openRun,
       exchange: async () => ({ accessToken: "tok", refreshToken: null }),
     }),
@@ -1585,7 +1608,7 @@ test("follow-up mcpTools come from this request body.tools, not KV", async () =>
 
   customToolChatClearForTests();
   setCustomToolAgentHostForTests(
-    createAgentServiceHost({
+    createSdkAgentHost({
       openRun,
       exchange: async () => ({ accessToken: "tok", refreshToken: null }),
     }),
@@ -1639,7 +1662,7 @@ test("Write park then a later user turn still offers Write and keeps the call in
     return duplex;
   };
   setCustomToolAgentHostForTests(
-    createAgentServiceHost({
+    createSdkAgentHost({
       openRun,
       exchange: async () => ({ accessToken: "tok", refreshToken: null }),
     }),
@@ -2004,7 +2027,6 @@ test("three user sentences stay one session: list tools, call, recall first sent
     async create({ customTools }) {
       return {
         agentId: "agent-three-ask",
-        keepsParkedExecute: true,
         async send(prompt, opts) {
           const round = sends++;
           prompts.push(prompt);
@@ -2015,8 +2037,9 @@ test("three user sentences stay one session: list tools, call, recall first sent
               const tool = customTools.get_weather || Object.values(customTools)[0];
               if (!tool) return { text: "no-tools" };
               await tool.execute({ city: "Tokyo" }, {});
-              return { text: "东京 22 度。" };
+              return { text: "should-not-reach" };
             }
+            if (round === 2) return { text: "东京 22 度。" };
             return { text: `你的第一句话是「${first}」。` };
           })();
           return { wait: () => wait, abort() {}, release() {} };
@@ -2086,8 +2109,9 @@ test("three user sentences stay one session: list tools, call, recall first sent
   const b2b = await r2b.json();
   assert.equal(b2b.error, undefined);
   assert.equal(b2b.conversation_id, b1.conversation_id);
-  assert.match(String(b2b.choices[0].message.content || ""), /东京 22 度/);
-  assert.equal(prompts.length, 2);
+  assert.equal(sendOpts[2]?.resume, false);
+  assert.match(prompts[2], /The client executed your custom tools/);
+  assert.match(decodeRootPromptText(sendOpts[2]!.conversationState!, sendOpts[2]!.blobs!), /你的工具有什么/);
 
   const r3 = await handleCustomToolChatCompletions({
     headers,
@@ -2104,7 +2128,9 @@ test("three user sentences stay one session: list tools, call, recall first sent
   assert.equal(b3.error, undefined);
   assert.equal(b3.conversation_id, b1.conversation_id);
   assert.match(String(b3.choices[0].message.content || ""), /你的工具有什么/);
-  assert.equal(prompts[2], third);
+  assert.equal(prompts[3], third);
+  assert.ok(sendOpts[3]?.conversationState, "third user turn must send conversationState");
+  assert.match(decodeRootPromptText(sendOpts[3]!.conversationState!, sendOpts[3]!.blobs!), /你的工具有什么/);
 
   customToolChatClearForTests();
   sends = 0;

@@ -53,7 +53,6 @@ import {
   failParkedClientTools,
   lastTurnIsToolResult,
   offerClientToolBatch,
-  resolveClientToolResults,
   toSdkCustomTools,
   upsertClientToolSession,
   waitForClientToolBatch,
@@ -290,8 +289,6 @@ export type CustomToolSendOpts = {
 
 export type CustomToolAgentHandle = {
   agentId: string;
-  /** When true, `release()` after parking keeps `customTools.execute()` open for the next `role: tool`. */
-  keepsParkedExecute?: boolean;
   send: (
     prompt: string,
     opts?: CustomToolSendOpts,
@@ -393,7 +390,6 @@ function ackLiveDeltas(live: LiveTurn, thinking?: string, text?: string): void {
 
 type LiveTurn = {
   agent: CustomToolAgentHandle;
-  keepsParkedExecute: boolean;
   session: ClientToolSession;
   wait: () => Promise<CustomToolTurnResult>;
   abort?: () => void;
@@ -421,11 +417,11 @@ function attachClientAbort(signal: AbortSignal | undefined, abort: () => void): 
   return () => signal.removeEventListener("abort", onAbort);
 }
 
-/** Detach HTTP abort after offering tool_calls. Keep the SDK run alive so
- * `customTools.execute()` can resolve on the next `role: tool` request. */
-function releaseUpstreamAfterPark(live: LiveTurn, _session: ClientToolSession): void {
-  live.detachClientAbort?.();
-  live.release?.();
+/** Close this HTTP request's AgentService/Run after offering tool_calls.
+ * Close-only: `cancelAction` would void the turn and break the next `role: tool`. */
+function releaseUpstreamAfterPark(live: LiveTurn, session: ClientToolSession): void {
+  (live.release ?? live.abort)?.();
+  failParkedClientTools(session, "released: request-scoped AgentService run");
 }
 
 const liveTurns = new Map<string, LiveTurn>();
@@ -523,7 +519,7 @@ async function resolveHost(): Promise<CustomToolAgentHost> {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new CloudChatError(
-      `@cursor/sdk local agent unavailable (${message}). HTTP MCP is not used.`,
+      `In-process customTools need AgentService/Run (${message}). HTTP MCP is not used.`,
       501,
     );
   }
@@ -593,32 +589,18 @@ async function startCustomToolTurn(opts: {
     await kvSetAgentRunLen(opts.kv, tenant, sessionFp, messages.length);
   };
 
-  if (toolFollowUp) {
-    const canContinueSameRun = Boolean(
-      existing?.keepsParkedExecute &&
-        existing &&
-        !existing.done &&
-        session.parked.some((p) => p.offered && p.resolve),
-    );
-    if (canContinueSameRun) {
-      const resolved = resolveClientToolResults(session, toolResults);
-      if (resolved > 0) {
-        await persistCommittedLength();
-        console.log(
-          `  custom_tools resolve_tools session=${computedIds.conversationId.slice(0, 24)} resolved=${resolved} parked=${session.parked.length}`,
-        );
-        return { live: existing!, session, sessionId: computedIds.conversationId, continued: true };
-      }
-    }
-  }
-
   if (existing && !existing.done) {
-    existing.abort?.();
-    failParkedClientTools(session, "cancelled: new user turn");
+    if (toolFollowUp) {
+      (existing.release ?? existing.abort)?.();
+      if (session.parked.length) failParkedClientTools(session, "released: previous AgentService run");
+    } else {
+      existing.abort?.();
+      failParkedClientTools(session, "cancelled: new user turn");
+    }
     try {
       await existing.wait();
     } catch {
-      /* previous run closed */
+      /* previous AgentService/Run closed */
     }
   } else if (session.parked.length && !toolFollowUp) {
     failParkedClientTools(session, "cancelled: new user turn");
@@ -626,17 +608,16 @@ async function startCustomToolTurn(opts: {
 
   const binding = opts.kv ? await kvGetAgentRun(opts.kv, tenant, sessionFp, sessionFp) : null;
   const priorMessageCount = opts.kv ? await kvGetAgentRunLen(opts.kv, tenant, sessionFp) : null;
-  const ids = {
-    conversationId: binding?.conversationId ?? computedIds.conversationId,
-    agentSessionId: binding?.agentSessionId,
-  };
+  const ids = binding
+    ? { conversationId: binding.conversationId, agentSessionId: binding.agentSessionId }
+    : computedIds;
   const sessionId = ids.conversationId;
-  const persistBinding = async (agentSessionId: string) => {
+  const persistBinding = async () => {
     if (!opts.kv) return;
     await kvSetAgentRun(opts.kv, tenant, sessionFp, {
       fp: sessionFp,
       conversationId: ids.conversationId,
-      agentSessionId,
+      agentSessionId: ids.agentSessionId,
     });
   };
 
@@ -658,6 +639,9 @@ async function startCustomToolTurn(opts: {
     cwd: cwdFromClientSystem(opts.body),
     conversationId: ids.conversationId,
     agentSessionId: ids.agentSessionId,
+    onCheckpoint: () => {
+      void persistBinding();
+    },
   }));
   if (toolFollowUp) {
     console.log(
@@ -665,7 +649,7 @@ async function startCustomToolTurn(opts: {
     );
   }
   const images = toolFollowUp ? [] : await lastUserAgentImages(messages);
-  if (!existing) await persistBinding(agent.agentId);
+  if (!existing) await persistBinding();
   if (priorMessageCount && messages.length > priorMessageCount) {
     console.log(`  custom_tools slice prior=${priorMessageCount} n=${messages.length}`);
   }
@@ -697,7 +681,6 @@ async function startCustomToolTurn(opts: {
   const detachClientAbort = opts.attachAbort === false ? () => {} : attachClientAbort(opts.signal, abortRun);
   const live: LiveTurn = {
     agent,
-    keepsParkedExecute: Boolean(agent.keepsParkedExecute),
     session,
     wait: run.wait,
     abort: abortRun,
@@ -715,7 +698,7 @@ async function startCustomToolTurn(opts: {
     live.thinking = result.thinking;
     live.error = result.error;
     live.usage = result.usage;
-    void persistBinding(agent.agentId);
+    void persistBinding();
     detachClientAbort();
   });
   const origin = existing ? "follow" : binding ? "kv_hit" : "create";

@@ -10,8 +10,8 @@
 
 | 禁止 | 不要做的事 |
 |------|------------|
-| **聊天走 `@cursor/sdk` local** | 生产路径是 `src/lib/sdk_agent_host.ts` → `Agent.create` / `Agent.resume` + `local.customTools`。自研 Connect 客户端在 `src/lib/agent_service_host.ts`（单测/探针） |
-| **Deno Deploy 不支持** | `@cursor/sdk` local 需要本机 executor；`DENO_DEPLOYMENT_ID` 存在时 `createSdkAgentHost()` 直接 501。Node/Bun 本地或自建机部署 |
+| **不装 `@cursor/sdk`** | 不要写进 `package.json` / `deno.json` / `import("@cursor/sdk")`。聊天实现是仓库内 `src/lib/sdk_agent_host.ts` |
+| **不要二进制依赖** | 不要 SDK 平台包（`@cursor/sdk--*`）、不要本机 agent 可执行文件、不要为 `local: { cwd }` 拉 sandbox / ripgrep。Deno Deploy 跑不了这些 |
 | **不要 Cloud 托管 sandbox VM** | 不要 `Agent.create({ cloud })`，不要 `POST https://api.cursor.com/v1/agents` 开 `bc-…` 对话。VM 自带 shell/edit，没有 OpenAI 式 park `tool_calls` |
 
 **是什么：** 网关进程内对 `POST https://api2.cursor.sh/agent.v1.AgentService/Run` 的 Connect JSON 客户端；MCP 家族 allowlist 请求头压掉默认 shell/edit；客户端 function tools → 合成 MCP `custom-user-tools`（`mcpTools` + `requestContext` / `mcpState`），`customTools.execute()` 在本进程 park，返回 OpenAI `tool_calls`。每一枪 HTTP 开/关一条 Run（交 `tool_calls` 时 **close 双工、不发 `cancelAction`**）。**每一枪都要带** `conversationState`（缺字段 → `invalid_argument: Conversation state is required`）。从全量 transcript 拼 `rootPromptMessagesJson`（SHA-256 JSON blob + `getBlob`），对象里 **只** 放 roots，**不要**空 `turns: []`。`role: tool` 走 **`userMessageAction` + `composeToolResultPrompt`**（双工已关，空 `resumeAction` 会空白结束）。cwd 默认 `/tmp`（`GATEWAY_AGENT_CWD`）。默认不发 `customSystemPrompt`。模型仍是 Cursor 托管推理，**不在** Cursor sandbox VM。
