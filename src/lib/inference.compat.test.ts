@@ -41,7 +41,10 @@ test("extractAgentMode reads mode from body, metadata, and cursor_mode", () => {
   assert.equal(extractAgentMode({ mode: "plan" }), "plan");
   assert.equal(extractAgentMode({ metadata: { mode: "agent" } }), "agent");
   assert.equal(extractAgentMode({ cursor_mode: "PLAN" }), "plan");
-  assert.equal(extractAgentMode({ model: "composer-2.5" }), undefined);
+  assert.equal(extractAgentMode({ model: "composer-2.5" }), "agent");
+  assert.equal(extractAgentMode({ mode: "bypass" }), "agent");
+  assert.equal(extractAgentMode({ mode: "ask" }), "agent");
+  assert.equal(extractAgentMode(null), "agent");
 });
 
 test("extractMaxTokens reads max_tokens then max_completion_tokens", () => {

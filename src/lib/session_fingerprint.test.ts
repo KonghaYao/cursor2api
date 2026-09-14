@@ -116,6 +116,18 @@ test("mode change alters session_fp", async () => {
   assert.notEqual(agent, plan);
 });
 
+test("bypass mode aliases to agent in session_fp", async () => {
+  const msgs = [{ role: "user", content: "hi" }];
+  const p = await runCanonicalMessagePipeline(msgs, body, []);
+  const agent = await computeSessionFp({ ...body, mode: "agent" }, [], { pipelined: p.messages, rawMessages: msgs });
+  const bypass = await computeSessionFp({ ...body, mode: "bypass" }, [], { pipelined: p.messages, rawMessages: msgs });
+  const ask = await computeSessionFp({ ...body, mode: "ask" }, [], { pipelined: p.messages, rawMessages: msgs });
+  const defaultMode = await computeSessionFp(body, [], { pipelined: p.messages, rawMessages: msgs });
+  assert.equal(bypass, agent);
+  assert.equal(ask, agent);
+  assert.equal(defaultMode, agent);
+});
+
 test("tools catalog change alters session_fp", async () => {
   const msgs = [{ role: "user", content: "x" }];
   const p = await runCanonicalMessagePipeline(msgs, body, []);

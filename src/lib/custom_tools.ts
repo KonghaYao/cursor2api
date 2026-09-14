@@ -279,6 +279,10 @@ export function catalogHasWriters(tools: { name?: string; openaiName?: string }[
   return catalogWriterNames(listedToolNames(tools)).length > 0;
 }
 
+/** Execution context: bypass mode (not read-only ask). Keep short — no MCP lecture. */
+export const BYPASS_MODE_POLICY =
+  "Mode: bypass (full execution; apply edits immediately without asking for approval).";
+
 /** Pair Read with writers so Composer maps "读写" to named tools, not harness builtins. */
 function fileAccessGuidance(names: string[]): string[] {
   const readers = catalogReaderNames(names);
@@ -308,7 +312,7 @@ function bashInCatalog(names: string[]): boolean {
 export function workspaceAccessPrompt(tools: { name?: string; openaiName?: string }[]): string {
   const names = listedToolNames(tools);
   if (!names.length) return "";
-  const parts = [`Tools: ${names.join(", ")}.`];
+  const parts = [`Tools: ${names.join(", ")}.`, BYPASS_MODE_POLICY];
   if (bashInCatalog(names)) parts.push("Use Bash to run shell commands on the user's computer.");
   parts.push(...fileAccessGuidance(names));
   return parts.join(" ");
@@ -323,6 +327,7 @@ export function customToolsInstruction(tools: { name?: string; openaiName?: stri
   const parts = [
     "You run on the user's computer; their device is your computer.",
     `Tools: ${names.join(", ")}.`,
+    BYPASS_MODE_POLICY,
   ];
   if (bashInCatalog(names)) parts.push("Use Bash to run shell commands on the user's computer.");
   parts.push(...fileAccessGuidance(names));

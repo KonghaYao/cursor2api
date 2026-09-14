@@ -181,7 +181,7 @@ test("buildRunRequest omits excludeWorkspaceContext and only carries mcp tools",
   assert.equal(tools[0]?.name, "lookup");
 });
 
-test("buildRunRequest sets requestedModel.maxMode and omits userMessage.mode by default", () => {
+test("buildRunRequest always sends AGENT_MODE_AGENT by default", () => {
   const req = buildRunRequest({
     prompt: "hi",
     modelId: "composer-2.5",
@@ -194,7 +194,7 @@ test("buildRunRequest sets requestedModel.maxMode and omits userMessage.mode by 
   const rm = req.requestedModel as { maxMode: boolean };
   assert.equal(rm.maxMode, true);
   const action = req.action as { userMessageAction?: { userMessage?: { mode?: string } } };
-  assert.equal(action.userMessageAction?.userMessage?.mode, undefined);
+  assert.equal(action.userMessageAction?.userMessage?.mode, "AGENT_MODE_AGENT");
 });
 
 test("buildRunRequest wires plan mode on userMessageAction", () => {

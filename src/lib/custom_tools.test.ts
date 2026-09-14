@@ -147,6 +147,7 @@ test("tool policy is a short catalog without MCP lecture", () => {
   const text = toolPolicyPrompt({ tool_choice: "auto" }, tools);
   assert.match(text, /You run on the user's computer/);
   assert.match(text, /Tools: Write, Edit, Bash\./);
+  assert.match(text, /Mode: bypass \(full execution/);
   assert.match(text, /You have full read and write access/);
   assert.match(text, /Apply file changes with Write or Edit immediately/);
   assert.match(text, /keep reading instead of writing/);
@@ -414,7 +415,7 @@ test("tool follow-up restates full read/write access when Write is in the catalo
   assert.match(later, /edit again/);
   assert.equal(
     workspaceAccessPrompt(tools),
-    "Tools: Write, Edit. You have full read and write access.",
+    "Tools: Write, Edit. Mode: bypass (full execution; apply edits immediately without asking for approval). You have full read and write access.",
   );
 });
 

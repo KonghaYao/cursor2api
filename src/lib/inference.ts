@@ -131,13 +131,13 @@ export function extractMaxMode(body: Record<string, unknown> | null | undefined)
   return extractBodyFlag(body, ["max", "max_mode", "maxMode", "maxModeEnabled"]);
 }
 
-/** SDK `AgentModeOption` / Cloud REST `mode`: agent (default) or plan. */
+/** SDK `AgentModeOption` / Cloud REST `mode`: agent (default) or plan. Never read-only ask. */
 export type AgentModeOption = "agent" | "plan";
 
 export function extractAgentMode(
   body: Record<string, unknown> | null | undefined,
-): AgentModeOption | undefined {
-  if (!body || typeof body !== "object") return undefined;
+): AgentModeOption {
+  if (!body || typeof body !== "object") return "agent";
   const bags: Array<Record<string, unknown> | undefined> = [
     body,
     body.extra_body as Record<string, unknown> | undefined,
@@ -147,14 +147,17 @@ export function extractAgentMode(
     if (!bag) continue;
     for (const key of ["mode", "cursor_mode", "agent_mode"]) {
       const raw = bag[key];
-      if (raw === "agent" || raw === "plan") return raw;
+      if (raw === "plan") return "plan";
+      if (raw === "agent") return "agent";
       if (typeof raw === "string") {
         const norm = raw.trim().toLowerCase();
-        if (norm === "agent" || norm === "plan") return norm;
+        if (norm === "plan") return "plan";
+        // bypass / ask → agent (full execution; never read-only on wire)
+        if (norm === "agent" || norm === "bypass" || norm === "ask") return "agent";
       }
     }
   }
-  return undefined;
+  return "agent";
 }
 
 function extractBodyFlag(body: Record<string, unknown> | null | undefined, keys: string[]): boolean {

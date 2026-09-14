@@ -155,8 +155,8 @@ export function buildRunRequest(opts: {
   const userMessage: JsonObject = {
     text: opts.prompt,
     messageId,
+    mode: agentModeWireValue(opts.mode ?? "agent"),
   };
-  if (opts.mode) userMessage.mode = agentModeWireValue(opts.mode);
   if (images.length) {
     userMessage.selectedContext = {
       selectedImages: images.map((img) => ({
