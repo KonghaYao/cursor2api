@@ -110,7 +110,8 @@ test("tool policy is a short catalog without MCP lecture", () => {
     { type: "function", function: { name: "Bash" } },
   ]);
   const text = toolPolicyPrompt({ tool_choice: "auto" }, tools);
-  assert.match(text, /^Tools: Write, Edit, Bash\./);
+  assert.match(text, /You run on the user's computer/);
+  assert.match(text, /Tools: Write, Edit, Bash\./);
   assert.match(text, /You have full read and write access/);
   assert.match(text, /Apply file changes with Write or Edit immediately/);
   assert.match(text, /keep reading instead of writing/);
@@ -120,7 +121,7 @@ test("tool policy is a short catalog without MCP lecture", () => {
 test("tool policy names StrReplace when that is the writer in the catalog", () => {
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "StrReplace" } }]);
   const text = toolPolicyPrompt({ tool_choice: "auto" }, tools);
-  assert.match(text, /^Tools: StrReplace\./);
+  assert.match(text, /Tools: StrReplace\./);
   assert.match(text, /Apply file changes with StrReplace immediately/);
   assert.doesNotMatch(text, /Write or Edit immediately/);
 });
@@ -128,7 +129,8 @@ test("tool policy names StrReplace when that is the writer in the catalog", () =
 test("tool policy does not lecture weather-only catalogs about Write", () => {
   const tools = openaiToolsToCustom([{ type: "function", function: { name: "get_weather" } }]);
   const text = toolPolicyPrompt({ tool_choice: "auto" }, tools);
-  assert.equal(text, "Tools: get_weather.");
+  assert.match(text, /You run on the user's computer/);
+  assert.match(text, /Tools: get_weather\./);
   assert.doesNotMatch(text, /Write or Edit|full read and write|describe a patch|MCP/i);
 });
 
@@ -271,7 +273,8 @@ test("composeCustomToolTurnPrompt puts latest tool results on the user action", 
     messages: [...messages, { role: "assistant", content: "22c 40%" }, { role: "user", content: "and osaka?" }],
     hadPriorTurn: true,
   });
-  assert.equal(nextUser, "and osaka?");
+  assert.match(nextUser, /Tools: lookup/);
+  assert.match(nextUser, /and osaka\?/);
 });
 
 test("composeCustomToolTurnPrompt slices multiple new users after priorMessageCount", () => {
@@ -338,7 +341,31 @@ test("tool follow-up restates full read/write access when Write is in the catalo
   assert.match(later, /You have full read and write access/);
   assert.match(later, /Tools: Write, Edit/);
   assert.match(later, /edit again/);
-  assert.equal(workspaceAccessPrompt(tools), "You have full read and write access. Tools: Write, Edit.");
+  assert.equal(
+    workspaceAccessPrompt(tools),
+    "Tools: Write, Edit. You have full read and write access.",
+  );
+});
+
+test("tool follow-up lists Bash/Grep when no writers in catalog", () => {
+  const tools = openaiToolsToCustom([
+    { type: "function", function: { name: "Bash" } },
+    { type: "function", function: { name: "Grep" } },
+  ]);
+  const text = composeToolResultPrompt([{ id: "call_g", content: "found 3" }], tools);
+  assert.match(text, /Tools: Bash, Grep/);
+  assert.match(text, /Use Bash to run shell commands/);
+  assert.doesNotMatch(text, /full read and write access/);
+});
+
+test("composeToolResultPrompt repeats full catalog instruction on deep history", () => {
+  const tools = openaiToolsToCustom([{ type: "function", function: { name: "Bash" } }]);
+  const shallow = composeToolResultPrompt([{ id: "c", content: "ok" }], tools);
+  const deep = composeToolResultPrompt([{ id: "c", content: "ok" }], tools, { deepHistory: true });
+  assert.match(shallow, /Use Bash to run shell commands/);
+  assert.doesNotMatch(shallow, /user's computer; their device is your computer/);
+  assert.match(deep, /user's computer; their device is your computer/);
+  assert.match(deep, /Use Bash to run shell commands/);
 });
 
 test("sdk local agent allowlists only mcp so customTools work and builtins stay off", () => {

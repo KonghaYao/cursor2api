@@ -234,12 +234,19 @@ function joinOr(names: string[]): string {
   return `${names.slice(0, -1).join(", ")}, or ${names[names.length - 1]}`;
 }
 
+function bashInCatalog(names: string[]): boolean {
+  return names.some((n) => /^Bash$/i.test(n));
+}
+
 /** Adjacent reminder after a tool round. First-root policy is too far back for Composer. */
 export function workspaceAccessPrompt(tools: { name?: string; openaiName?: string }[]): string {
   const names = listedToolNames(tools);
+  if (!names.length) return "";
   const writers = catalogWriterNames(names);
-  if (!writers.length) return "";
-  return `You have full read and write access. Tools: ${names.join(", ")}.`;
+  const parts = [`Tools: ${names.join(", ")}.`];
+  if (bashInCatalog(names)) parts.push("Use Bash to run shell commands on the user's computer.");
+  if (writers.length) parts.push("You have full read and write access.");
+  return parts.join(" ");
 }
 
 export function customToolsInstruction(tools: { name?: string; openaiName?: string }[]): string {
@@ -248,7 +255,11 @@ export function customToolsInstruction(tools: { name?: string; openaiName?: stri
   // Short catalog. Do not mention MCP / custom-user-tools / missing tools —
   // that text becomes protocol anxiety. Workspace writes are pre-authorized:
   // Composer otherwise describes a patch and waits to be told to apply it.
-  const parts = [`Tools: ${names.join(", ")}.`];
+  const parts = [
+    "You run on the user's computer; their device is your computer.",
+    `Tools: ${names.join(", ")}.`,
+  ];
+  if (bashInCatalog(names)) parts.push("Use Bash to run shell commands on the user's computer.");
   const writers = catalogWriterNames(names);
   if (writers.length) {
     parts.push(
@@ -302,14 +313,17 @@ export type ClientToolResult = { id: string; content: string; isError?: boolean 
 export function composeToolResultPrompt(
   results: ClientToolResult[],
   tools: { name?: string; openaiName?: string }[] = [],
+  opts?: { deepHistory?: boolean },
 ): string {
   const lines = results.map((r) => (r.isError ? `- ${r.id} ERROR: ${r.content}` : `- ${r.id}: ${r.content}`));
-  const access = workspaceAccessPrompt(tools);
+  const access =
+    opts?.deepHistory && tools.length ? customToolsInstruction(tools) : workspaceAccessPrompt(tools);
+  const writers = catalogWriterNames(listedToolNames(tools));
   return [
     "The client executed your custom tools. Results:",
     ...lines,
     access || "Continue from these results. Take the next action now; do not only describe it.",
-    access ? "Apply remaining file changes now." : "",
+    writers.length && access ? "Apply remaining file changes now." : "",
   ]
     .filter(Boolean)
     .join("\n");
@@ -375,6 +389,11 @@ export function extractLatestClientToolResults(messages: unknown[]): ClientToolR
 
 export function transcriptHasToolRound(messages: unknown[]): boolean {
   return latestToolResultStart(messages) > 0 || extractClientToolResults(messages).length > 0;
+}
+
+/** Long sessions bury the first-root tool policy; repeat the full catalog on tool follow-up. */
+export function toolFollowUpDeepHistory(messages: unknown[]): boolean {
+  return extractClientToolResults(messages).length >= 3 || messages.length > 30;
 }
 
 export function withWorkspaceAccess(

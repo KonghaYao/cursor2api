@@ -53,6 +53,7 @@ import {
   failParkedClientTools,
   lastTurnIsToolResult,
   offerClientToolBatch,
+  toolFollowUpDeepHistory,
   toSdkCustomTools,
   upsertClientToolSession,
   waitForClientToolBatch,
@@ -261,7 +262,11 @@ export function composeCustomToolTurnPrompt(opts: {
   void opts.body;
   void opts.hadPriorTurn;
   const latest = extractLatestClientToolResults(opts.messages);
-  if (lastTurnIsToolResult(opts.messages) && latest.length > 0) return composeToolResultPrompt(latest, opts.tools);
+  if (lastTurnIsToolResult(opts.messages) && latest.length > 0) {
+    return composeToolResultPrompt(latest, opts.tools, {
+      deepHistory: toolFollowUpDeepHistory(opts.messages),
+    });
+  }
   const prior = opts.priorMessageCount;
   const canSlice = prior != null && Number.isInteger(prior) && prior > 0 && opts.messages.length > prior;
   if (canSlice) {
@@ -443,10 +448,17 @@ function liveKey(tenant: string, sessionFp: string): string {
 function offeredToolsThisTurn(
   body: Record<string, unknown>,
   protocol: "openai" | "anthropic",
-  tools: CustomToolDef[],
+  handlerTools: CustomToolDef[],
 ): CustomToolDef[] {
-  if (tools.length) return tools;
-  return clientToolsFromRequest(body, protocol);
+  // Cursor Agent sends the full catalog on body.tools every turn. When present
+  // (including []), that is the only source of truth — handlerTools may be stale.
+  if (body.tools !== undefined) return clientToolsFromRequest(body, protocol);
+  return handlerTools;
+}
+
+function formatOfferedTools(tools: CustomToolDef[]): string {
+  const names = tools.map((t) => t.openaiName || t.name).filter(Boolean);
+  return names.length ? names.join(",") : "(none)";
 }
 
 /** Anthropic `thinking.budget_tokens` → fingerprint `reasoning_effort` (same bands as /v1/messages). */
@@ -575,6 +587,7 @@ async function startCustomToolTurn(opts: {
   }
   const protocol = opts.protocol ?? "openai";
   const tools = offeredToolsThisTurn(opts.body, protocol, opts.tools);
+  console.log(`  custom_tools offered ${formatOfferedTools(tools)}`);
   const sessionFp = await sessionFpForCustomTools(opts.body, protocol, tools);
   const computedIds = agentRunIds(tenant, sessionFp);
   const session = upsertClientToolSession(tenant, sessionFp, tools);
@@ -645,7 +658,7 @@ async function startCustomToolTurn(opts: {
   }));
   if (toolFollowUp) {
     console.log(
-      `  custom_tools follow_tool session=${sessionId.slice(0, 24)} existing=${Boolean(existing)} kv=${Boolean(binding)} resume=${spliced.resume} roots=${(spliced.conversationState.rootPromptMessagesJson as unknown[] | undefined)?.length ?? 0} — new AgentService/Run`,
+      `  custom_tools follow_tool session=${sessionId.slice(0, 24)} offered=${formatOfferedTools(tools)} existing=${Boolean(existing)} kv=${Boolean(binding)} resume=${spliced.resume} roots=${(spliced.conversationState.rootPromptMessagesJson as unknown[] | undefined)?.length ?? 0} — new AgentService/Run`,
     );
   }
   const images = toolFollowUp ? [] : await lastUserAgentImages(messages);
@@ -656,7 +669,7 @@ async function startCustomToolTurn(opts: {
   const rootCount = (spliced.conversationState.rootPromptMessagesJson as unknown[] | undefined)?.length ?? 0;
   if (!toolFollowUp && (existing || binding)) {
     console.log(
-      `  custom_tools follow_user session=${sessionId.slice(0, 24)} existing=${Boolean(existing)} kv=${Boolean(binding)} resume=${spliced.resume} roots=${rootCount}`,
+      `  custom_tools follow_user session=${sessionId.slice(0, 24)} offered=${formatOfferedTools(tools)} existing=${Boolean(existing)} kv=${Boolean(binding)} resume=${spliced.resume} roots=${rootCount}`,
     );
   }
   const deltas = createTextDeltaHub();
@@ -920,7 +933,9 @@ export async function handleCustomToolChatCompletions(opts: {
     offerClientToolBatch(started.session, settled.batch);
     releaseUpstreamAfterPark(started.live, started.session);
     const toolCalls = clientToolsToOpenAi(settled.batch);
-    console.log(`  custom_tools park ${toolCalls.map((c) => c.function.name).join(",")}`);
+    console.log(
+      `  custom_tools park offered=${formatOfferedTools(started.session.tools)} ${toolCalls.map((c) => c.function.name).join(",")}`,
+    );
     ackLiveDeltas(started.live, started.live.thinking, started.live.text);
     return jsonResponse(
       200,
@@ -1145,7 +1160,9 @@ function streamCustomOpenAi(opts: {
           offerClientToolBatch(session, settled.batch);
           releaseUpstreamAfterPark(live, session);
           const toolCalls = clientToolsToOpenAi(settled.batch);
-          console.log(`  custom_tools park ${toolCalls.map((c) => c.function.name).join(",")}`);
+          console.log(
+            `  custom_tools park offered=${formatOfferedTools(session.tools)} ${toolCalls.map((c) => c.function.name).join(",")}`,
+          );
           enqueueChunk({ tool_calls: toolCalls });
           enqueueChunk({}, "tool_calls", { usage }, true);
           controller.enqueue(

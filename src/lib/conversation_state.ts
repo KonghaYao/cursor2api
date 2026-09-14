@@ -16,6 +16,7 @@ import {
   extractLatestClientToolResults,
   lastTurnIsToolResult,
   latestToolResultStart,
+  toolFollowUpDeepHistory,
   toolPolicyPrompt,
   withWorkspaceAccess,
   type CustomToolDef,
@@ -375,7 +376,9 @@ export function splicedUserPrompt(opts: {
     const latest = extractLatestClientToolResults(opts.messages);
     return {
       resume: false,
-      prompt: composeToolResultPrompt(latest, tools),
+      prompt: composeToolResultPrompt(latest, tools, {
+        deepHistory: toolFollowUpDeepHistory(opts.messages),
+      }),
       historyEnd: latestToolResultStart(opts.messages),
     };
   }

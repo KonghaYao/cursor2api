@@ -1633,6 +1633,56 @@ test("follow-up mcpTools come from this request body.tools, not KV", async () =>
   assert.deepEqual(duplexMcpStateListedNames(duplexes[1]!), ["Write", "Edit", "Bash"]);
 });
 
+test("offered catalog ignores stale handler tools when body.tools differs", async () => {
+  const duplexes: ChatInteractiveDuplex[] = [];
+  const openRun: OpenAgentRun = async () => {
+    const duplex = new ChatInteractiveDuplex();
+    duplexes.push(duplex);
+    attachCatalogDiscovery(duplex, () => {
+      duplex.push({ interactionUpdate: { textDelta: { text: "ok" } } });
+      duplex.push({ interactionUpdate: { turnEnded: {} } });
+    });
+    return duplex;
+  };
+  setCustomToolAgentHostForTests(
+    createSdkAgentHost({
+      openRun,
+      exchange: async () => ({ accessToken: "tok", refreshToken: null }),
+    }),
+  );
+  const fullCatalog = [
+    { type: "custom" as const, name: "Write" },
+    { type: "function" as const, function: { name: "Edit" } },
+    { type: "function" as const, function: { name: "Bash" } },
+  ];
+  const grepOnly = [{ type: "function" as const, function: { name: "Grep" } }];
+  const staleTools = openaiToolsToCustom(fullCatalog);
+  const headers = new Headers({ authorization: "Bearer crsr_test" });
+  const user = { role: "user", content: "search" };
+
+  const first = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [user], tools: fullCatalog },
+    tools: staleTools,
+    kv: createMemoryKv(),
+  });
+  assert.equal(first.status, 200);
+  assert.deepEqual(duplexMcpToolNames(duplexes[0]!), ["Write", "Edit", "Bash"]);
+
+  const second = await handleCustomToolChatCompletions({
+    headers,
+    body: {
+      model: "composer-2.5",
+      tools: grepOnly,
+      messages: [user, { role: "assistant", content: "ok" }, { role: "user", content: "again" }],
+    },
+    tools: staleTools,
+    kv: createMemoryKv(),
+  });
+  assert.equal(second.status, 200);
+  assert.deepEqual(duplexMcpToolNames(duplexes[1]!), ["Grep"]);
+});
+
 test("Write park then a later user turn still offers Write and keeps the call in roots", async () => {
   const duplexes: ChatInteractiveDuplex[] = [];
   const openRun: OpenAgentRun = async () => {
@@ -2128,7 +2178,8 @@ test("three user sentences stay one session: list tools, call, recall first sent
   assert.equal(b3.error, undefined);
   assert.equal(b3.conversation_id, b1.conversation_id);
   assert.match(String(b3.choices[0].message.content || ""), /你的工具有什么/);
-  assert.equal(prompts[3], third);
+  assert.match(prompts[3], /Tools: get_weather, lookup/);
+  assert.match(prompts[3], new RegExp(third));
   assert.ok(sendOpts[3]?.conversationState, "third user turn must send conversationState");
   assert.match(decodeRootPromptText(sendOpts[3]!.conversationState!, sendOpts[3]!.blobs!), /你的工具有什么/);
 
@@ -2163,7 +2214,8 @@ test("three user sentences stay one session: list tools, call, recall first sent
   const hopBody = await hop.json();
   assert.equal(hopBody.error, undefined);
   assert.equal(hopBody.conversation_id, b1.conversation_id);
-  assert.equal(hopPrompts[0], third);
+  assert.match(hopPrompts[0], /Tools: get_weather, lookup/);
+  assert.match(hopPrompts[0], new RegExp(third));
   assert.match(decodeRootPromptText(hopOpts[0]!.conversationState!, hopOpts[0]!.blobs!), /你的工具有什么/);
   assert.match(String(hopBody.choices[0].message.content || ""), /你的工具有什么/);
 });

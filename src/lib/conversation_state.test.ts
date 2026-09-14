@@ -169,7 +169,8 @@ test("three user turns keep the first sentence in roots for the last question", 
     priorMessageCount: turn3.length - 1,
   });
   assert.equal(s3.resume, false);
-  assert.equal(s3.prompt, third);
+  assert.match(s3.prompt, /Tools: get_weather, lookup/);
+  assert.match(s3.prompt, new RegExp(third));
   const roots3 = decodeRootPromptText(s3.conversationState, s3.blobs);
   assert.match(roots3, /你的工具有什么/);
   assert.match(roots3, /调用一下/);
