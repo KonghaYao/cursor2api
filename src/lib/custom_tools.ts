@@ -222,6 +222,19 @@ export function clientToolsFromRequest(body: Record<string, unknown>, protocol: 
   return protocol === "anthropic" ? anthropicToolsToCustom(body.tools) : openaiToolsToCustom(body.tools);
 }
 
+/**
+ * Single source of truth for the offered catalog on one HTTP turn.
+ * When `body.tools` is present (including `[]`), it wins over handler fallback.
+ */
+export function resolveOfferedTools(
+  body: Record<string, unknown>,
+  protocol: "openai" | "anthropic",
+  handlerTools: CustomToolDef[] = [],
+): CustomToolDef[] {
+  if (body.tools !== undefined) return clientToolsFromRequest(body, protocol);
+  return handlerTools;
+}
+
 function listedToolNames(tools: { name?: string; openaiName?: string }[]): string[] {
   return tools.map((t) => t.openaiName || t.name || "").filter(Boolean);
 }

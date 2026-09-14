@@ -16,7 +16,7 @@ import { startCloudRunWatch, watchOnDelta, type CloudRunWatch } from "./cloud_ru
 import { extractCloudSessionRef, startCloudTurn } from "./cloud_session.ts";
 import { handleCustomToolChatCompletions, handleCustomToolMessages, customToolChatClearForTests } from "./custom_tool_chat.ts";
 import {
-  clientToolsFromRequest,
+  resolveOfferedTools,
   customToolsClearForTests,
   type CustomToolDef,
 } from "./custom_tools.ts";
@@ -193,7 +193,7 @@ export function cloudModelSelection(
 }
 
 function clientToolDefs(body: Record<string, unknown>, anthropic: boolean): CustomToolDef[] {
-  return clientToolsFromRequest(body, anthropic ? "anthropic" : "openai");
+  return resolveOfferedTools(body, anthropic ? "anthropic" : "openai");
 }
 
 function openAiCompletion(opts: {

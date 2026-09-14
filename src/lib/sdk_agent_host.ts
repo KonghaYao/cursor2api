@@ -263,24 +263,28 @@ async function runTurn(opts: {
       });
     }, HEARTBEAT_MS);
 
-    await duplex.send(
-      clientRunMessage(
-        buildRunRequest({
-          prompt: opts.prompt,
-          modelId: opts.modelId,
-          modelParameters: opts.modelParameters,
-          conversationId: opts.conversationId,
-          runId,
-          agentSessionId: opts.agentSessionId,
-          tools: opts.tools,
-          conversationState: opts.conversationState,
-          cwd: opts.cwd,
-          images: opts.images,
-          resume: opts.resume,
-          customSystemPrompt: opts.customSystemPrompt,
-        }),
-      ),
-    );
+    const runRequest = buildRunRequest({
+      prompt: opts.prompt,
+      modelId: opts.modelId,
+      modelParameters: opts.modelParameters,
+      conversationId: opts.conversationId,
+      runId,
+      agentSessionId: opts.agentSessionId,
+      tools: opts.tools,
+      conversationState: opts.conversationState,
+      cwd: opts.cwd,
+      images: opts.images,
+      resume: opts.resume,
+      customSystemPrompt: opts.customSystemPrompt,
+    });
+    const mcpCount = ((runRequest.mcpTools as { mcpTools?: unknown[] } | undefined)?.mcpTools || []).length;
+    if (opts.tools.length && mcpCount === 0) {
+      console.log(`  agent_wire warn mcpTools empty specs=${opts.tools.map((t) => t.name).join(",") || "(none)"}`);
+    } else if (opts.tools.length) {
+      console.log(`  agent_wire mcpTools=${opts.tools.map((t) => t.name).join(",")}`);
+    }
+
+    await duplex.send(clientRunMessage(runRequest));
 
     while (true) {
       if (cancelled) break;

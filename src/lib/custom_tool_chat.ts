@@ -46,6 +46,7 @@ import { agentRunIds, resolveSessionMode } from "./session.ts";
 import { computeAgentRunFp } from "./session_fingerprint.ts";
 import {
   clientToolsFromRequest,
+  resolveOfferedTools,
   clientToolsToAnthropic,
   clientToolsToOpenAi,
   composeToolResultPrompt,
@@ -54,6 +55,7 @@ import {
   lastTurnIsToolResult,
   offerClientToolBatch,
   toolFollowUpDeepHistory,
+  toolPolicyPrompt,
   toSdkCustomTools,
   upsertClientToolSession,
   waitForClientToolBatch,
@@ -66,6 +68,7 @@ import { gatewayAgentModelSelection, promptCacheHitPercent, type AgentInlineImag
 import { openaiContentToCursorParts } from "./content_parts.ts";
 import { spliceConversationFromClient } from "./conversation_state.ts";
 import { defaultSdkAgentHost } from "./sdk_agent_host.ts";
+import { auditToolCatalog, logToolCatalogAudit, specsForWireAudit } from "./tool_catalog_audit.ts";
 
 export type SdkCustomToolMap = ReturnType<typeof toSdkCustomTools>;
 
@@ -445,17 +448,6 @@ function liveKey(tenant: string, sessionFp: string): string {
   return `${tenant}:${sessionFp}`;
 }
 
-function offeredToolsThisTurn(
-  body: Record<string, unknown>,
-  protocol: "openai" | "anthropic",
-  handlerTools: CustomToolDef[],
-): CustomToolDef[] {
-  // Cursor Agent sends the full catalog on body.tools every turn. When present
-  // (including []), that is the only source of truth — handlerTools may be stale.
-  if (body.tools !== undefined) return clientToolsFromRequest(body, protocol);
-  return handlerTools;
-}
-
 function formatOfferedTools(tools: CustomToolDef[]): string {
   const names = tools.map((t) => t.openaiName || t.name).filter(Boolean);
   return names.length ? names.join(",") : "(none)";
@@ -586,7 +578,12 @@ async function startCustomToolTurn(opts: {
     throw new CloudChatError("SESSION_MODE=random cannot park customTools.execute across turns.", 400);
   }
   const protocol = opts.protocol ?? "openai";
-  const tools = offeredToolsThisTurn(opts.body, protocol, opts.tools);
+  const tools = resolveOfferedTools(opts.body, protocol, opts.tools);
+  if (opts.body.tools === undefined && opts.tools.length) {
+    console.log(
+      `  custom_tools warn body.tools omitted — using handler catalog ${formatOfferedTools(opts.tools)} (client should send full tools every turn)`,
+    );
+  }
   console.log(`  custom_tools offered ${formatOfferedTools(tools)}`);
   const sessionFp = await sessionFpForCustomTools(opts.body, protocol, tools);
   const computedIds = agentRunIds(tenant, sessionFp);
@@ -643,6 +640,15 @@ async function startCustomToolTurn(opts: {
 
   const host = await resolveHost();
   const customTools = toSdkCustomTools(session);
+  logToolCatalogAudit(
+    auditToolCatalog({
+      offered: tools,
+      wireSpecs: specsForWireAudit(tools),
+      execKeys: Object.keys(customTools),
+      policyText: tools.length ? toolPolicyPrompt(opts.body, tools) : undefined,
+    }),
+    `pre_send session=${sessionId.slice(0, 24)}`,
+  );
   const agent = existing?.agent ?? (await host.create({
     apiKey: opts.apiKey,
     model: opts.body.model,
