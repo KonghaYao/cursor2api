@@ -243,6 +243,10 @@ function catalogWriterNames(names: string[]): string[] {
   return names.filter((n) => /^(Write|Edit|StrReplace|ApplyPatch)$/i.test(n));
 }
 
+export function catalogHasWriters(tools: { name?: string; openaiName?: string }[]): boolean {
+  return catalogWriterNames(listedToolNames(tools)).length > 0;
+}
+
 function joinOr(names: string[]): string {
   if (names.length <= 2) return names.join(" or ");
   return `${names.slice(0, -1).join(", ")}, or ${names[names.length - 1]}`;
@@ -333,9 +337,9 @@ export function composeToolResultPrompt(
   opts?: { deepHistory?: boolean },
 ): string {
   const lines = results.map((r) => (r.isError ? `- ${r.id} ERROR: ${r.content}` : `- ${r.id}: ${r.content}`));
-  const access =
-    (opts?.deepHistory ?? false) && tools.length ? customToolsInstruction(tools) : workspaceAccessPrompt(tools);
   const writers = catalogWriterNames(listedToolNames(tools));
+  const useFull = Boolean(tools.length && ((opts?.deepHistory ?? false) || writers.length));
+  const access = useFull ? customToolsInstruction(tools) : workspaceAccessPrompt(tools);
   return [
     "The client executed your custom tools. Results:",
     ...lines,
@@ -410,11 +414,32 @@ export function transcriptHasToolRound(messages: unknown[]): boolean {
 
 /** Long sessions bury the first-root tool policy; repeat the full catalog on follow-up. */
 export function followUpDeepHistory(messages: unknown[]): boolean {
-  return extractClientToolResults(messages).length >= 3 || messages.length > 30;
+  return extractClientToolResults(messages).length >= 2 || messages.length > 12;
 }
 
 /** @deprecated use followUpDeepHistory */
 export const toolFollowUpDeepHistory = followUpDeepHistory;
+
+/** True once the transcript has assistant turns or multiple real user turns. */
+export function transcriptIsFollowUp(messages: unknown[]): boolean {
+  let realUsers = 0;
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    const rec = m as Record<string, unknown>;
+    const role = String(rec.role || "").toLowerCase();
+    if (role === "assistant") return true;
+    if (role !== "user") continue;
+    if (
+      Array.isArray(rec.content) &&
+      rec.content.some((b) => b && typeof b === "object" && String((b as Record<string, unknown>).type || "") === "tool_result")
+    ) {
+      continue;
+    }
+    realUsers += 1;
+    if (realUsers > 1) return true;
+  }
+  return false;
+}
 
 export function withWorkspaceAccess(
   prompt: string,
@@ -423,9 +448,14 @@ export function withWorkspaceAccess(
 ): string {
   if (!tools.length) return prompt;
   const deep = followUpDeepHistory(messages);
-  const access = deep ? customToolsInstruction(tools) : workspaceAccessPrompt(tools);
+  const hasToolRound = transcriptHasToolRound(messages);
+  const followUp = transcriptIsFollowUp(messages);
+  const writers = catalogHasWriters(tools);
+  const shouldRemind = deep || hasToolRound || (followUp && writers);
+  if (!shouldRemind) return prompt;
+  const useFull = deep || (writers && (followUp || hasToolRound));
+  const access = useFull ? customToolsInstruction(tools) : workspaceAccessPrompt(tools);
   if (!access) return prompt;
-  if (!deep && !transcriptHasToolRound(messages)) return prompt;
   if (prompt.startsWith(access)) return prompt;
   return `${access}\n\n${prompt}`;
 }

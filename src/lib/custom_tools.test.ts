@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import test, { afterEach } from "node:test";
 import {
   anthropicToolsToCustom,
+  catalogHasWriters,
   clientToolsDisabled,
   clientToolsToOpenAi,
   customToolsClearForTests,
   extractClientToolResults,
   extractLatestClientToolResults,
+  followUpDeepHistory,
   lastTurnIsToolResult,
   sanitizeCustomToolName,
   openaiToolsToCustom,
@@ -14,6 +16,7 @@ import {
   parkClientToolCall,
   resolveClientToolResults,
   toolPolicyPrompt,
+  transcriptIsFollowUp,
   upsertClientToolSession,
   composeToolResultPrompt,
   withWorkspaceAccess,
@@ -336,10 +339,13 @@ test("tool follow-up restates full read/write access when Write is in the catalo
     { type: "function", function: { name: "Write" } },
     { type: "custom", name: "Edit" },
   ]);
+  assert.equal(catalogHasWriters(tools), true);
   const text = composeToolResultPrompt([{ id: "call_w", content: "wrote a.ts" }], tools);
   assert.match(text, /wrote a\.ts/);
   assert.match(text, /You have full read and write access/);
   assert.match(text, /Tools: Write, Edit/);
+  assert.match(text, /user's computer; their device is your computer/);
+  assert.match(text, /Apply file changes with Write or Edit immediately/);
   assert.match(text, /Apply remaining file changes now/);
   assert.doesNotMatch(text, /Do not call the same tools again/);
   const later = withWorkspaceAccess("edit again", tools, [
@@ -379,17 +385,38 @@ test("composeToolResultPrompt repeats full catalog instruction on deep history",
   assert.match(deep, /Use Bash to run shell commands/);
 });
 
+test("writer follow-up repeats full catalog even on a short thread without tool rounds", () => {
+  const tools = openaiToolsToCustom([
+    { type: "function", function: { name: "Write" } },
+    { type: "function", function: { name: "Bash" } },
+  ]);
+  const messages = [
+    { role: "user", content: "plan a feature" },
+    { role: "assistant", content: "here is the plan" },
+    { role: "user", content: "implement it now" },
+  ];
+  assert.equal(transcriptIsFollowUp(messages), true);
+  assert.equal(followUpDeepHistory(messages), false);
+  const prompt = withWorkspaceAccess("implement it now", tools, messages);
+  assert.match(prompt, /user's computer; their device is your computer/);
+  assert.match(prompt, /Tools: Write, Bash/);
+  assert.match(prompt, /Apply file changes with Write immediately/);
+  assert.match(prompt, /Use Bash to run shell commands/);
+  assert.match(prompt, /implement it now/);
+});
+
 test("long user follow-up repeats full catalog even without a prior tool round", () => {
   const tools = openaiToolsToCustom([
     { type: "function", function: { name: "Write" } },
     { type: "function", function: { name: "Bash" } },
   ]);
-  const messages = Array.from({ length: 31 }, (_, i) =>
+  const messages = Array.from({ length: 13 }, (_, i) =>
     i % 2 === 0
       ? { role: "user", content: `question ${i}` }
       : { role: "assistant", content: `answer ${i}` },
   );
   messages.push({ role: "user", content: "edit the file now" });
+  assert.equal(followUpDeepHistory(messages), true);
   const prompt = withWorkspaceAccess("edit the file now", tools, messages);
   assert.match(prompt, /user's computer; their device is your computer/);
   assert.match(prompt, /Tools: Write, Bash/);

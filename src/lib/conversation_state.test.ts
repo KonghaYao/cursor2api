@@ -223,6 +223,32 @@ test("policy stays its own first root ahead of a large Cursor Agent system", asy
   assert.match(spliced.prompt, /edit again/);
 });
 
+test("long writer sessions re-inject tool policy in replayed roots", async () => {
+  const catalog = [
+    { type: "custom" as const, name: "Write" },
+    { type: "function" as const, function: { name: "Edit" } },
+    { type: "function" as const, function: { name: "Bash" } },
+  ];
+  const tools = openaiToolsToCustom(catalog);
+  const messages: Array<Record<string, unknown>> = [{ role: "system", content: "be brief" }];
+  for (let i = 0; i < 10; i++) {
+    messages.push({ role: "user", content: `task ${i}` });
+    messages.push({ role: "assistant", content: `done ${i}` });
+  }
+  messages.push({ role: "user", content: "write the patch now" });
+  const spliced = await spliceConversationFromClient({
+    body: { messages, tools: catalog },
+    tools,
+    messages,
+    priorMessageCount: messages.length - 1,
+  });
+  const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
+  const policyHits = roots.match(/Tools: Write, Edit, Bash\./g) ?? [];
+  assert.ok(policyHits.length >= 2, `expected periodic root reminders, got ${policyHits.length}`);
+  assert.match(spliced.prompt, /Apply file changes with Write or Edit immediately/);
+  assert.match(spliced.prompt, /write the patch now/);
+});
+
 test("blob ids are SHA-256 of the JSON bytes (Connect JSON base64)", async () => {
   const store = new Map<string, string>();
   const value = { role: "system", content: "x" };

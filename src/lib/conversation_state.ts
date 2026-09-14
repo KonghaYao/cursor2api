@@ -12,6 +12,7 @@
  * model returns "".
  */
 import {
+  catalogHasWriters,
   composeToolResultPrompt,
   extractLatestClientToolResults,
   lastTurnIsToolResult,
@@ -19,6 +20,7 @@ import {
   toolFollowUpDeepHistory,
   toolPolicyPrompt,
   withWorkspaceAccess,
+  workspaceAccessPrompt,
   type CustomToolDef,
 } from "./custom_tools.ts";
 import { bytesBody } from "./bytes.ts";
@@ -28,6 +30,8 @@ const utf8 = new TextEncoder();
 const utf8Dec = new TextDecoder();
 
 const DEFAULT_SYSTEM = "You are a helpful assistant.";
+/** Re-inject write-tool policy in roots when history buries the first-root catalog. */
+const ROOT_POLICY_REMINDER_INTERVAL = 8;
 
 export type ConversationBlobStore = Map<string, string>;
 
@@ -281,9 +285,19 @@ async function replayMessages(
   messages: unknown[],
   endExclusive: number,
   names: Map<string, string>,
+  tools: CustomToolDef[] = [],
 ): Promise<string[]> {
   const ids: string[] = [];
   const limit = Math.min(endExclusive, messages.length);
+  const rootsReminder = catalogHasWriters(tools) ? workspaceAccessPrompt(tools) : "";
+  let rootsSinceReminder = 0;
+  const pushReminderIfDue = async () => {
+    if (!rootsReminder) return;
+    rootsSinceReminder += 1;
+    if (rootsSinceReminder < ROOT_POLICY_REMINDER_INTERVAL) return;
+    await pushRoot(store, ids, rootClientSystemText(rootsReminder));
+    rootsSinceReminder = 0;
+  };
   for (let i = 0; i < limit; i++) {
     const rec = asRec(messages[i]);
     if (!rec) continue;
@@ -308,18 +322,26 @@ async function replayMessages(
               }),
             ),
           );
+          await pushReminderIfDue();
         }
         continue;
       }
       const text = messageText(rec.content);
-      if (text) await pushRoot(store, ids, rootUserText(text));
+      if (text) {
+        await pushRoot(store, ids, rootUserText(text));
+        await pushReminderIfDue();
+      }
       continue;
     }
     if (role === "assistant") {
       const text = assistantVisibleText(rec);
-      if (text) await pushRoot(store, ids, rootAssistantText(text));
+      if (text) {
+        await pushRoot(store, ids, rootAssistantText(text));
+        await pushReminderIfDue();
+      }
       for (const call of assistantToolCalls(rec)) {
         await pushRoot(store, ids, rootAssistantText(toolCallRootText(call)));
+        await pushReminderIfDue();
       }
       continue;
     }
@@ -338,6 +360,7 @@ async function replayMessages(
           }),
         ),
       );
+      await pushReminderIfDue();
     }
   }
   return ids;
@@ -424,7 +447,7 @@ export async function spliceConversationFromClient(opts: {
     tools: opts.tools,
   });
   const names = toolNamesById(opts.messages);
-  const historyIds = await replayMessages(blobs, opts.messages, historyEnd, names);
+  const historyIds = await replayMessages(blobs, opts.messages, historyEnd, names, opts.tools);
   rootIds.push(...historyIds);
 
   return {
