@@ -106,6 +106,19 @@ function lastRealUserIndex(messages: unknown[]): number {
   return -1;
 }
 
+/** First real user at or after `start` (exclusive end for replay). Skips assistant echoes. */
+function firstRealUserIndexFrom(messages: unknown[], start: number): number {
+  const begin = Math.max(0, start);
+  for (let i = begin; i < messages.length; i++) {
+    const rec = asRec(messages[i]);
+    if (!rec) continue;
+    if (rec.role !== "user") continue;
+    if (isToolResultUser(rec)) continue;
+    return i;
+  }
+  return messages.length;
+}
+
 function lastUserPrompt(messages: unknown[]): string {
   const i = lastRealUserIndex(messages);
   if (i < 0) return "(empty)";
@@ -387,6 +400,10 @@ export function decodeRootPromptText(state: JsonObject, blobs: ConversationBlobS
  * Prompt for `userMessageAction` once history lives in root blobs.
  * Latest tool results stay off the roots and go in this prompt — a new Run
  * cannot `resumeAction` a duplex we already closed.
+ *
+ * `historyEnd` is exclusive for root replay. On a KV-length user follow-up it
+ * is the first new real user, not `priorMessageCount` (that index often lands
+ * on the assistant echo the client appended).
  */
 export function splicedUserPrompt(opts: {
   messages: unknown[];
@@ -413,7 +430,10 @@ export function splicedUserPrompt(opts: {
       return {
         resume: false,
         prompt: withWorkspaceAccess(users, tools, opts.messages),
-        historyEnd: prior,
+        // KV length is the previous HTTP transcript. The client then appends
+        // assistant (and maybe tool_calls) before the new user; that echo is
+        // history, not the delta. Exclusive end must be the first new user.
+        historyEnd: firstRealUserIndexFrom(opts.messages, prior),
       };
     }
   }

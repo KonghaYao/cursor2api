@@ -11,7 +11,7 @@ import {
 } from "./custom_tool_chat.ts";
 import type { AgentInlineImage, JsonObject } from "./agent_json.ts";
 import { asObject, field } from "./agent_json.ts";
-import { createMemoryKv, kvGetAgentRunLen } from "./kv.ts";
+import { agentRunLenKvKey, createMemoryKv, kvGetAgentRunLen } from "./kv.ts";
 import type { CustomToolAgentCreateOpts, CustomToolSendOpts } from "./custom_tool_chat.ts";
 import { createSdkAgentHost } from "./sdk_agent_host.ts";
 import type { AgentDuplex, OpenAgentRun } from "./agent_run.ts";
@@ -501,6 +501,143 @@ test("follow-up user always sends conversationState (upstream requires it)", asy
   const roots = decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!);
   assert.match(roots, /你的工具有什么/);
   assert.doesNotMatch(JSON.stringify(sendOpts[1]!.conversationState), /"turns":\[\]/);
+});
+
+test("KV follow-up user keeps previous assistant text in roots", async () => {
+  const sendOpts: Array<CustomToolSendOpts | undefined> = [];
+  const prompts: string[] = [];
+  setCustomToolAgentHostForTests({
+    async create() {
+      return {
+        agentId: "agent-slice-assistant",
+        async send(prompt, opts) {
+          prompts.push(prompt);
+          sendOpts.push(opts);
+          return { wait: async () => ({ text: "UNIQUE_ASSISTANT_ECHO" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const kv = createMemoryKv();
+  const headers = new Headers({ authorization: "Bearer crsr_test" });
+  const first = await handleCustomToolChatCompletions({
+    headers,
+    body: { model: "composer-2.5", messages: [{ role: "user", content: "UNIQUE_FIRST_USER" }] },
+    tools: [],
+    kv,
+  });
+  assert.equal(first.status, 200);
+  const second = await handleCustomToolChatCompletions({
+    headers,
+    body: {
+      model: "composer-2.5",
+      messages: [
+        { role: "user", content: "UNIQUE_FIRST_USER" },
+        { role: "assistant", content: "UNIQUE_ASSISTANT_ECHO" },
+        { role: "user", content: "UNIQUE_SECOND_USER" },
+      ],
+    },
+    tools: [],
+    kv,
+  });
+  assert.equal(second.status, 200);
+  assert.equal(prompts[1], "UNIQUE_SECOND_USER");
+  const roots = decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!);
+  assert.match(roots, /UNIQUE_FIRST_USER/);
+  assert.match(roots, /UNIQUE_ASSISTANT_ECHO/);
+  assert.doesNotMatch(roots, /UNIQUE_SECOND_USER/);
+
+  const sessionId = String((await second.json()).conversation_id);
+  const colon = sessionId.indexOf(":");
+  const tenant = sessionId.slice(0, colon);
+  const sessionFp = sessionId.slice(colon + 1);
+  await kv.removeItem(agentRunLenKvKey(tenant, sessionFp));
+  customToolChatClearForTests();
+  setCustomToolAgentHostForTests({
+    async create() {
+      return {
+        agentId: "agent-slice-assistant-hop",
+        async send(prompt, opts) {
+          prompts.push(prompt);
+          sendOpts.push(opts);
+          return { wait: async () => ({ text: "UNIQUE_THIRD_REPLY" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const hop = await handleCustomToolChatCompletions({
+    headers,
+    body: {
+      model: "composer-2.5",
+      messages: [
+        { role: "user", content: "UNIQUE_FIRST_USER" },
+        { role: "assistant", content: "UNIQUE_ASSISTANT_ECHO" },
+        { role: "user", content: "UNIQUE_SECOND_USER" },
+        { role: "assistant", content: "UNIQUE_ASSISTANT_ECHO" },
+        { role: "user", content: "UNIQUE_THIRD_USER" },
+      ],
+    },
+    tools: [],
+    kv,
+  });
+  assert.equal(hop.status, 200);
+  assert.equal(prompts[2], "UNIQUE_THIRD_USER");
+  const hopRoots = decodeRootPromptText(sendOpts[2]!.conversationState!, sendOpts[2]!.blobs!);
+  assert.match(hopRoots, /UNIQUE_FIRST_USER/);
+  assert.match(hopRoots, /UNIQUE_SECOND_USER/);
+  assert.match(hopRoots, /UNIQUE_ASSISTANT_ECHO/);
+  assert.doesNotMatch(hopRoots, /UNIQUE_THIRD_USER/);
+});
+
+test("Anthropic KV follow-up user keeps previous assistant text in roots", async () => {
+  const sendOpts: Array<CustomToolSendOpts | undefined> = [];
+  const prompts: string[] = [];
+  setCustomToolAgentHostForTests({
+    async create() {
+      return {
+        agentId: "agent-slice-anth",
+        async send(prompt, opts) {
+          prompts.push(prompt);
+          sendOpts.push(opts);
+          return { wait: async () => ({ text: "ANTH_ASSISTANT_ECHO" }) };
+        },
+        async close() {},
+      };
+    },
+  });
+  const kv = createMemoryKv();
+  const headers = new Headers({ "x-api-key": "crsr_test" });
+  const first = await handleCustomToolMessages({
+    headers,
+    body: { model: "composer-2.5", max_tokens: 64, messages: [{ role: "user", content: "ANTH_FIRST_USER" }] },
+    tools: [],
+    kv,
+    requestId: "req_slice_1",
+  });
+  assert.equal(first.status, 200);
+  const second = await handleCustomToolMessages({
+    headers,
+    body: {
+      model: "composer-2.5",
+      max_tokens: 64,
+      messages: [
+        { role: "user", content: "ANTH_FIRST_USER" },
+        { role: "assistant", content: [{ type: "text", text: "ANTH_ASSISTANT_ECHO" }] },
+        { role: "user", content: "ANTH_SECOND_USER" },
+      ],
+    },
+    tools: [],
+    kv,
+    requestId: "req_slice_2",
+  });
+  assert.equal(second.status, 200);
+  assert.equal(prompts[1], "ANTH_SECOND_USER");
+  const roots = decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!);
+  assert.match(roots, /ANTH_FIRST_USER/);
+  assert.match(roots, /ANTH_ASSISTANT_ECHO/);
+  assert.doesNotMatch(roots, /ANTH_SECOND_USER/);
 });
 
 test("park_miss with a full transcript splices tool history into conversationState", async () => {

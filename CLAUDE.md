@@ -45,7 +45,7 @@ Cursor 用 `rootPromptMessagesJson`（Vercel-AI 形 JSON 的 SHA-256 blob id）�
 | 本轮 | `conversationState` | action |
 |------|---------------------|--------|
 | 首轮 | 系统 blob（client system + tool policy；缺省则默认助手句） | `userMessageAction` = 第一条 user 文本。**不要**把 system 再折进 user，**不要**发空 `{}` |
-| 跟进 user | **必须带字段**：系统 + 历史（不含本轮新 user）。**禁止省略**（上游 `Conversation state is required`） | `userMessageAction` = 新 user（可 slice 多条） |
+| 跟进 user | **必须带字段**：系统 + 历史（不含本轮新 user，**含**上一枪 assistant 回声）。**禁止省略**（上游 `Conversation state is required`） | `userMessageAction` = 新 user（可 slice 多条） |
 | `role: tool` | 系统 + 历史（**不含**本轮最新 tool 结果） | **`userMessageAction`** = `composeToolResultPrompt`。双工已关，空 `resumeAction` 会空白 `stop` |
 
 - blob id = SHA-256(JSON utf8)，Connect JSON 里是标准 base64；`getBlob` 回 `blobData` = JSON 字节的 base64
@@ -116,7 +116,7 @@ Deno.serve 默认会在**成功响应之后** abort `request.signal`（日志里
 
 **用户端中断（官方 abort）：** 客户端断开 HTTP / 取消 SSE 时，对**这一枪还在飞的** `AgentService/Run` 发 `conversationAction.cancelAction`（proto `CancelAction`），再关双工。不要只停本地 SSE 而让上游继续计费。握手阶段（`fetch` 还没连上）才直接 abort 传输。成功返回 200 之后立刻摘掉 `request.signal`，避免 Deno legacy abort 误发 cancel。`ReadableStream.cancel()`（SSE 客户端丢连接）同样走 `cancelAction`。
 
-**会话 id（Deno isolate / serverless）：** `conversationId` = `tenant:agentRunFp`。`agentRunFp` = model / effort / flags / tools / system / **第一条 user**（不含后续轮次）。客户端 `x-session-id` / `conversation_id` **忽略**。**每一枪 HTTP 开/关一条 `AgentService/Run`**：返回 `tool_calls` 就关掉双工。跟进枪 **必须**带自拼 roots（缺字段会 `Conversation state is required`）。`role: tool` 用 `userMessageAction` 送工具结果，**不要**空 `resumeAction`。KV `agent-run:${tenant}:${fp}` 只存 `{fp, conversationId, agentSessionId}`，TTL 24h，**不要**把 checkpoint / messages 写进 KV。KV `agent-run-len:` 只存上次成功处理的 `messages.length`，TTL **5 分钟**，用来 slice 新 user；**不要**并进 24h 的 `agent-run`。
+**会话 id（Deno isolate / serverless）：** `conversationId` = `tenant:agentRunFp`。`agentRunFp` = model / effort / flags / tools / system / **第一条 user**（不含后续轮次）。客户端 `x-session-id` / `conversation_id` **忽略**。**每一枪 HTTP 开/关一条 `AgentService/Run`**：返回 `tool_calls` 就关掉双工。跟进枪 **必须**带自拼 roots（缺字段会 `Conversation state is required`）。`role: tool` 用 `userMessageAction` 送工具结果，**不要**空 `resumeAction`。KV `agent-run:${tenant}:${fp}` 只存 `{fp, conversationId, agentSessionId}`，TTL 24h，**不要**把 checkpoint / messages 写进 KV。KV `agent-run-len:` 只存上次成功处理的 `messages.length`，TTL **5 分钟**，用来 slice 新 user；**不要**并进 24h 的 `agent-run`。该长度是上一枪 transcript 的 end；跟进枪客户端会先 append assistant。`userMessageAction` = `joinUserPrompts(messages.slice(len))`（跳过 assistant）；roots 的 exclusive end 是 suffix 里**第一条新 user**，**不要**把 raw len 当 `historyEnd`（会把 assistant 回声从 roots 切掉）。缺 len 时回退 last user（roots 含其前全部 history，禁止把整段 history 叠进 action）。
 
 ### 不要做的
 

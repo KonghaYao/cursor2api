@@ -4,6 +4,7 @@ import { openaiToolsToCustom } from "./custom_tools.ts";
 import {
   decodeRootPromptText,
   spliceConversationFromClient,
+  splicedUserPrompt,
   storeJsonBlob,
   utf8FromBlobData,
 } from "./conversation_state.ts";
@@ -149,6 +150,7 @@ test("three user turns keep the first sentence in roots for the last question", 
   assert.doesNotMatch(s2.prompt, new RegExp(first));
   const roots2 = decodeRootPromptText(s2.conversationState, s2.blobs);
   assert.match(roots2, /你的工具有什么/);
+  assert.match(roots2, /我有 get_weather 和 lookup/);
   assert.match(roots2, /get_weather/);
 
   const turn3 = [
@@ -251,6 +253,276 @@ test("long writer sessions re-inject tool policy in replayed roots", async () =>
   assert.ok(policyHits.length >= 2, `expected periodic root reminders, got ${policyHits.length}`);
   assert.match(spliced.prompt, /Apply file changes with Write or Edit immediately/);
   assert.match(spliced.prompt, /write the patch now/);
+});
+
+test("KV-length follow-up keeps assistant echo in roots, not in userMessageAction", async () => {
+  const messages = [
+    { role: "system", content: "be brief" },
+    { role: "user", content: "first question" },
+    { role: "assistant", content: "UNIQUE_ASSISTANT_ECHO" },
+    { role: "user", content: "second question" },
+  ];
+  const slice = splicedUserPrompt({ messages, priorMessageCount: 2 });
+  assert.equal(slice.historyEnd, 3);
+  assert.equal(slice.prompt, "second question");
+  assert.equal(slice.resume, false);
+
+  const spliced = await spliceConversationFromClient({
+    body: { messages },
+    tools,
+    messages,
+    priorMessageCount: 2,
+  });
+  assert.equal(spliced.prompt, "second question");
+  assert.doesNotMatch(spliced.prompt, /first question|UNIQUE_ASSISTANT_ECHO/);
+  const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
+  assert.match(roots, /first question/);
+  assert.match(roots, /UNIQUE_ASSISTANT_ECHO/);
+  assert.doesNotMatch(roots, /second question/);
+});
+
+test("two new users after an assistant echo both go in the action", async () => {
+  const messages = [
+    { role: "user", content: "UNIQUE_ONE" },
+    { role: "assistant", content: "UNIQUE_ACK_ONE" },
+    { role: "user", content: "UNIQUE_TWO" },
+    { role: "user", content: "UNIQUE_THREE" },
+  ];
+  const slice = splicedUserPrompt({ messages, priorMessageCount: 1 });
+  assert.equal(slice.historyEnd, 2);
+  assert.equal(slice.prompt, "UNIQUE_TWO\n\nUNIQUE_THREE");
+  const spliced = await spliceConversationFromClient({
+    body: { messages },
+    tools: [],
+    messages,
+    priorMessageCount: 1,
+  });
+  assert.equal(spliced.prompt, "UNIQUE_TWO\n\nUNIQUE_THREE");
+  const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
+  assert.match(roots, /UNIQUE_ONE/);
+  assert.match(roots, /UNIQUE_ACK_ONE/);
+  assert.doesNotMatch(roots, /UNIQUE_TWO|UNIQUE_THREE/);
+});
+
+test("missing prior still excludes only the last user and keeps assistant history", async () => {
+  const messages = [
+    { role: "system", content: "be brief" },
+    { role: "user", content: "first question" },
+    { role: "assistant", content: "UNIQUE_ASSISTANT_ECHO" },
+    { role: "user", content: "second question" },
+  ];
+  const slice = splicedUserPrompt({ messages });
+  assert.equal(slice.historyEnd, 3);
+  assert.equal(slice.prompt, "second question");
+  const spliced = await spliceConversationFromClient({ body: { messages }, tools, messages });
+  const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
+  assert.match(roots, /first question/);
+  assert.match(roots, /UNIQUE_ASSISTANT_ECHO/);
+  assert.doesNotMatch(roots, /second question/);
+  assert.doesNotMatch(spliced.prompt, /first question/);
+});
+
+test("shorter transcript does not restack history into userMessageAction", async () => {
+  const messages = [
+    { role: "system", content: "be brief" },
+    { role: "user", content: "retry first" },
+  ];
+  const slice = splicedUserPrompt({ messages, priorMessageCount: 4 });
+  assert.equal(slice.historyEnd, 1);
+  assert.equal(slice.prompt, "retry first");
+  const spliced = await spliceConversationFromClient({
+    body: { messages },
+    tools: [],
+    messages,
+    priorMessageCount: 4,
+  });
+  assert.equal(spliced.prompt, "retry first");
+  assert.doesNotMatch(spliced.prompt, /<system>/);
+  const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
+  assert.doesNotMatch(roots, /retry first/);
+});
+
+test("same-length last-user edit is a last-user retry, not a no-op", async () => {
+  const messages = [
+    { role: "user", content: "one" },
+    { role: "assistant", content: "ack-one" },
+    { role: "user", content: "edited two" },
+  ];
+  const slice = splicedUserPrompt({ messages, priorMessageCount: 3 });
+  assert.equal(slice.historyEnd, 2);
+  assert.equal(slice.prompt, "edited two");
+  const spliced = await spliceConversationFromClient({
+    body: { messages },
+    tools: [],
+    messages,
+    priorMessageCount: 3,
+  });
+  const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
+  assert.match(roots, /one/);
+  assert.match(roots, /ack-one/);
+  assert.doesNotMatch(roots, /edited two/);
+});
+
+test("follow-up after a tool round uses the new user, not old tool results", async () => {
+  const afterTools = [
+    { role: "user", content: "tokyo weather then a follow-up" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"Tokyo"}' } }],
+    },
+    { role: "tool", tool_call_id: "call_1", content: '{"temp":22}' },
+  ];
+  const messages = [
+    ...afterTools,
+    { role: "assistant", content: "TOKYO_ASSISTANT_SUMMARY" },
+    { role: "user", content: "what was the temp?" },
+  ];
+  const slice = splicedUserPrompt({ messages, tools, priorMessageCount: afterTools.length });
+  assert.equal(slice.historyEnd, afterTools.length + 1);
+  assert.match(slice.prompt, /what was the temp\?/);
+  assert.doesNotMatch(slice.prompt, /The client executed your custom tools/);
+  assert.doesNotMatch(slice.prompt, /TOKYO_ASSISTANT_SUMMARY|"temp":22/);
+
+  const spliced = await spliceConversationFromClient({
+    body: { messages },
+    tools,
+    messages,
+    priorMessageCount: afterTools.length,
+  });
+  const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
+  assert.match(roots, /tokyo weather then a follow-up/);
+  assert.match(roots, /Already invoked client tool get_weather/);
+  assert.match(roots, /22/);
+  assert.match(roots, /TOKYO_ASSISTANT_SUMMARY/);
+  assert.doesNotMatch(roots, /what was the temp\?/);
+});
+
+test("parallel tool results stay off roots and all appear in the action", async () => {
+  const messages = [
+    { role: "user", content: "search three ways" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: "call_a", type: "function", function: { name: "get_weather", arguments: "{}" } },
+        { id: "call_b", type: "function", function: { name: "lookup", arguments: "{}" } },
+        { id: "call_c", type: "function", function: { name: "search", arguments: "{}" } },
+      ],
+    },
+    { role: "tool", tool_call_id: "call_a", content: "A-RESULT" },
+    { role: "tool", tool_call_id: "call_b", content: "B-RESULT" },
+    { role: "tool", tool_call_id: "call_c", content: "C-RESULT" },
+  ];
+  const slice = splicedUserPrompt({ messages, tools, priorMessageCount: 1 });
+  assert.equal(slice.historyEnd, 2);
+  assert.match(slice.prompt, /call_a[\s\S]*A-RESULT/);
+  assert.match(slice.prompt, /call_b[\s\S]*B-RESULT/);
+  assert.match(slice.prompt, /call_c[\s\S]*C-RESULT/);
+  const spliced = await spliceConversationFromClient({
+    body: { messages },
+    tools,
+    messages,
+    priorMessageCount: 1,
+  });
+  assert.equal(spliced.resume, false);
+  const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
+  assert.match(roots, /search three ways/);
+  assert.match(roots, /Already invoked client tool get_weather/);
+  assert.doesNotMatch(roots, /A-RESULT|B-RESULT|C-RESULT/);
+});
+
+test("Anthropic tool_result users slice like OpenAI role=tool", async () => {
+  const messages = [
+    { role: "user", content: "weather?" },
+    {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "tu_1", name: "get_weather", input: { city: "Tokyo" } }],
+    },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_1", content: '{"temp":22}' }] },
+  ];
+  const slice = splicedUserPrompt({ messages, tools, priorMessageCount: 1 });
+  assert.equal(slice.historyEnd, 2);
+  assert.match(slice.prompt, /tu_1/);
+  assert.match(slice.prompt, /22/);
+  assert.doesNotMatch(slice.prompt, /weather\?/);
+  const spliced = await spliceConversationFromClient({ body: { messages }, tools, messages });
+  const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
+  assert.match(roots, /weather\?/);
+  assert.match(roots, /Already invoked client tool get_weather/);
+  assert.doesNotMatch(roots, /"temp":22/);
+});
+
+test("Anthropic follow-up user keeps assistant text in roots", async () => {
+  const messages = [
+    { role: "user", content: "first anthropic" },
+    { role: "assistant", content: [{ type: "text", text: "ANTH_ASSISTANT_ECHO" }] },
+    { role: "user", content: "second anthropic" },
+  ];
+  const slice = splicedUserPrompt({ messages, priorMessageCount: 1 });
+  assert.equal(slice.historyEnd, 2);
+  assert.equal(slice.prompt, "second anthropic");
+  const spliced = await spliceConversationFromClient({
+    body: { system: "be brief", messages },
+    tools: [],
+    messages,
+    priorMessageCount: 1,
+  });
+  const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
+  assert.match(roots, /first anthropic/);
+  assert.match(roots, /ANTH_ASSISTANT_ECHO/);
+  assert.doesNotMatch(roots, /second anthropic/);
+  assert.doesNotMatch(spliced.prompt, /first anthropic|<system>/);
+});
+
+test("system and developer roles count toward length but never enter userMessageAction", async () => {
+  const messages = [
+    { role: "system", content: "sys-hidden" },
+    { role: "developer", content: "dev-hidden" },
+    { role: "user", content: "visible user" },
+    { role: "assistant", content: "asst-keep" },
+    { role: "user", content: "next user" },
+  ];
+  const slice = splicedUserPrompt({ messages, priorMessageCount: 3 });
+  assert.equal(slice.historyEnd, 4);
+  assert.equal(slice.prompt, "next user");
+  const spliced = await spliceConversationFromClient({
+    body: { messages },
+    tools: [],
+    messages,
+    priorMessageCount: 3,
+  });
+  assert.doesNotMatch(spliced.prompt, /sys-hidden|dev-hidden|visible user|asst-keep/);
+  const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
+  assert.match(roots, /sys-hidden/);
+  assert.match(roots, /dev-hidden/);
+  assert.match(roots, /visible user/);
+  assert.match(roots, /asst-keep/);
+  assert.doesNotMatch(roots, /next user/);
+});
+
+test("assistant tool_calls with no content still count in the length cursor", async () => {
+  const messages = [
+    { role: "user", content: "call it" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "call_z", type: "function", function: { name: "lookup", arguments: "{}" } }],
+    },
+    { role: "user", content: "never mind" },
+  ];
+  const slice = splicedUserPrompt({ messages, priorMessageCount: 1 });
+  assert.equal(slice.historyEnd, 2);
+  assert.equal(slice.prompt, "never mind");
+  const spliced = await spliceConversationFromClient({
+    body: { messages },
+    tools,
+    messages,
+    priorMessageCount: 1,
+  });
+  const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
+  assert.match(roots, /Already invoked client tool lookup \(id call_z\)/);
+  assert.doesNotMatch(roots, /never mind/);
 });
 
 test("blob ids are SHA-256 of the JSON bytes (Connect JSON base64)", async () => {
