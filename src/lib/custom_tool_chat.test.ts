@@ -702,7 +702,7 @@ test("park_miss with a full transcript splices tool history into conversationSta
   assert.equal(res.status, 200);
   assert.equal(prompts.length, 2);
   assert.equal(sends[1]?.opts?.resume, false);
-  assert.match(prompts[1], /The client executed your custom tools/);
+  assert.match(prompts[1], /"type":"tool-result"/);
   assert.match(prompts[1], /call_2/);
   assert.match(prompts[1], /40/);
   assert.doesNotMatch(prompts[1], /call_1/);
@@ -710,8 +710,10 @@ test("park_miss with a full transcript splices tool history into conversationSta
   assert.match(roots, /weather in tokyo/);
   assert.match(roots, /call_1/);
   assert.match(roots, /22/);
-  assert.match(roots, /Already invoked client tool lookup \(id call_2\)/);
-  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]/);
+  assert.match(roots, /"type":"tool-call"/);
+  assert.match(roots, /"toolCallId":"call_2"/);
+  assert.match(roots, /"toolName":"lookup"/);
+  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]|Already invoked/);
   assert.doesNotMatch(roots, /humidity/);
 });
 
@@ -988,7 +990,7 @@ test("role:tool opens a new send; tool_calls closes the previous AgentService ru
           prompts.push(prompt);
           sendOpts.push(opts);
           const wait = (async () => {
-            if (String(prompt).includes("The client executed your custom tools")) return { text: "22c" };
+            if (String(prompt).includes('"type":"tool-result"')) return { text: "22c" };
             const tool = Object.values(customTools)[0];
             if (!tool) return { text: "no-tools" };
             await tool.execute({}, {});
@@ -1038,7 +1040,7 @@ test("role:tool opens a new send; tool_calls closes the previous AgentService ru
   assert.equal(body2.choices[0].message.content, "22c");
   assert.equal(prompts.length, 2);
   assert.equal(sendOpts[1]?.resume, false);
-  assert.match(prompts[1], /The client executed your custom tools/);
+  assert.match(prompts[1], /"type":"tool-result"/);
   assert.match(prompts[1], /22/);
   assert.match(decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!), /weather\?/);
   assert.doesNotMatch(decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!), /"temp":22/);
@@ -1129,7 +1131,7 @@ test("three sequential catalog tools: get_weather then lookup then search then t
   assert.equal(releases, 2);
   assert.equal(body2.conversation_id, body1.conversation_id);
   assert.equal(sendOpts[1]?.resume, false);
-  assert.match(prompts[1], /The client executed your custom tools/);
+  assert.match(prompts[1], /"type":"tool-result"/);
   assert.match(prompts[1], /22/);
   const roots2 = decodeRootPromptText(sendOpts[1]!.conversationState!, sendOpts[1]!.blobs!);
   assert.match(roots2, /tokyo weather, humidity, then a headline/);
@@ -1257,7 +1259,7 @@ test("stream=true two tool rounds emit complete tool_calls then final text", asy
   assert.match(sse2, /"finish_reason":"tool_calls"/);
   const tc2 = lastOpenAiSseToolCalls(sse2);
   assert.equal(releases, 2);
-  assert.match(prompts[1], /The client executed your custom tools/);
+  assert.match(prompts[1], /"type":"tool-result"/);
   assert.match(prompts[1], /22/);
   assert.doesNotMatch(prompts[1] || "", /weather\?/);
 
@@ -1280,7 +1282,7 @@ test("stream=true two tool rounds emit complete tool_calls then final text", asy
   assert.match(sse3, /done-sse/);
   assert.match(sse3, /"finish_reason":"stop"/);
   assert.equal(prompts.length, 3);
-  assert.match(prompts[2], /The client executed your custom tools/);
+  assert.match(prompts[2], /"type":"tool-result"/);
   assert.match(prompts[2], /40/);
 });
 
@@ -1350,7 +1352,7 @@ test("Anthropic two tool_use rounds then end_turn", async () => {
   assert.ok(use2);
   assert.equal(releases, 2);
   assert.equal(body2.conversation_id, body1.conversation_id);
-  assert.match(prompts[1], /The client executed your custom tools/);
+  assert.match(prompts[1], /"type":"tool-result"/);
   assert.match(prompts[1], /22/);
   assert.doesNotMatch(prompts[1] || "", /weather\?/);
 
@@ -1373,7 +1375,7 @@ test("Anthropic two tool_use rounds then end_turn", async () => {
   const body3 = await third.json();
   assert.equal(body3.stop_reason, "end_turn");
   assert.equal(body3.content.find((b: { type?: string; text?: string }) => b.type === "text")?.text, "40 percent");
-  assert.match(prompts[2], /The client executed your custom tools/);
+  assert.match(prompts[2], /"type":"tool-result"/);
   assert.match(prompts[2], /40/);
 });
 
@@ -1583,7 +1585,7 @@ test("in-repo host: three sequential MCP parks then text; resume splices convers
   assert.equal(duplexes.length, 2);
   assert.equal(duplexSentCancel(duplexes[1]!), false);
   assert.equal(duplexIsResume(duplexes[1]!), false);
-  assert.match(duplexUserText(duplexes[1]!), /The client executed your custom tools/);
+  assert.match(duplexUserText(duplexes[1]!), /"type":"tool-result"/);
   assert.match(duplexUserText(duplexes[1]!), /22/);
   const spliced2 = await spliceConversationFromClient({ body: { messages: secondMessages }, tools, messages: secondMessages });
   assert.deepEqual(
@@ -1937,8 +1939,8 @@ test("Write park then a later user turn still offers Write and keeps the call in
   const body2 = await second.json();
   assert.equal(body2.conversation_id, body1.conversation_id);
   assert.equal(body2.choices[0].message.content, "wrote it");
-  assert.match(duplexUserText(duplexes[1]!), /You have full read and write access/);
-  assert.match(duplexUserText(duplexes[1]!), /Tools: Write, Edit, Bash/);
+  assert.match(duplexUserText(duplexes[1]!), /"type":"tool-result"/);
+  assert.match(duplexUserText(duplexes[1]!), /wrote a\.ts/);
 
   const later = [...afterWrite, { role: "assistant", content: "wrote it" }, { role: "user", content: "edit again" }];
   const third = await handleCustomToolChatCompletions({
@@ -1968,8 +1970,10 @@ test("Write park then a later user turn still offers Write and keeps the call in
   assert.match(systemRoot, /You are Cursor Grok/);
   assert.doesNotMatch(systemRoot, /\bTools:/);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
-  assert.match(roots, /Already invoked client tool Write/);
-  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]/);
+  assert.match(roots, /"type":"tool-call"/);
+  assert.match(roots, /"toolName":"Write"/);
+  assert.match(roots, /"type":"tool-result"/);
+  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]|Already invoked/);
   assert.match(roots, /wrote a\.ts/);
   assert.doesNotMatch(roots, /edit again/);
   assert.match(duplexUserText(duplexes[2]!), /You have full read and write access/);
@@ -2340,7 +2344,7 @@ test("three user sentences stay one session: list tools, call, recall first sent
   assert.equal(b2b.error, undefined);
   assert.equal(b2b.conversation_id, b1.conversation_id);
   assert.equal(sendOpts[2]?.resume, false);
-  assert.match(prompts[2], /The client executed your custom tools/);
+  assert.match(prompts[2], /"type":"tool-result"/);
   assert.match(decodeRootPromptText(sendOpts[2]!.conversationState!, sendOpts[2]!.blobs!), /你的工具有什么/);
 
   const r3 = await handleCustomToolChatCompletions({
@@ -2361,7 +2365,11 @@ test("three user sentences stay one session: list tools, call, recall first sent
   assert.match(prompts[3], /Tools: get_weather, lookup/);
   assert.match(prompts[3], new RegExp(third));
   assert.ok(sendOpts[3]?.conversationState, "third user turn must send conversationState");
-  assert.match(decodeRootPromptText(sendOpts[3]!.conversationState!, sendOpts[3]!.blobs!), /你的工具有什么/);
+  const roots3 = decodeRootPromptText(sendOpts[3]!.conversationState!, sendOpts[3]!.blobs!);
+  assert.match(roots3, /你的工具有什么/);
+  assert.match(roots3, /Tools: get_weather, lookup/);
+  assert.match(roots3, /"type":"tool-call"/);
+  assert.match(roots3, /"type":"tool-result"/);
 
   customToolChatClearForTests();
   sends = 0;
@@ -2396,7 +2404,10 @@ test("three user sentences stay one session: list tools, call, recall first sent
   assert.equal(hopBody.conversation_id, b1.conversation_id);
   assert.match(hopPrompts[0], /Tools: get_weather, lookup/);
   assert.match(hopPrompts[0], new RegExp(third));
-  assert.match(decodeRootPromptText(hopOpts[0]!.conversationState!, hopOpts[0]!.blobs!), /你的工具有什么/);
+  const hopRoots = decodeRootPromptText(hopOpts[0]!.conversationState!, hopOpts[0]!.blobs!);
+  assert.match(hopRoots, /你的工具有什么/);
+  assert.match(hopRoots, /Tools: get_weather, lookup/);
+  assert.match(hopRoots, /"type":"tool-result"/);
   assert.match(String(hopBody.choices[0].message.content || ""), /你的工具有什么/);
 });
 

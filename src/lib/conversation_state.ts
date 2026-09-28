@@ -6,21 +6,19 @@
  * synthetic first user root: AgentService ignores `role: system` roots, while
  * this shape keeps the full prompt visible and stable across HTTP turns.
  * `turns[]` is UI metadata and must be omitted — we are not the IDE. The active
- * user turn stays in `userMessageAction`. A `role: tool` follow-up also uses
- * `userMessageAction` (`composeToolResultPrompt`): we already closed the
- * previous duplex, so empty `resumeAction` has no in-flight MCP exec and the
- * model returns "".
+ * user turn stays in `userMessageAction`. A follow-up user action repeats the
+ * short tool catalog: the first-root list sits under the client system and
+ * Composer then treats Write/Edit/Bash as absent. A `role: tool` follow-up
+ * carries SDK `tool-result` objects. The previous duplex is already closed,
+ * so empty `resumeAction` has no in-flight MCP exec. History tool calls stay
+ * in roots as `tool-call` / `tool-result` parts.
  */
 import {
-  catalogHasFileTools,
-  composeToolResultPrompt,
   extractLatestClientToolResults,
   lastTurnIsToolResult,
   latestToolResultStart,
-  toolFollowUpDeepHistory,
   toolPolicyPrompt,
   withWorkspaceAccess,
-  workspaceAccessPrompt,
   type CustomToolDef,
 } from "./custom_tools.ts";
 import { bytesBody } from "./bytes.ts";
@@ -30,8 +28,6 @@ const utf8 = new TextEncoder();
 const utf8Dec = new TextDecoder();
 
 const DEFAULT_SYSTEM = "You are a helpful assistant.";
-/** Re-inject write-tool policy in roots when history buries the first-root catalog. */
-const ROOT_POLICY_REMINDER_INTERVAL = 4;
 
 export type ConversationBlobStore = Map<string, string>;
 
@@ -230,11 +226,63 @@ function assistantToolCalls(rec: Record<string, unknown>): Array<{ id: string; n
   return out;
 }
 
-function toolCallRootText(opts: { id: string; name: string; args: string }): string {
-  // Past tense, no [Tool Call] / [tool_call] markers — Composer copies those
-  // into visible text instead of invoking MCP (16fbae5 regression).
-  void opts.args;
-  return `Already invoked client tool ${opts.name} (id ${opts.id}).`;
+function parseToolArgs(raw: string): Record<string, unknown> {
+  const text = raw.trim();
+  if (!text) return {};
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+  } catch {
+    /* arguments were not a JSON object */
+  }
+  return {};
+}
+
+function toolResultMessage(opts: { id: string; name: string; content: string; isError?: boolean }): {
+  role: "tool";
+  id: string;
+  content: Array<{ type: "tool-result"; toolName: string; toolCallId: string; result: string; isError?: boolean }>;
+} {
+  const part: { type: "tool-result"; toolName: string; toolCallId: string; result: string; isError?: boolean } = {
+    type: "tool-result",
+    toolName: opts.name,
+    toolCallId: opts.id,
+    result: opts.content,
+  };
+  if (opts.isError) part.isError = true;
+  return { role: "tool", id: opts.id, content: [part] };
+}
+
+function assistantRootMessage(rec: Record<string, unknown>): { role: "assistant"; content: Array<Record<string, unknown>> } | undefined {
+  const content: Array<Record<string, unknown>> = [];
+  const text = assistantVisibleText(rec);
+  if (text) content.push({ type: "text", text });
+  for (const call of assistantToolCalls(rec)) {
+    content.push({
+      type: "tool-call",
+      toolCallId: call.id,
+      toolName: call.name,
+      args: parseToolArgs(call.args),
+    });
+  }
+  if (!content.length) return undefined;
+  return { role: "assistant", content };
+}
+
+/** Latest tool results as the action payload. History keeps the matching tool-call. */
+export function formatLatestToolResultAction(messages: unknown[]): string {
+  const names = toolNamesById(messages);
+  const latest = extractLatestClientToolResults(messages);
+  return JSON.stringify(
+    latest.map((result) =>
+      toolResultMessage({
+        id: result.id,
+        name: names.get(result.id) || "",
+        content: result.content,
+        isError: result.isError,
+      }),
+    ),
+  );
 }
 
 function toolNamesById(messages: unknown[]): Map<string, string> {
@@ -268,29 +316,29 @@ function rootUserText(text: string): { role: "user"; content: Array<{ type: "tex
   return { role: "user", content: [{ type: "text", text }] };
 }
 
-function rootAssistantText(text: string): { role: "assistant"; content: Array<{ type: "text"; text: string }> } {
-  return { role: "assistant", content: [{ type: "text", text }] };
-}
-
 function rootClientSystemText(text: string): { role: "user"; content: Array<{ type: "text"; text: string }> } {
   return rootUserText(`<system>\n${text}\n</system>`);
 }
 
-function toolResultRootText(opts: { id: string; name?: string; content: string; isError?: boolean }): string {
-  const prefix = opts.isError ? "[Tool Error]" : "[Tool Result]";
-  return [
-    prefix,
-    "[tool_result]",
-    `call_id: ${opts.id}`,
-    `name: ${opts.name || ""}`,
-    `is_error: ${Boolean(opts.isError)}`,
-    "output:",
-    opts.content,
-  ].join("\n");
-}
-
 async function pushRoot(store: ConversationBlobStore, ids: string[], value: unknown): Promise<void> {
   ids.push(await storeJsonBlob(store, value));
+}
+
+async function pushToolResult(
+  store: ConversationBlobStore,
+  ids: string[],
+  opts: { id: string; name?: string; content: string; isError?: boolean },
+): Promise<void> {
+  await pushRoot(
+    store,
+    ids,
+    toolResultMessage({
+      id: opts.id,
+      name: opts.name || "",
+      content: opts.content,
+      isError: opts.isError,
+    }),
+  );
 }
 
 async function replayMessages(
@@ -298,19 +346,9 @@ async function replayMessages(
   messages: unknown[],
   endExclusive: number,
   names: Map<string, string>,
-  tools: CustomToolDef[] = [],
 ): Promise<string[]> {
   const ids: string[] = [];
   const limit = Math.min(endExclusive, messages.length);
-  const rootsReminder = catalogHasFileTools(tools) ? workspaceAccessPrompt(tools) : "";
-  let rootsSinceReminder = 0;
-  const pushReminderIfDue = async () => {
-    if (!rootsReminder) return;
-    rootsSinceReminder += 1;
-    if (rootsSinceReminder < ROOT_POLICY_REMINDER_INTERVAL) return;
-    await pushRoot(store, ids, rootClientSystemText(rootsReminder));
-    rootsSinceReminder = 0;
-  };
   for (let i = 0; i < limit; i++) {
     const rec = asRec(messages[i]);
     if (!rec) continue;
@@ -323,57 +361,33 @@ async function replayMessages(
           if (!b || String(b.type || "") !== "tool_result") continue;
           const id = String(b.tool_use_id || b.toolUseId || "").trim();
           if (!id) continue;
-          await pushRoot(
-            store,
-            ids,
-            rootUserText(
-              toolResultRootText({
-                id,
-                name: names.get(id),
-                content: messageText(b.content ?? b.text),
-                isError: Boolean(b.is_error || b.isError),
-              }),
-            ),
-          );
-          await pushReminderIfDue();
+          await pushToolResult(store, ids, {
+            id,
+            name: names.get(id),
+            content: messageText(b.content ?? b.text),
+            isError: Boolean(b.is_error || b.isError),
+          });
         }
         continue;
       }
       const text = messageText(rec.content);
-      if (text) {
-        await pushRoot(store, ids, rootUserText(text));
-        await pushReminderIfDue();
-      }
+      if (text) await pushRoot(store, ids, rootUserText(text));
       continue;
     }
     if (role === "assistant") {
-      const text = assistantVisibleText(rec);
-      if (text) {
-        await pushRoot(store, ids, rootAssistantText(text));
-        await pushReminderIfDue();
-      }
-      for (const call of assistantToolCalls(rec)) {
-        await pushRoot(store, ids, rootAssistantText(toolCallRootText(call)));
-        await pushReminderIfDue();
-      }
+      const message = assistantRootMessage(rec);
+      if (message) await pushRoot(store, ids, message);
       continue;
     }
     if (role === "tool" || role === "function") {
       const id = String(rec.tool_call_id || rec.toolCallId || rec.id || "").trim();
       if (!id) continue;
-      await pushRoot(
-        store,
-        ids,
-        rootUserText(
-          toolResultRootText({
-            id,
-            name: String(rec.name || names.get(id) || ""),
-            content: messageText(rec.content),
-            isError: Boolean(rec.is_error || rec.isError),
-          }),
-        ),
-      );
-      await pushReminderIfDue();
+      await pushToolResult(store, ids, {
+        id,
+        name: String(rec.name || names.get(id) || ""),
+        content: messageText(rec.content),
+        isError: Boolean(rec.is_error || rec.isError),
+      });
     }
   }
   return ids;
@@ -398,8 +412,8 @@ export function decodeRootPromptText(state: JsonObject, blobs: ConversationBlobS
 
 /**
  * Prompt for `userMessageAction` once history lives in root blobs.
- * Latest tool results stay off the roots and go in this prompt — a new Run
- * cannot `resumeAction` a duplex we already closed.
+ * Latest tool results stay off the roots and go in this prompt as SDK
+ * `tool-result` objects — a new Run cannot `resumeAction` a closed duplex.
  *
  * `historyEnd` is exclusive for root replay. On a KV-length user follow-up it
  * is the first new real user, not `priorMessageCount` (that index often lands
@@ -410,18 +424,14 @@ export function splicedUserPrompt(opts: {
   priorMessageCount?: number;
   tools?: CustomToolDef[];
 }): { resume: boolean; prompt: string; historyEnd: number } {
-  const tools = opts.tools || [];
-  const latestToolFollowUp = lastTurnIsToolResult(opts.messages);
-  if (latestToolFollowUp) {
-    const latest = extractLatestClientToolResults(opts.messages);
+  if (lastTurnIsToolResult(opts.messages)) {
     return {
       resume: false,
-      prompt: composeToolResultPrompt(latest, tools, {
-        deepHistory: toolFollowUpDeepHistory(opts.messages),
-      }),
+      prompt: formatLatestToolResultAction(opts.messages),
       historyEnd: latestToolResultStart(opts.messages),
     };
   }
+  const tools = opts.tools || [];
   const prior = opts.priorMessageCount;
   const canSlice = prior != null && Number.isInteger(prior) && prior > 0 && opts.messages.length > prior;
   if (canSlice) {
@@ -467,7 +477,7 @@ export async function spliceConversationFromClient(opts: {
     tools: opts.tools,
   });
   const names = toolNamesById(opts.messages);
-  const historyIds = await replayMessages(blobs, opts.messages, historyEnd, names, opts.tools);
+  const historyIds = await replayMessages(blobs, opts.messages, historyEnd, names);
   rootIds.push(...historyIds);
 
   return {

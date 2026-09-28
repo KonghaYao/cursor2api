@@ -71,9 +71,11 @@ test("tool follow-up puts latest results in userMessageAction, not empty resume"
   assert.doesNotMatch(spliced.prompt, /full read and write access/);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
   assert.match(roots, /weather in tokyo then humidity then news/);
-  assert.match(roots, /Already invoked client tool get_weather/);
-  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]/);
-  assert.doesNotMatch(roots, /"temp":22/);
+  assert.match(roots, /"type":"tool-call"/);
+  assert.match(roots, /"toolName":"get_weather"/);
+  assert.match(roots, /"city":"Tokyo"/);
+  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]|Already invoked/);
+  assert.doesNotMatch(roots, /"type":"tool-result"/);
 });
 
 test("three sequential user tool rounds keep the full catalog history in roots", async () => {
@@ -109,9 +111,10 @@ test("three sequential user tool rounds keep the full catalog history in roots",
   assert.match(roots, /tokyo weather, humidity, then a headline/);
   assert.match(roots, /call_wx/);
   assert.match(roots, /call_hum/);
-  assert.match(roots, /Already invoked client tool get_weather/);
-  assert.match(roots, /Already invoked client tool lookup/);
-  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]/);
+  assert.match(roots, /"toolName":"get_weather"/);
+  assert.match(roots, /"toolName":"lookup"/);
+  assert.match(roots, /"type":"tool-result"/);
+  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]|Already invoked/);
   assert.match(roots, /22/);
   assert.match(roots, /40/);
   assert.doesNotMatch(roots, /rain later/);
@@ -218,8 +221,10 @@ test("policy stays its own first root ahead of a large Cursor Agent system", asy
   assert.match(systemRoot, /You are Cursor Grok/);
   assert.doesNotMatch(systemRoot, /\bTools:/);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
-  assert.match(roots, /Already invoked client tool Write/);
-  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]/);
+  assert.match(roots, /"type":"tool-call"/);
+  assert.match(roots, /"toolName":"Write"/);
+  assert.match(roots, /"type":"tool-result"/);
+  assert.doesNotMatch(roots, /\[Tool Call\]|\[tool_call\]|Already invoked/);
   assert.match(roots, /wrote a\.ts/);
   assert.doesNotMatch(roots, /edit again/);
   assert.match(spliced.prompt, /You have full read and write access/);
@@ -228,7 +233,7 @@ test("policy stays its own first root ahead of a large Cursor Agent system", asy
   assert.match(spliced.prompt, /edit again/);
 });
 
-test("long writer sessions re-inject tool policy in replayed roots", async () => {
+test("long writer sessions keep the catalog on the first root only", async () => {
   const catalog = [
     { type: "function" as const, function: { name: "Read" } },
     { type: "custom" as const, name: "Write" },
@@ -250,7 +255,7 @@ test("long writer sessions re-inject tool policy in replayed roots", async () =>
   });
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
   const policyHits = roots.match(/Tools: Read, Write, Edit, Bash\./g) ?? [];
-  assert.ok(policyHits.length >= 2, `expected periodic root reminders, got ${policyHits.length}`);
+  assert.equal(policyHits.length, 1);
   assert.match(spliced.prompt, /Apply file changes with Write or Edit immediately/);
   assert.match(spliced.prompt, /write the patch now/);
 });
@@ -392,7 +397,9 @@ test("follow-up after a tool round uses the new user, not old tool results", asy
   });
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
   assert.match(roots, /tokyo weather then a follow-up/);
-  assert.match(roots, /Already invoked client tool get_weather/);
+  assert.match(roots, /"type":"tool-call"/);
+  assert.match(roots, /"toolName":"get_weather"/);
+  assert.match(roots, /"type":"tool-result"/);
   assert.match(roots, /22/);
   assert.match(roots, /TOKYO_ASSISTANT_SUMMARY/);
   assert.doesNotMatch(roots, /what was the temp\?/);
@@ -428,7 +435,9 @@ test("parallel tool results stay off roots and all appear in the action", async 
   assert.equal(spliced.resume, false);
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
   assert.match(roots, /search three ways/);
-  assert.match(roots, /Already invoked client tool get_weather/);
+  assert.match(roots, /"type":"tool-call"/);
+  assert.match(roots, /"toolName":"get_weather"/);
+  assert.doesNotMatch(roots, /"type":"tool-result"/);
   assert.doesNotMatch(roots, /A-RESULT|B-RESULT|C-RESULT/);
 });
 
@@ -449,8 +458,10 @@ test("Anthropic tool_result users slice like OpenAI role=tool", async () => {
   const spliced = await spliceConversationFromClient({ body: { messages }, tools, messages });
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
   assert.match(roots, /weather\?/);
-  assert.match(roots, /Already invoked client tool get_weather/);
-  assert.doesNotMatch(roots, /"temp":22/);
+  assert.match(roots, /"type":"tool-call"/);
+  assert.match(roots, /"toolName":"get_weather"/);
+  assert.match(roots, /"city":"Tokyo"/);
+  assert.doesNotMatch(roots, /"type":"tool-result"/);
 });
 
 test("Anthropic follow-up user keeps assistant text in roots", async () => {
@@ -521,7 +532,9 @@ test("assistant tool_calls with no content still count in the length cursor", as
     priorMessageCount: 1,
   });
   const roots = decodeRootPromptText(spliced.conversationState, spliced.blobs);
-  assert.match(roots, /Already invoked client tool lookup \(id call_z\)/);
+  assert.match(roots, /"type":"tool-call"/);
+  assert.match(roots, /"toolName":"lookup"/);
+  assert.match(roots, /"toolCallId":"call_z"/);
   assert.doesNotMatch(roots, /never mind/);
 });
 

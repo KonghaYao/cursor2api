@@ -16,7 +16,7 @@
  * `tool_calls` closes that duplex **without** `cancelAction`. The next
  * `role: tool` is a new Run: the gateway splices `conversationState`
  * (`rootPromptMessagesJson` blobs) from the full client transcript and
- * sends `userMessageAction` = `composeToolResultPrompt` (the previous
+ * sends `userMessageAction` as the SDK `tool-result` objects (the previous
  * duplex is already closed; empty `resumeAction` ends with blank text).
  * Follow-up user turns send only the new user text in `userMessageAction`.
  * Client disconnect / SSE cancel sends
@@ -52,24 +52,21 @@ import {
   resolveOfferedTools,
   clientToolsToAnthropic,
   clientToolsToOpenAi,
-  composeToolResultPrompt,
   extractLatestClientToolResults,
   failParkedClientTools,
   lastTurnIsToolResult,
   offerClientToolBatch,
-  toolFollowUpDeepHistory,
   toolPolicyPrompt,
   toSdkCustomTools,
   upsertClientToolSession,
   waitForClientToolBatch,
-  withWorkspaceAccess,
   type ClientToolSession,
   type CustomToolDef,
   type ParkedClientTool,
 } from "./custom_tools.ts";
 import { gatewayAgentModelSelection, promptCacheHitPercent, type AgentInlineImage, type AgentTurnUsage } from "./agent_json.ts";
 import { openaiContentToCursorParts } from "./content_parts.ts";
-import { spliceConversationFromClient } from "./conversation_state.ts";
+import { spliceConversationFromClient, splicedUserPrompt } from "./conversation_state.ts";
 import { defaultSdkAgentHost } from "./sdk_agent_host.ts";
 import { auditToolCatalog, logToolCatalogAudit, specsForWireAudit } from "./tool_catalog_audit.ts";
 
@@ -267,19 +264,11 @@ export function composeCustomToolTurnPrompt(opts: {
 }): string {
   void opts.body;
   void opts.hadPriorTurn;
-  const latest = extractLatestClientToolResults(opts.messages);
-  if (lastTurnIsToolResult(opts.messages) && latest.length > 0) {
-    return composeToolResultPrompt(latest, opts.tools, {
-      deepHistory: toolFollowUpDeepHistory(opts.messages),
-    });
-  }
-  const prior = opts.priorMessageCount;
-  const canSlice = prior != null && Number.isInteger(prior) && prior > 0 && opts.messages.length > prior;
-  if (canSlice) {
-    const users = joinUserPrompts(opts.messages.slice(prior));
-    if (users) return withWorkspaceAccess(users, opts.tools, opts.messages);
-  }
-  return withWorkspaceAccess(lastUserPrompt(opts.messages), opts.tools, opts.messages);
+  return splicedUserPrompt({
+    messages: opts.messages,
+    priorMessageCount: opts.priorMessageCount,
+    tools: opts.tools,
+  }).prompt;
 }
 
 export type CustomToolTurnResult = { text: string; thinking?: string; error?: string; usage?: AgentTurnUsage };
